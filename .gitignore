@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+*.egg
+
+# Android
+client/.gradle/
+client/build/
+client/app/build/
+client/local.properties
+*.iml
+.idea/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Data
+history/*.jpg
+history/animations/
+history/svgs_*/
+reports/*.html
+data/*.db
+server_ip.txt
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Large binary files
+*.pkl
+*.model
+*.h5
+*.onnx
