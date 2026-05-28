@@ -1,0 +1,3904 @@
+package com.gyyz.assistant
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.gyyz.assistant.camera.CameraAnalyzer
+import com.gyyz.assistant.gesture.HandGestureRecognizer
+import com.gyyz.assistant.network.ApiService
+import com.gyyz.assistant.network.ServerDiscoverer
+import io.noties.markwon.Markwon
+import io.noties.markwon.ext.latex.JLatexMathPlugin
+import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
+import io.noties.markwon.image.ImagesPlugin
+import io.noties.markwon.image.glide.GlideImagesPlugin
+import io.noties.markwon.ext.tables.TablePlugin
+import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.*
+import org.json.JSONObject
+
+@Suppress("OPT_IN_IS_NOT_ENABLED")
+@OptIn(ExperimentalMaterial3Api::class)
+
+
+sealed class AppState {
+    data class Login(val isLoading: Boolean = false, val error: String = "") : AppState()
+
+    object Tracking : AppState()
+
+    data class Solving(
+            val stage: SolveStage = SolveStage.UPLOADING,
+            val requestId: String = "",
+            val questionInfo: String = "",
+            val solutionSteps: String = "",
+            val fullSolution: String = "",
+            val mindMap: String = "",
+            val suggestedQuestions: List<String> = emptyList()
+    ) : AppState()
+
+    data class Report(val reportText: String = "", val isLoading: Boolean = true) : AppState()
+
+    object History : AppState()
+
+    object Animation : AppState()
+
+    data class Knowledge(
+            val summary: String = "",
+            val mistakes: String = "",
+            val extension: String = "",
+            val suggestedQuestions: List<String> = emptyList()
+    ) : AppState()
+}
+
+enum class SolveStage {
+    UPLOADING,
+    ANALYZING,
+    DISPLAY_STEPS,
+    DISPLAY_FULL,
+    DISPLAY_MINDMAP,
+    INTERACTIVE,
+    COMPLETED
+}
+
+enum class FocusState(val label: String) {
+    WRITING("书写中"),
+    THINKING("思考中"),
+    PAGE_TURNING("翻页中"),
+    SEEKING_HELP("求助中");
+
+    companion object {
+        fun fromString(s: String): FocusState {
+            return when (s.lowercase()) {
+                "writing" -> WRITING
+                "thinking" -> THINKING
+                "page_turning" -> PAGE_TURNING
+                "seeking_help" -> SEEKING_HELP
+                else -> WRITING
+            }
+        }
+    }
+}
+
+// ==================== ViewModel ====================
+
+class MainViewModel : ViewModel() {
+    private val _appState = MutableStateFlow<AppState>(AppState.Tracking)
+    val appState: StateFlow<AppState> = _appState.asStateFlow()
+
+    private val _statusText = MutableStateFlow("跟踪学习中...")
+    val statusText: StateFlow<String> = _statusText.asStateFlow()
+
+    private val _pomodoroTime = MutableStateFlow(25 * 60)
+    val pomodoroTime: StateFlow<Int> = _pomodoroTime.asStateFlow()
+
+    private val _pageCount = MutableStateFlow(0)
+    val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
+
+    private val _thinkingTimer = MutableStateFlow(0)
+    val thinkingTimer: StateFlow<Int> = _thinkingTimer.asStateFlow()
+
+    private var thinkingJob: Job? = null
+    private var pomodoroJob: Job? = null
+    private val _animationUrl = MutableStateFlow("")
+    val animationUrl: StateFlow<String> = _animationUrl.asStateFlow()
+
+    private val apiService = ApiService()
+
+    private val _isLoggedIn = MutableStateFlow(false)
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    private val _loggedInUsername = MutableStateFlow("")
+    val loggedInUsername: StateFlow<String> = _loggedInUsername.asStateFlow()
+
+    // Feature 5: SSE取消标志
+    var cancelCurrentSSE = false
+    
+    // Feature 4: 掌握程度
+    val showMasteryDialog = MutableStateFlow(false)
+    val currentSolvingRequestId = MutableStateFlow("")
+
+    // Feature 9/10: OCR/手势确认弹窗
+    val showOcrConfirmDialog = MutableStateFlow(false)
+    val ocrConfirmText = MutableStateFlow("")
+    val ocrConfirmTitle = MutableStateFlow("确认识别结果")
+
+    // Feature 3: 提问loading状态
+    val isAskingQuestion = MutableStateFlow(false)
+
+    // Feature 11/12: 番茄钟休息
+    val isResting = MutableStateFlow(false)
+    val restTimeRemaining = MutableStateFlow(0)
+    val pomodoroWorkDuration = MutableStateFlow(25)
+    val pomodoroRestDuration = MutableStateFlow(5)
+
+    // Feature 20: GeoGebra
+    val showGeoGebraScreen = MutableStateFlow(false)
+    val geogebraUrl = MutableStateFlow("")
+
+    init {
+        viewModelScope.launch {
+            delay(100)
+
+            tomatoEnabled.collect { enabled ->
+                if (enabled) {
+                    startTomato()
+                } else {
+                    pomodoroJob?.cancel()
+                }
+            }
+        }
+    }
+
+    fun initApiService(context: android.content.Context) {
+        apiService.init(context)
+        if (apiService.isLoggedIn()) {
+            _isLoggedIn.value = true
+            _loggedInUsername.value = apiService.getUsername() ?: ""
+            _appState.value = AppState.Tracking
+            _statusText.value = "欢迎回来，${_loggedInUsername.value}"
+        } else {
+            _appState.value = AppState.Login()
+        }
+    }
+
+    fun register(username: String, password: String) {
+        _appState.value = AppState.Login(isLoading = true)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = apiService.register(username, password)
+                withContext(Dispatchers.Main) {
+                    _isLoggedIn.value = true
+                    _loggedInUsername.value = result.user.username
+                    _appState.value = AppState.Tracking
+                    _statusText.value = "注册成功，欢迎 ${result.user.username}"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Login(error = e.message ?: "注册失败")
+                }
+            }
+        }
+    }
+
+    fun login(username: String, password: String) {
+        _appState.value = AppState.Login(isLoading = true)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = apiService.login(username, password)
+                withContext(Dispatchers.Main) {
+                    _isLoggedIn.value = true
+                    _loggedInUsername.value = result.user.username
+                    _appState.value = AppState.Tracking
+                    _statusText.value = "登录成功，欢迎 ${result.user.username}"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Login(error = e.message ?: "登录失败")
+                }
+            }
+        }
+    }
+
+    fun logout() {
+        apiService.logout()
+        _isLoggedIn.value = false
+        _loggedInUsername.value = ""
+        _appState.value = AppState.Login()
+        _statusText.value = "已退出登录"
+    }
+
+    private fun startTomato() {
+        pomodoroJob?.cancel()
+        pomodoroJob = viewModelScope.launch {
+            while (isActive && tomatoEnabled.value) {
+                delay(1000)
+                if (_pomodoroTime.value > 0) {
+                    _pomodoroTime.value -= 1
+                } else {
+                    // Feature 11: 番茄钟完成 → 全屏休息
+                    _statusText.value = "完成一个番茄钟！休息一下吧~"
+                    isResting.value = true
+                    restTimeRemaining.value = pomodoroRestDuration.value * 60
+                    // 关闭手势、语音、摄像头（通过Tracking状态控制）
+                    _appState.value = AppState.Tracking
+                    // 休息倒计时
+                    while (isActive && restTimeRemaining.value > 0) {
+                        delay(1000)
+                        restTimeRemaining.value -= 1
+                    }
+                    isResting.value = false
+                    _statusText.value = "休息结束，继续学习！"
+                    _pomodoroTime.value = pomodoroWorkDuration.value * 60
+                }
+            }
+        }
+    }
+
+    private fun startTracking() {
+        _appState.value = AppState.Tracking
+
+        if (tomatoEnabled.value) {
+            _pomodoroTime.value = pomodoroWorkDuration.value * 60
+            startTomato()
+        }
+    }
+
+    fun onFocusStateChanged(focusState: FocusState) {
+        when (focusState) {
+            FocusState.THINKING -> {
+                thinkingJob?.cancel()
+                thinkingJob =
+                        viewModelScope.launch {
+                            _thinkingTimer.value = 0
+                            while (_thinkingTimer.value < 30) {
+                                delay(1000)
+                                _thinkingTimer.value += 1
+                            }
+                            _statusText.value = "需要帮助吗？正在准备解题..."
+                            startSolving()
+                            thinkingJob?.cancel()
+                        }
+            }
+            FocusState.PAGE_TURNING -> {
+                _pageCount.value += 1
+                thinkingJob?.cancel()
+                _thinkingTimer.value = 0
+            }
+            FocusState.WRITING -> {
+                thinkingJob?.cancel()
+                _thinkingTimer.value = 0
+            }
+            FocusState.SEEKING_HELP -> {
+                startSolving()
+            }
+        }
+    }
+
+    fun onGestureDetected(fingerCount: Int) {
+        when (fingerCount) {
+            1 -> {
+                _statusText.value = "更多功能..."
+            }
+            2 -> {
+                // Feature 10: 手势确认弹窗
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "将生成AI学情报告"
+                ocrConfirmTitle.value = "手势识别确认 - AI报告(2指)"
+                _appState.value = AppState.Report(isLoading = true)
+                loadAiReport()
+            }
+            3 -> {
+                // Feature 10: 手势确认弹窗
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "将生成数据学情报告"
+                ocrConfirmTitle.value = "手势识别确认 - 数据报告(3指)"
+                _appState.value = AppState.Report(isLoading = true)
+                loadDataReport()
+            }
+            4 -> {
+                // Feature 10: 手势确认弹窗
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "将触发生成AI动画"
+                ocrConfirmTitle.value = "手势识别确认 - AI动画(4指)"
+                _appState.value = AppState.Animation
+            }
+        }
+    }
+
+    fun handleVoiceCommand(text: String) {
+        when {
+            text.contains("不会") || text.contains("拍照") || text.contains("解题") -> {
+                // Feature 10: 语音识别确认弹窗
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "识别到语音指令：$text"
+                ocrConfirmTitle.value = "语音识别确认"
+                onButtonSolve()
+            }
+            text.contains("抽象") || text.contains("动画") -> {
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "识别到语音指令：$text"
+                ocrConfirmTitle.value = "语音识别确认"
+                onButtonAnimation()
+            }
+            text.contains("做了多少") || text.contains("数据") -> {
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "识别到语音指令：$text"
+                ocrConfirmTitle.value = "语音识别确认"
+                loadDataReport()
+            }
+            text.contains("掌握") || text.contains("了解") -> {
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "识别到语音指令：$text"
+                ocrConfirmTitle.value = "语音识别确认"
+                loadAiReport()
+            }
+            text.contains("还想了解") || text.contains("延伸") -> {
+                showOcrConfirmDialog.value = true
+                ocrConfirmText.value = "识别到语音指令：$text"
+                ocrConfirmTitle.value = "语音识别确认"
+                onButtonExtend()
+            }
+            else -> _statusText.value = "未识别到命令: $text"
+        }
+    }
+
+    fun startSolving() {
+        _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+        _statusText.value = "正在拍照..."
+    }
+
+    fun onPhotoReady(photoFile: java.io.File) {
+        Log.d("MainViewModel", "照片就绪，开始上传: ${photoFile.absolutePath}")
+        cancelCurrentSSE = false  // Feature 5: 重置取消标志
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+                    _statusText.value = "正在上传题目..."
+                }
+
+                val photoBytes = photoFile.readBytes()
+                Log.d("MainViewModel", "调用 apiService.startSolve()")
+                val requestId = apiService.startSolve(photoBytes)
+                Log.d("MainViewModel", "上传成功，requestId=$requestId")
+                currentSolvingRequestId.value = requestId
+
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.ANALYZING)
+                    _statusText.value = "正在分析题目..."
+                }
+
+                Log.d("MainViewModel", "开始连接SSE流...")
+                connectAndReceiveSSE(requestId)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "解题失败: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "解题失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    fun onPhotoError(error: String) {
+        _statusText.value = "拍照失败: $error"
+        _appState.value = AppState.Tracking
+    }
+
+    private suspend fun connectAndReceiveSSE(requestId: String) {
+        val client =
+                OkHttpClient.Builder()
+                        .connectTimeout(30, TimeUnit.SECONDS)
+                        .readTimeout(0, TimeUnit.MILLISECONDS)
+                        .build()
+
+        val request =
+                Request.Builder()
+                        .url("${apiService.getBaseUrl()}/solve/stream/$requestId")
+                        .header("Accept", "text/event-stream")
+                        .build()
+
+        Log.d("MainViewModel", "SSE请求URL: ${request.url}")
+
+        try {
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+
+            if (!response.isSuccessful) {
+                Log.e("MainViewModel", "SSE连接失败: ${response.code}")
+                withContext(Dispatchers.Main) { _statusText.value = "连接失败: ${response.code}" }
+                return
+            }
+
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var eventType = ""
+            var dataBuffer = StringBuilder()
+
+            var solutionSteps = ""
+            var fullSolution = ""
+            var mindMap = ""
+            var suggestedQuestions = emptyList<String>()
+            var ocrText = ""
+
+            while (true) {
+                // Feature 5: 检查取消标志
+                if (cancelCurrentSSE) {
+                    Log.d("MainViewModel", "SSE接收已取消")
+                    reader.close()
+                    response.close()
+                    withContext(Dispatchers.Main) {
+                        _statusText.value = "已取消"
+                        _appState.value = AppState.Tracking
+                    }
+                    return
+                }
+                
+                val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
+
+                when {
+                    line.startsWith("event:") -> {
+                        eventType = line.substring(6).trim()
+                    }
+                    line.startsWith("data:") -> {
+                        dataBuffer.append(line.substring(5).trim())
+                    }
+                    line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                        val data = dataBuffer.toString()
+                        Log.d("MainViewModel", "SSE事件: $data")
+                        dataBuffer = StringBuilder()
+
+                        withContext(Dispatchers.Main) {
+                            try {
+                                val json = JSONObject(data)
+                                val stage = json.optString("stage", "")
+
+                                when (stage) {
+                                    "info" ->
+                                            _statusText.value = json.optString("content", "处理中...")
+                                    "ocr_complete" -> {
+                                        ocrText = json.optString("content", "")
+                                        _statusText.value = "正在搜索题库..."
+                                        // Feature 9: OCR确认弹窗
+                                        showOcrConfirmDialog.value = true
+                                        ocrConfirmText.value = ocrText
+                                        ocrConfirmTitle.value = "确认识别结果"
+                                    }
+                                    "search_complete" -> _statusText.value = "AI正在分析..."
+                                    "question_info" -> _statusText.value = "正在生成解题思路..."
+                                    "solution_steps" -> {
+                                        solutionSteps = json.optString("content", "")
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_STEPS,
+                                                        solutionSteps = solutionSteps
+                                                )
+                                    }
+                                    "solution", "solution_rendered" -> {
+                                        fullSolution = json.optString("content", "")
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_FULL,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution
+                                                )
+                                    }
+                                    "mindmap" -> {
+                                        mindMap = json.optString("content", "")
+                                        mindMap = "```\n" + mindMap + "\n"
+                                        val formattedMindMap = mindMap
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_MINDMAP,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = formattedMindMap
+                                                )
+                                    }
+                                    "suggested_questions" -> {
+                                        val arr = json.optJSONArray("content")
+                                        if (arr != null) {
+                                            suggestedQuestions =
+                                                    (0 until arr.length()).map { arr.getString(it) }
+                                        }
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.INTERACTIVE,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = mindMap,
+                                                        suggestedQuestions = suggestedQuestions
+                                                )
+                                    }
+                                    "complete" -> {
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.COMPLETED,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = mindMap,
+                                                        suggestedQuestions = suggestedQuestions
+                                                )
+                                        _statusText.value = "解答完成"
+                                        // Feature 4: 显示掌握程度弹窗
+                                        showMasteryDialog.value = true
+                                    }
+                                    "error" ->
+                                            _statusText.value = "错误: ${json.optString("content")}"
+                                }
+                            } catch (e: Exception) {
+                                Log.e("MainViewModel", "解析SSE事件失败: $data", e)
+                            }
+                        }
+                    }
+                }
+            }
+            reader.close()
+            response.close()
+        } catch (e: Exception) {
+            Log.e("MainViewModel", "SSE连接失败: ${e.message}", e)
+            withContext(Dispatchers.Main) { _statusText.value = "SSE失败: ${e.message}" }
+        }
+    }
+
+    fun askQuestion(question: String) {
+        val currentState = _appState.value as? AppState.Solving ?: return
+        _statusText.value = "正在获取回答..."
+        isAskingQuestion.value = true  // Feature 3: 显示loading
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val answer =
+                        apiService.askQuestion(
+                                sessionId = currentState.requestId,
+                                question = question
+                        )
+
+                withContext(Dispatchers.Main) {
+                    val updatedSolution =
+                            currentState.fullSolution + "\n\n---\n\n**Q: $question**\n\n$answer"
+
+                    _appState.value =
+                            currentState.copy(
+                                    fullSolution = updatedSolution,
+                                    suggestedQuestions = emptyList()
+                            )
+                    _statusText.value = "已回答"
+                    isAskingQuestion.value = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "提问失败: ${e.message}"
+                    isAskingQuestion.value = false
+                }
+            }
+        }
+    }
+
+    fun requestAnimation(photoFile: java.io.File) {
+        Log.d("MainViewModel", "请求AI动画，上传图片: ${photoFile.absolutePath}")
+        cancelCurrentSSE = false
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Animation  // Feature 6: loading状态
+                    _statusText.value = "正在生成动画..."
+                }
+
+                val photoBytes = photoFile.readBytes()
+                val response = apiService.requestAnimation(photoBytes)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        _statusText.value = "动画已生成"
+                        _animationUrl.value = "${apiService.getBaseUrl()}${response.url}"
+                    } else {
+                        _statusText.value = "动画生成失败: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "动画请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    fun loadAiReport() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Report(isLoading = true)  // Feature 6: loading状态
+                    _statusText.value = "正在生成AI学情报告..."
+                }
+
+                val response = apiService.getAiReport(7)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        _appState.value =
+                                AppState.Report(reportText = response.report, isLoading = false)
+                        _statusText.value = "AI报告已生成"
+                    } else {
+                        _statusText.value = "报告生成失败: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "报告请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    fun loadDataReport() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Report(isLoading = true)  // Feature 6: loading状态
+                    _statusText.value = "正在生成数据学情报告..."
+                }
+
+                val response = apiService.getDataReport(7)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        val fullUrl = "${apiService.getBaseUrl()}${response.url}"
+                        _appState.value =
+                                AppState.Report(
+                                        reportText = fullUrl,
+                                        isLoading = false
+                                )
+                        _statusText.value = "数据报告已生成"
+                    } else {
+                        _statusText.value = "报告生成失败: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "报告请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    fun requestKnowledgeExtension(photoFile: java.io.File) {
+        Log.d("MainViewModel", "请求知识延伸: ${photoFile.absolutePath}")
+        cancelCurrentSSE = false
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Knowledge()  // Feature 6: loading状态
+                    _statusText.value = "正在上传..."
+                }
+
+                val photoBytes = photoFile.readBytes()
+                val requestId = apiService.startExtend(photoBytes)
+
+                withContext(Dispatchers.Main) { _statusText.value = "正在分析..." }
+
+                connectExtendSSE(requestId)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    private suspend fun connectExtendSSE(requestId: String) {
+        val client =
+                OkHttpClient.Builder()
+                        .connectTimeout(30, TimeUnit.SECONDS)
+                        .readTimeout(0, TimeUnit.MILLISECONDS)
+                        .build()
+
+        val request =
+                Request.Builder()
+                        .url("${apiService.getBaseUrl()}/extend/stream/$requestId")
+                        .header("Accept", "text/event-stream")
+                        .build()
+
+        try {
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var dataBuffer = StringBuilder()
+            var summary = ""
+            var mistakes = ""
+            var extension = ""
+            var questions = emptyList<String>()
+
+            while (true) {
+                val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
+
+                when {
+                    line.startsWith("data:") -> {
+                        dataBuffer.append(line.substring(5).trim())
+                    }
+                    line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                        val data = dataBuffer.toString()
+                        dataBuffer = StringBuilder()
+
+                        withContext(Dispatchers.Main) {
+                            val json = JSONObject(data)
+                            val stage = json.optString("stage")
+
+                            when (stage) {
+                                "info" -> _statusText.value = json.optString("content", "处理中...")
+                                "ocr_complete" -> _statusText.value = "正在分析内容..."
+                                "question_info" -> {
+                                    _appState.value = AppState.Knowledge()
+                                    _statusText.value = "正在总结知识点..."
+                                }
+                                "mistakes" -> {
+                                    mistakes = json.optString("content", "")
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes
+                                            )
+                                    _statusText.value = "易错点已生成"
+                                }
+                                "extension" -> {
+                                    extension = json.optString("content", "")
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension
+                                            )
+                                    _statusText.value = "知识拓展已生成"
+                                }
+                                "suggested_questions" -> {
+                                    val arr = json.optJSONArray("content")
+                                    if (arr != null) {
+                                        questions = (0 until arr.length()).map { arr.getString(it) }
+                                    }
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension,
+                                                    suggestedQuestions = questions
+                                            )
+                                    _statusText.value = "延伸完成"
+                                }
+                                "complete" -> {
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension,
+                                                    suggestedQuestions = questions
+                                            )
+                                    _statusText.value = "延伸完成"
+                                }
+                                "error" -> _statusText.value = "错误: ${json.optString("content")}"
+                            }
+                        }
+                    }
+                }
+            }
+            reader.close()
+            response.close()
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) { _statusText.value = "连接失败: ${e.message}" }
+        }
+    }
+
+    fun backToTracking() {
+        cancelCurrentSSE = true  // Feature 5: 取消当前SSE接收
+        isAskingQuestion.value = false
+        showMasteryDialog.value = false
+        showOcrConfirmDialog.value = false
+        _appState.value = AppState.Tracking
+        _statusText.value = "跟踪学习中..."
+    }
+
+    // Feature 11: 跳过休息
+    fun skipRest() {
+        isResting.value = false
+        restTimeRemaining.value = 0
+        _pomodoroTime.value = pomodoroWorkDuration.value * 60
+        _statusText.value = "休息结束，继续学习！"
+    }
+
+    private val _detectedFingerCount = MutableStateFlow(0)
+    val detectedFingerCount: StateFlow<Int> = _detectedFingerCount.asStateFlow()
+
+    fun setFingerCount(count: Int) {
+        _detectedFingerCount.value = count
+    }
+
+    val showSettingsDialog = MutableStateFlow(false)
+    val showWelcomeDialog = MutableStateFlow(true)
+    val showHistoryScreen = MutableStateFlow(false)
+
+    val gestureEnabled = MutableStateFlow(false)
+    val voiceEnabled = MutableStateFlow(false)
+    val tomatoEnabled = MutableStateFlow(false)
+    val serverAddress = MutableStateFlow("10.100.55.167:8000")
+    val themeColor = MutableStateFlow(Color(0xFF00D2FF))
+    val fontSize = MutableStateFlow(16f)
+
+    val showModules =
+            MutableStateFlow(
+                    mapOf(
+                            "solution_steps" to true,
+                            "full_solution" to true,
+                            "mind_map" to true,
+                            "suggested_questions" to true,
+                            "mistakes" to true,
+                            "extension" to true,
+                    )
+            )
+
+    val aiEngine = MutableStateFlow("deepseek")
+    val historyStartDate = MutableStateFlow("")
+    val historyEndDate = MutableStateFlow("")
+
+    fun updateServerAddress(address: String) {
+        serverAddress.value = address.removePrefix("http://")
+        apiService.updateServerAddress(address)
+        Log.d("MainViewModel", "服务器地址已更新: $address")
+    }
+
+    fun showSettings() {
+        showSettingsDialog.value = true
+    }
+    fun showHistory() {
+        showHistoryScreen.value = true
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                apiService.clearHistory()
+                withContext(Dispatchers.Main) { _statusText.value = "历史记录已清除" }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusText.value = "清除失败: ${e.message}" }
+            }
+        }
+    }
+
+    var onButtonTakePhoto: (() -> Unit)? = null
+    var onButtonAnimation: (() -> Unit)? = null
+    var onButtonExtend: (() -> Unit)? = null
+
+    fun onButtonSolve() {
+        _statusText.value = "正在拍照..."
+        onButtonTakePhoto?.invoke()
+    }
+
+    fun onButtonAnimation() {
+        _statusText.value = "正在准备动画..."
+        onButtonAnimation?.invoke()
+    }
+
+    fun onButtonExtend() {
+        _statusText.value = "正在准备知识延伸..."
+        onButtonExtend?.invoke()
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        thinkingJob?.cancel()
+        pomodoroJob?.cancel()
+    }
+}
+
+
+class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val TAG = "LearningAssistant"
+    }
+
+    private lateinit var cameraExecutor: java.util.concurrent.ExecutorService
+
+    private var imageCapture: ImageCapture? = null
+    private val gestureRecognizerState = MutableStateFlow<HandGestureRecognizer?>(null)
+    private val isCameraReady = MutableStateFlow(false)
+
+
+    private val hasCameraPermission = MutableStateFlow(false)
+
+    private lateinit var mainViewModel: MainViewModel
+
+    private val cameraRebindTrigger = MutableStateFlow(0)
+
+    var onTakePhoto: ((ImageCapture) -> Unit)? = null
+
+    private val requestPermissionLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                    permissions ->
+                val granted = permissions.values.all { it }
+                if (granted) {
+                    Log.d(TAG, "所有权限已授予")
+                    hasCameraPermission.value = true
+                } else {
+                    Log.w(TAG, "权限被拒绝")
+                    Toast.makeText(this, "需要相机权限才能正常使用", Toast.LENGTH_LONG).show()
+                    hasCameraPermission.value = false
+                }
+            }
+
+    private val serverDiscoverer = ServerDiscoverer()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        discoverAndConnect()
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        initGestureRecognizer()
+
+        val hasCamera =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                    PackageManager.PERMISSION_GRANTED
+        val hasInternet =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) ==
+                    PackageManager.PERMISSION_GRANTED
+        Log.d(TAG, "权限状态- 相机:$hasCamera, 网络:$hasInternet")
+
+        if (hasCamera) {
+            hasCameraPermission.value = true
+            Log.d(TAG, "相机权限已授予，直接设置")
+        } else {
+            Log.d(TAG, "相机权限未授予，主动请求")
+            requestPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.INTERNET,
+                    Manifest.permission.ACCESS_NETWORK_STATE,
+                    Manifest.permission.RECORD_AUDIO,
+                )
+            )
+        }
+
+        setContent {
+            LearningAssistantTheme {
+                val viewModel = viewModel<MainViewModel>()
+                mainViewModel = viewModel
+
+                LaunchedEffect(Unit) {
+                    viewModel.initApiService(this@MainActivity)
+                }
+
+                fun requireCamera(action: String, takeAction: (ImageCapture) -> Unit) {
+                    Log.d(TAG, "$action: imageCapture=${imageCapture}, isCameraReady=${isCameraReady.value}")
+                    if (!isCameraReady.value) {
+                        Toast.makeText(this@MainActivity, "相机未就绪，请稍后再试", Toast.LENGTH_SHORT).show()
+                        return
+                    }
+                    imageCapture?.let { capture ->
+                        takeAction(capture)
+                    } ?: run {
+                        Log.e(TAG, "imageCapture 为 null")
+                        Toast.makeText(this@MainActivity, "相机未就绪，请稍后再试", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                viewModel.onButtonTakePhoto = {
+                    requireCamera("onButtonTakePhoto") { capture ->
+                        takePhotoAndUpload(capture, viewModel)
+                    }
+                }
+
+                viewModel.onButtonAnimation = {
+                    requireCamera("onButtonAnimation") { capture ->
+                        takePhotoAndUploadAnimation(capture, viewModel)
+                    }
+                }
+
+                viewModel.onButtonExtend = {
+                    requireCamera("onButtonExtend") { capture ->
+                        takePhotoAndUploadExtend(capture, viewModel)
+                    }
+                }
+
+                MainScreen(
+                    hasCameraPermission = hasCameraPermission.collectAsState().value,
+                    gestureRecognizer = gestureRecognizerState.collectAsState().value,
+                    viewModel = viewModel,
+                    onImageCaptureReady = { capture ->
+                        imageCapture = capture
+                        isCameraReady.value = true
+                        Log.d(TAG, "ImageCapture 已就绪")
+                    },
+                    cameraRebindTrigger = cameraRebindTrigger.collectAsState().value
+                )
+            }
+        }
+    }
+
+    private fun discoverAndConnect() {
+        lifecycleScope.launch {
+            delay(500)
+            val address = serverDiscoverer.discover()
+            if (address != null) {
+                Log.d(TAG, "自动发现成功: $address")
+                mainViewModel.updateServerAddress(address)
+            } else {
+                Log.w(TAG, "未发现服务端，将使用默认地址")
+            }
+        }
+    }
+
+    private fun takePhotoAndUpload(capture: ImageCapture, viewModel: MainViewModel) {
+        if (!isCameraReady.value) {
+            viewModel.onPhotoError("相机未就绪")
+            return
+        }
+
+        val photoFile = java.io.File(externalCacheDir, "solve_${System.currentTimeMillis()}.jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        val mainHandler = Handler(Looper.getMainLooper())
+        val timeoutRunnable = Runnable {
+            Log.e(TAG, "拍照超时")
+            viewModel.onPhotoError("拍照超时")
+        }
+        mainHandler.postDelayed(timeoutRunnable, 5000)
+
+        capture.takePicture(
+            outputOptions,
+            cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    Log.d(TAG, "照片已保存: ${photoFile.absolutePath}")
+                    viewModel.onPhotoReady(photoFile)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    Log.e(TAG, "拍照失败: ${exception.message}")
+                    if (exception.message?.contains("closed") == true) {
+                        isCameraReady.value = false
+                        imageCapture = null
+                        cameraRebindTrigger.value += 1
+                    }
+                    viewModel.onPhotoError(exception.message ?: "拍照失败")
+                }
+            }
+        )
+    }
+
+    private fun takePhotoAndUploadAnimation(capture: ImageCapture, viewModel: MainViewModel) {
+        val photoFile = java.io.File(externalCacheDir, "anim_${System.currentTimeMillis()}.jpg")
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        Log.d(TAG, "动画照片已保存: ${photoFile.absolutePath}")
+                        viewModel.requestAnimation(photoFile)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "拍照失败: ${exception.message}")
+                    }
+                }
+        )
+    }
+
+    private fun initGestureRecognizer() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val recognizer = HandGestureRecognizer(
+                    context = this@MainActivity,
+                    onGestureDetected = { fingerCount ->
+                        Log.d(TAG, "手势识别: $fingerCount 根手指")
+                            runOnUiThread {
+                                when (fingerCount) {
+                                    5 -> {
+                                        mainViewModel.startSolving()
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUpload(capture, mainViewModel)
+                                        }
+                                                ?: Log.e(TAG, "imageCapture 为空，无法拍照")
+                                    }
+                                    4 -> {
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUploadAnimation(capture, mainViewModel)
+                                        }
+                                                ?: Log.e(TAG, "imageCapture 为空，无法拍照")
+                                    }
+                                    3 -> {
+                                        mainViewModel.onGestureDetected(3)
+                                    }
+                                    2 -> {
+                                        mainViewModel.onGestureDetected(2)
+                                    }
+                                    1 -> {
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUploadExtend(capture, mainViewModel)
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        onFingerCountChanged = { fingerCount ->
+                            runOnUiThread { mainViewModel.setFingerCount(fingerCount) }
+                        },
+                        onError = { error ->
+                            Log.e(TAG, "手势识别错误: ${error.message}")
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "手势识别失败: ${error.message}", Toast.LENGTH_SHORT)
+                                        .show()
+                            }
+                        }
+                )
+            
+            withContext(Dispatchers.Main) {
+                gestureRecognizerState.value = recognizer
+                Log.d(TAG, "手势识别器初始化完成")
+            }
+        }
+    }
+
+    private fun requestCameraPermissions() {
+        val permissions =
+                arrayOf(
+                        Manifest.permission.CAMERA,
+                        Manifest.permission.INTERNET,
+                        Manifest.permission.ACCESS_NETWORK_STATE,
+                )
+
+        val needRequest =
+                permissions.any {
+                    val hasIt =
+                            ContextCompat.checkSelfPermission(this, it) ==
+                                    PackageManager.PERMISSION_GRANTED
+                    Log.d(TAG, "权限 $it: ${if (hasIt) "已授予" else "未授予"}")
+                    !hasIt
+                }
+
+        if (needRequest) {
+            Log.d(TAG, "正在请求权限...")
+            requestPermissionLauncher.launch(permissions)
+        } else {
+            Log.d(TAG, "所有权限已授予，无需请求")
+            hasCameraPermission.value = true
+        }
+    }
+
+    private fun takePhotoAndUploadExtend(capture: ImageCapture, viewModel: MainViewModel) {
+        val photoFile = java.io.File(externalCacheDir, "extend_${System.currentTimeMillis()}.jpg")
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        Log.d(TAG, "延伸照片已保存: ${photoFile.absolutePath}")
+                        viewModel.requestKnowledgeExtension(photoFile)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "拍照失败: ${exception.message}")
+                    }
+                }
+        )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        gestureRecognizerState.value?.close()
+        cameraExecutor.shutdown()
+    }
+}
+
+@Composable
+fun MainScreen(
+    hasCameraPermission: Boolean = false,
+    gestureRecognizer: HandGestureRecognizer? = null,
+    viewModel: MainViewModel,
+    onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
+    cameraRebindTrigger: Int = 0,
+) {
+    val appState by viewModel.appState.collectAsState()
+    val statusText by viewModel.statusText.collectAsState()
+    val gestureEnabled by viewModel.gestureEnabled.collectAsState()
+    val isMainScreen = appState is AppState.Tracking
+    val showModules by viewModel.showModules.collectAsState()
+    val isAskingQuestion by viewModel.isAskingQuestion.collectAsState()
+    val animationUrl by viewModel.animationUrl.collectAsState()
+    val showWelcome by viewModel.showWelcomeDialog.collectAsState()
+    val showSettings by viewModel.showSettingsDialog.collectAsState()
+    val showHistory by viewModel.showHistoryScreen.collectAsState()
+    val showMastery by viewModel.showMasteryDialog.collectAsState()
+    val showOcr by viewModel.showOcrConfirmDialog.collectAsState()
+    val ocrConfirmTitle by viewModel.ocrConfirmTitle.collectAsState()
+    val ocrConfirmText by viewModel.ocrConfirmText.collectAsState()
+    val showGeoGebra by viewModel.showGeoGebraScreen.collectAsState()
+
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A1A))) {
+        // Feature 11: 番茄钟休息全屏界面
+        val isResting by viewModel.isResting.collectAsState()
+        if (isResting) {
+            PomodoroRestScreen(viewModel = viewModel)
+            return@Box
+        }
+
+        if (hasCameraPermission) {
+            CameraPreviewView(
+                modifier = if (isMainScreen) Modifier.fillMaxSize() else Modifier.fillMaxSize().alpha(0f),
+                gestureRecognizer = if (gestureEnabled && isMainScreen) gestureRecognizer else null,
+                onImageCaptureReady = onImageCaptureReady,
+                onCameraReady = {
+                    Log.d("MainScreen", "相机已就绪")
+                },
+                rebindKey = cameraRebindTrigger
+            )
+        }
+        when (val state = appState) {
+            is AppState.Login ->
+                LoginScreen(
+                    isLoading = state.isLoading,
+                    error = state.error,
+                    onLogin = { username, password -> viewModel.login(username, password) },
+                    onRegister = { username, password -> viewModel.register(username, password) },
+                )
+            is AppState.Tracking ->
+                MainMenuScreen(
+                    viewModel = viewModel,
+                    statusText = statusText,
+                    gestureEnabled = gestureEnabled,
+                )
+            is AppState.Solving ->
+                SolvingScreen(
+                    solveState = state,
+                    showModules = showModules,
+                    onAskQuestion = { viewModel.askQuestion(it) },
+                    onBack = { viewModel.backToTracking() },
+                    isAskingQuestion = isAskingQuestion,
+                    viewModel = viewModel,
+                )
+            is AppState.Report -> {
+                val isDataReport = state.reportText.startsWith("http")
+                if (state.isLoading) {
+                    LoadingOverlay("正在生成报告...")
+                } else {
+                    ReportScreen(
+                            report = state,
+                            onBack = { viewModel.backToTracking() },
+                            reportUrl = if (isDataReport) state.reportText else "",
+                            reportText = if (!isDataReport) state.reportText else "",
+                    )
+                }
+            }
+            is AppState.Animation -> {
+                if (animationUrl.isEmpty()) {
+                    LoadingOverlay("正在生成动画...")
+                } else {
+                    AnimationScreen(
+                            onBack = { viewModel.backToTracking() },
+                            animationUrl = animationUrl
+                    )
+                }
+            }
+            is AppState.History ->
+                    HistoryScreen(
+                            onBack = { viewModel.backToTracking() },
+                    )
+            is AppState.Knowledge ->
+                    KnowledgeScreen(
+                            state = state,
+                            showModules = showModules,
+                            onAskQuestion = { viewModel.askQuestion(it) },
+                            onBack = { viewModel.backToTracking() },
+                    )
+        }
+
+        if (showWelcome) {
+            WelcomeDialog(onDismiss = { viewModel.showWelcomeDialog.value = false })
+        }
+
+        if (showSettings) {
+            SettingsDialog(
+                    viewModel = viewModel,
+                    onDismiss = { viewModel.showSettingsDialog.value = false }
+            )
+        }
+        if (showHistory) {
+            HistoryViewScreen(
+                viewModel = viewModel,
+                onBack = { viewModel.showHistoryScreen.value = false }
+            )
+        }
+
+        // Feature 4: 掌握程度弹窗
+        if (showMastery) {
+            MasteryDialog(
+                onSelect = { level ->
+                    viewModel.showMasteryDialog.value = false
+                    viewModel.viewModelScope.launch(Dispatchers.IO) {
+                        try {
+                            val api = ApiService()
+                            api.saveMastery(viewModel.currentSolvingRequestId.value, level)
+                        } catch (e: Exception) {
+                            Log.e("MainViewModel", "保存掌握程度失败: ${e.message}")
+                        }
+                    }
+                }
+            )
+        }
+
+        // Feature 9: OCR确认弹窗
+        if (showOcr) {
+            CountdownConfirmDialog(
+                title = ocrConfirmTitle,
+                content = ocrConfirmText,
+                onConfirm = {
+                    viewModel.showOcrConfirmDialog.value = false
+                },
+                onCancel = {
+                    viewModel.showOcrConfirmDialog.value = false
+                    viewModel.backToTracking()
+                }
+            )
+        }
+
+        // Feature 20: GeoGebra图形页面
+        if (showGeoGebra) {
+            GeoGebraScreen(
+                onBack = { viewModel.showGeoGebraScreen.value = false }
+            )
+        }
+    }
+}
+
+
+@Composable
+fun CameraPreviewView(
+    modifier: Modifier = Modifier,
+    gestureRecognizer: HandGestureRecognizer? = null,
+    onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
+    onCameraReady: (() -> Unit)? = null,
+    rebindKey: Int = 0,
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+
+    val hasPermission =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+
+    if (!hasPermission) {
+        Box(modifier = modifier.background(Color.Black))
+        return
+    }
+
+    val cameraState = remember {
+        mutableStateOf<ProcessCameraProvider?>(null)
+    }
+
+    val imageCaptureRef = remember { mutableStateOf<ImageCapture?>(null) }
+    val isBound = remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        var retryCount = 0
+        val maxRetries = 5
+        while (retryCount < maxRetries && cameraState.value == null) {
+            try {
+                val cameraProvider = withContext(Dispatchers.IO) {
+                    val future = ProcessCameraProvider.getInstance(context)
+                    try {
+                        future.get(10, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (e: java.util.concurrent.TimeoutException) {
+                        Log.w("CameraPreview", "获取 CameraProvider 超时 (第${retryCount + 1}次)")
+                        null
+                    }
+                }
+                if (cameraProvider != null) {
+                    cameraState.value = cameraProvider
+                    Log.d("CameraPreview", "CameraProvider 获取成功")
+                } else {
+                    retryCount++
+                    if (retryCount < maxRetries) {
+                        delay(2000)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CameraPreview", "获取 CameraProvider 失败 (第${retryCount + 1}次)", e)
+                retryCount++
+                if (retryCount < maxRetries) {
+                    delay(2000)
+                }
+            }
+        }
+        if (cameraState.value == null) {
+            Log.e("CameraPreview", "CameraProvider 获取失败，已重试 $maxRetries 次")
+        }
+    }
+
+    LaunchedEffect(cameraState.value, lifecycleOwner, rebindKey) {
+        val cameraProvider = cameraState.value ?: return@LaunchedEffect
+        val currentLifecycle = lifecycleOwner
+
+        cameraProvider.unbindAll()
+        isBound.value = false
+
+        val preview = Preview.Builder().build()
+
+        val imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .build()
+
+        val useCases = mutableListOf<UseCase>(preview, imageCapture)
+
+        if (gestureRecognizer != null) {
+            val analyzer = CameraAnalyzer(gestureRecognizer, processIntervalMs = 60)
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also {
+                    it.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
+                }
+            useCases.add(imageAnalysis)
+        }
+
+        try {
+            withContext(Dispatchers.Main) {
+                cameraProvider.bindToLifecycle(
+                    currentLifecycle,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    *useCases.toTypedArray()
+                )
+            }
+
+            imageCaptureRef.value = imageCapture
+            onImageCaptureReady?.invoke(imageCapture)
+            isBound.value = true
+            onCameraReady?.invoke()
+
+            Log.d("CameraPreview", "相机绑定成功")
+        } catch (e: Exception) {
+            Log.e("CameraPreview", "相机绑定失败", e)
+        }
+    }
+
+    LaunchedEffect(gestureRecognizer) {
+        val cameraProvider = cameraState.value ?: return@LaunchedEffect
+        if (!isBound.value) return@LaunchedEffect
+        
+        cameraProvider.unbindAll()
+        
+        val preview = Preview.Builder().build()
+        val imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .build()
+        
+        val useCases = mutableListOf<UseCase>(preview, imageCapture)
+
+        if (gestureRecognizer != null) {
+            val analyzer = CameraAnalyzer(gestureRecognizer, processIntervalMs = 60)
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also {
+                    it.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
+                }
+            useCases.add(imageAnalysis)
+        }
+        
+        try {
+            cameraProvider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                *useCases.toTypedArray()
+            )
+            imageCaptureRef.value = imageCapture
+            onImageCaptureReady?.invoke(imageCapture)
+            Log.d("CameraPreview", "Gesture: ${if (gestureRecognizer != null) "enabled" else "disabled"}")
+        } catch (e: Exception) {
+            Log.e("CameraPreview", "Failed to update gesture analyzer", e)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                cameraState.value?.unbindAll()
+                Log.d("CameraPreview", "相机已解绑")
+            } catch (e: Exception) {
+                Log.e("CameraPreview", "解绑相机失败", e)
+            }
+        }
+    }
+
+    Box(modifier = modifier)
+}
+
+
+@Composable
+fun TrackingOverlay(
+        statusText: String,
+        pomodoroTime: Int,
+        pageCount: Int,
+        thinkingTimer: Int,
+        fingerCount: Int = 0,
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+                modifier =
+                        Modifier.align(Alignment.TopCenter)
+                                .padding(16.dp)
+                                .background(Color(0xAA000000))
+                                .padding(12.dp)
+        ) {
+            Text(
+                    text = statusText,
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(text = "${formatTime(pomodoroTime)}", color = Color.White, fontSize = 14.sp)
+                Text(text = "已做${pageCount}页", color = Color.White, fontSize = 14.sp)
+            }
+
+            if (thinkingTimer > 0) {
+                Text(
+                        text = "思考中... ${thinkingTimer}s",
+                        color = Color(0xFFFFD700),
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+        }
+
+        if (fingerCount > 0) {
+            Text(
+                    text = "$fingerCount 根手指",
+                    color = Color(0xFF00FF00),
+                    fontSize = 48.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier =
+                            Modifier.align(Alignment.Center)
+                                    .background(Color(0xAA000000))
+                                    .padding(16.dp)
+            )
+        }
+
+        if (fingerCount > 0) {
+            Text(
+                    text = "手势命令: 5→解题 | 4→动画 | 3→数据报告 | 2→AI报告 | 1→知识延伸",
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 12.sp,
+                    modifier =
+                            Modifier.align(Alignment.BottomCenter)
+                                    .padding(16.dp)
+                                    .background(Color(0x55000000))
+                                    .padding(8.dp)
+            )
+        }
+    }
+}
+
+
+@Composable
+fun LoginScreen(
+    isLoading: Boolean = false,
+    error: String = "",
+    onLogin: (String, String) -> Unit,
+    onRegister: (String, String) -> Unit,
+) {
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var isRegisterMode by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A1A))
+            .padding(32.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "📎 学习助手",
+                    color = Color(0xFF00D2FF),
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (isRegisterMode) "创建新账号" else "登录",
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("用户名", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    enabled = !isLoading,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF00D2FF),
+                        unfocusedBorderColor = Color.Gray,
+                        cursorColor = Color(0xFF00D2FF),
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("密码", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    enabled = !isLoading,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF00D2FF),
+                        unfocusedBorderColor = Color.Gray,
+                        cursorColor = Color(0xFF00D2FF),
+                    )
+                )
+
+                if (error.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = error,
+                        color = Color(0xFFFF5722),
+                        fontSize = 13.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Button(
+                    onClick = {
+                        if (username.isNotBlank() && password.isNotBlank()) {
+                            if (isRegisterMode) {
+                                onRegister(username.trim(), password)
+                            } else {
+                                onLogin(username.trim(), password)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    enabled = !isLoading && username.isNotBlank() && password.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            color = Color.White,
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text(
+                            text = if (isRegisterMode) "注册" else "登录",
+                            color = Color.Black,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                TextButton(onClick = { isRegisterMode = !isRegisterMode }) {
+                    Text(
+                        text = if (isRegisterMode) {
+                            "已有账号？点击登录"
+                        } else {
+                            "没有账号？点击注册"
+                        },
+                        color = Color(0xFF00D2FF),
+                        fontSize = 14.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+fun SolvingScreen(
+        solveState: AppState.Solving,
+        showModules: Map<String, Boolean> = emptyMap(),
+        onAskQuestion: (String) -> Unit,
+        onBack: () -> Unit,
+        isAskingQuestion: Boolean = false,
+        viewModel: MainViewModel? = null,
+) {
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        val solvingFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
+        Column(
+                modifier =
+                        Modifier.fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(16.dp)
+        ) {
+            // Feature 14: 固定返回按钮在顶部
+            Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text(
+                        text =
+                                when (solveState.stage) {
+                                    SolveStage.UPLOADING -> "上传中..."
+                                    SolveStage.ANALYZING -> "分析中..."
+                                    SolveStage.DISPLAY_STEPS -> "解题思路"
+                                    SolveStage.DISPLAY_FULL -> "完整解析"
+                                    SolveStage.DISPLAY_MINDMAP -> "思维导图"
+                                    SolveStage.INTERACTIVE -> "互动问答"
+                                    SolveStage.COMPLETED -> "解答完成"
+                                },
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            if (solveState.stage == SolveStage.UPLOADING || solveState.stage == SolveStage.ANALYZING) {
+                Box(
+                        modifier = Modifier.fillMaxWidth().height(200.dp),
+                        contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = Color(0xFF00D2FF))
+                    Text(
+                            text = "正在分析题目...",
+                            color = Color.White,
+                            modifier = Modifier.padding(top = 80.dp)
+                    )
+                }
+            }
+
+            if (solveState.solutionSteps.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
+                SolutionCard(
+                        title = "💡 解题思路",
+                        content = solveState.solutionSteps,
+                        color = Color(0xFF00D2FF),
+                        fontSize = solvingFontSize
+                )
+            }
+
+            if (solveState.fullSolution.isNotEmpty() && showModules.getOrDefault("full_solution", true)) {
+                SolutionCard(
+                        title = "📝 完整解析",
+                        content = solveState.fullSolution,
+                        color = Color(0xFF7B2FBE),
+                        fontSize = solvingFontSize
+                )
+            }
+
+            if (solveState.mindMap.isNotEmpty() && showModules.getOrDefault("mind_map", true)) {
+                SolutionCard(
+                        title = "🗺️ 思维导图",
+                        content = solveState.mindMap,
+                        color = Color(0xFF00C853),
+                        fontSize = solvingFontSize
+                )
+            }
+
+            if (solveState.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
+                Text(
+                        text = "💬 您可能还想问：",
+                        color = Color.White,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                )
+
+                solveState.suggestedQuestions.forEach { question ->
+                    Button(
+                            onClick = { onAskQuestion(question) },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
+                            enabled = !isAskingQuestion
+                    ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                }
+
+                // Feature 2: 两个固定按钮指令
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                        text = "📌 固定指令：",
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                )
+                Button(
+                        onClick = { onAskQuestion("有没有更加简单或便捷的方法？") },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
+                        enabled = !isAskingQuestion
+                ) { Text("🟢 有没有更加简单或便捷的方法？", color = Color.White, fontSize = 14.sp) }
+                Button(
+                        onClick = { onAskQuestion("请添加更多图形以辅助理解") },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0D47A1)),
+                        enabled = !isAskingQuestion
+                ) { Text("🔵 请添加更多图形以辅助理解", color = Color.White, fontSize = 14.sp) }
+
+                // Feature 20: GeoGebra按钮
+                Button(
+                        onClick = { viewModel?.showGeoGebraScreen?.value = true },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
+                        enabled = !isAskingQuestion
+                ) { Text("📐 查看GeoGebra图形", color = Color.White, fontSize = 14.sp) }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+
+        // Feature 3: 提问时的loading遮罩
+        if (isAskingQuestion) {
+            LoadingOverlay("正在获取回答...")
+        }
+    }
+}
+
+@Composable
+fun SolutionCard(title: String, content: String, color: Color, fontSize: Float = 18f) {
+    Card(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                    text = title,
+                    color = color,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
+        }
+    }
+}
+
+@Composable
+fun ReportScreen(
+        report: AppState.Report,
+        onBack: () -> Unit,
+        reportUrl: String = "",
+        reportText: String = ""
+) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        // Feature 14: 固定返回按钮在顶部
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text("学情报告", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(60.dp))  // 平衡布局
+            }
+        }
+
+        if (reportUrl.isNotEmpty()) {
+            AndroidView(
+                    factory = { ctx ->
+                        android.webkit.WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
+                            // Feature 15: 禁用缩放和交互
+                            settings.builtInZoomControls = false
+                            settings.displayZoomControls = false
+                            settings.setSupportZoom(false)
+                            setInitialScale(50)
+                            isClickable = false
+                            isFocusable = false
+                            setOnTouchListener { _, _ -> true }  // 拦截所有触摸事件
+                            loadUrl(reportUrl)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+            )
+        } else if (reportText.isNotEmpty()) {
+            MarkdownView(content = reportText, modifier = Modifier.fillMaxSize().padding(16.dp))
+        } else if (report.isLoading) {
+            LoadingOverlay("正在生成报告...")
+        }
+    }
+}
+
+@Composable
+fun KnowledgeScreen(
+        state: AppState.Knowledge,
+        showModules: Map<String, Boolean> = emptyMap(),
+        onAskQuestion: (String) -> Unit,
+        onBack: () -> Unit,
+) {
+    Column(
+            modifier =
+                    Modifier.fillMaxSize()
+                            .background(Color(0xFF1A1A2E))
+    ) {
+        // Feature 14: 固定返回按钮在顶部
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text("📎 知识延伸", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(60.dp))
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            if (state.summary.isEmpty() && state.mistakes.isEmpty()) {
+                LoadingOverlay("正在分析内容...")
+            }
+
+            if (state.summary.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
+                SolutionCard("📝 知识点总结", state.summary, Color(0xFF00D2FF))
+            }
+
+            if (state.mistakes.isNotEmpty() && showModules.getOrDefault("mistakes", true)) {
+                SolutionCard("Mistakes", state.mistakes, Color(0xFFFF5722))
+            }
+
+            if (state.extension.isNotEmpty() && showModules.getOrDefault("extension", true)) {
+                SolutionCard("🚀 知识拓展", state.extension, Color(0xFF7B2FBE))
+            }
+
+            if (state.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
+                Text(
+                        text = "💬 延伸思考：",
+                        color = Color.White,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                )
+
+                state.suggestedQuestions.forEach { question ->
+                    Button(
+                            onClick = { onAskQuestion(question) },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                    ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
+    val context = LocalContext.current
+
+    if (animationUrl.isEmpty()) {
+        Box(
+                modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E)),
+                contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("🎬 AI动画", color = Color.White, fontSize = 24.sp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("正在加载动画...", color = Color.Gray, fontSize = 16.sp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = onBack) { Text("返回") }
+            }
+        }
+        return
+    }
+
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        // Feature 14: 固定返回按钮
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text("🎬 AI动画", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(60.dp))
+            }
+        }
+
+        AndroidView(
+                factory = { ctx ->
+                    android.webkit.WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.allowFileAccess = true
+                        settings.domStorageEnabled = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
+                        settings.builtInZoomControls = false
+                        settings.displayZoomControls = false
+                        settings.setSupportZoom(false)
+                        loadUrl(animationUrl)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+        )
+    }
+}
+
+@Composable
+fun HistoryScreen(onBack: () -> Unit) {
+    Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E)),
+            contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("📎 历史记录", color = Color.White, fontSize = 24.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("请在设置中打开历史记录", color = Color.Gray, fontSize = 14.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(onClick = onBack) { Text("返回") }
+        }
+    }
+}
+
+fun formatTime(seconds: Int): String {
+    val mins = seconds / 60
+    val secs = seconds % 60
+    return "%02d:%02d".format(mins, secs)
+}
+
+@Composable
+fun MarkdownView(
+    content: String,
+    modifier: Modifier = Modifier,
+    fontSize: Float = 18f,
+    onRendered: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+
+    val processedContent = remember(content) { prepareMarkdownContent(content) }
+
+    val markwon = remember {
+        Markwon.builder(context)
+                .usePlugin(MarkwonInlineParserPlugin.create())
+                .usePlugin(StrikethroughPlugin.create())
+                .usePlugin(TablePlugin.create(context))
+                .usePlugin(
+                        ImagesPlugin.create { plugin ->
+                            plugin.errorHandler { _, _ ->
+                                android.graphics.drawable.ColorDrawable(android.graphics.Color.RED)
+                            }
+                            plugin.placeholderProvider {
+                                android.graphics.drawable.ColorDrawable(
+                                        android.graphics.Color.DKGRAY
+                                )
+                            }
+                        }
+                )
+                .usePlugin(GlideImagesPlugin.create(context))
+                .usePlugin(
+                        JLatexMathPlugin.create(
+                                50f,
+                                JLatexMathPlugin.BuilderConfigure { builder ->
+                                    builder.inlinesEnabled(true)
+                                    builder.blocksEnabled(true)
+                                    builder.theme().apply {
+                                        textColor(android.graphics.Color.WHITE)
+                                        backgroundProvider {
+                                            android.graphics.drawable.ColorDrawable(
+                                                    android.graphics.Color.TRANSPARENT
+                                            )
+                                        }
+                                    }
+                                }
+                        )
+                )
+                .build()
+    }
+
+    AndroidView(
+            factory = { ctx ->
+                TextView(ctx).apply {
+                    setTextColor(android.graphics.Color.WHITE)
+                    textSize = fontSize
+                    setPadding(30, 20, 30, 20)
+                    setLineSpacing(8f, 1.3f)
+                    setTextIsSelectable(true)
+                    setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
+                }
+            },
+            update = { textView ->
+                if (processedContent.isNotEmpty()) {
+                    try {
+                        markwon.setMarkdown(textView, processedContent)
+                        onRendered?.invoke()
+                    } catch (e: Exception) {
+                        Log.e("MarkdownView", "渲染失败: ${e.message}")
+                        textView.text = processedContent
+                    }
+                } else {
+                    textView.text = ""
+                }
+            },
+            modifier = modifier
+    )
+}
+
+private fun prepareMarkdownContent(content: String): String {
+    if (content.isEmpty()) return ""
+    var processed = content
+    processed = processed.replace(Regex("(?<!\\$)\\$(?!\\$)")) { "$$" }
+    processed =
+            processed.replace(Regex("""\\\[(.*")\\\]""", RegexOption.DOT_MATCHES_ALL)) { match ->
+                "\n\$\$\n${match.groupValues[1].trim()}\n\$\$\n"
+            }
+    processed =
+            processed.replace(Regex("""\\\((.*")\\\)""")) { match ->
+                "\$\$${match.groupValues[1].trim()}\$\$"
+            }
+    processed = processed.replace(Regex("([^\n])\n(#{1,6}\\s|>\\s|\\*\\s|\\d+\\.\\s)"), "$1\n\n$2")
+
+    return processed
+}
+
+@Composable
+fun LearningAssistantTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+            colorScheme =
+                    darkColorScheme(
+                            primary = Color(0xFF00D2FF),
+                            secondary = Color(0xFF7B2FBE),
+                            background = Color(0xFF1A1A2E),
+                            surface = Color(0xFF16213E),
+                            onPrimary = Color.White,
+                            onSecondary = Color.White,
+                            onBackground = Color.White,
+                            onSurface = Color.White,
+                    ),
+            typography = Typography(),
+            content = content
+    )
+}
+
+
+
+@Composable
+fun VoiceFloatingActionButton(
+    viewModel: MainViewModel,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var isListening by remember { mutableStateOf(false) }
+    var hasAudioPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasAudioPermission = granted
+    }
+
+    val speechRecognizer = remember {
+        SpeechRecognizer.createSpeechRecognizer(context)
+    }
+
+    val recognitionListener = remember {
+        object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {
+                isListening = false
+            }
+            override fun onError(error: Int) {
+                isListening = false
+                val errorMsg = when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH -> "未听清，请重试"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "未检测到语音"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "缺少录音权限"
+                    else -> "语音识别错误: $error"
+                }
+                Toast.makeText(context, errorMsg, Toast.LENGTH_SHORT).show()
+            }
+            override fun onResults(results: Bundle?) {
+                isListening = false
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (!matches.isNullOrEmpty()) {
+                    val spokenText = matches[0]
+                    viewModel.handleVoiceCommand(spokenText)
+                }
+            }
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            speechRecognizer.destroy()
+        }
+    }
+
+    FloatingActionButton(
+        onClick = {
+            if (!hasAudioPermission) {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return@FloatingActionButton
+            }
+            if (!isListening) {
+                isListening = true
+                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN")
+                    putExtra(RecognizerIntent.EXTRA_PROMPT, "请说出你的需求...")
+                }
+                speechRecognizer.setRecognitionListener(recognitionListener)
+                speechRecognizer.startListening(intent)
+            } else {
+                speechRecognizer.stopListening()
+                isListening = false
+            }
+        },
+        modifier = modifier,
+        containerColor = if (isListening) Color(0xFF00D2FF) else Color(0xFF2196F3)
+    ) {
+        Text(if (isListening) "listening" else "mic", fontSize = 24.sp)
+    }
+}
+
+
+@Composable
+fun AskDialog(
+    suggestedQuestions: List<String>,
+    onAsk: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var inputText by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("💬 您可能还想问", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (suggestedQuestions.isNotEmpty()) {
+                    Text("推荐问题：", color = Color.Gray, fontSize = 13.sp)
+                    suggestedQuestions.forEach { question ->
+                        TextButton(
+                            onClick = { onAsk(question) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                question,
+                                color = Color(0xFF00D2FF),
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Start,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("输入你的问题...", color = Color.Gray) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00D2FF),
+                            unfocusedBorderColor = Color.Gray,
+                        )
+                    )
+                    Button(
+                        onClick = {
+                            if (inputText.isNotBlank()) {
+                                onAsk(inputText.trim())
+                                inputText = ""
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                    ) {
+                        Text("发送", color = Color.White)
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        containerColor = Color(0xFF16213E)
+    )
+}
+
+data class FunctionButtonData(
+    val title: String,
+    val subtitle: String,
+    val color: Color,
+    val onClick: () -> Unit
+)
+
+@Composable
+fun MainMenuScreen(
+    viewModel: MainViewModel,
+    statusText: String,
+    gestureEnabled: Boolean = false,
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF0A0A1A))
+        ) {
+        TopStatusBar(statusText = statusText, viewModel = viewModel)
+
+        val fingerCount by viewModel.detectedFingerCount.collectAsState()
+        if (gestureEnabled && fingerCount > 0) {
+            FingerCountHint(fingerCount = fingerCount)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val buttons = listOf(
+                FunctionButtonData("📸 拍照解题", "伸出5根手指", Color(0xFF2196F3), { viewModel.onButtonSolve() }),
+                FunctionButtonData("🎬 AI动画", "伸出4根手指", Color(0xFF9C27B0), { viewModel.onButtonAnimation() }),
+                FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800), { viewModel.loadDataReport() }),
+                FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50), { viewModel.loadAiReport() }),
+                FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4), { viewModel.onButtonExtend() }),
+                FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548), { viewModel.showHistory() }),
+                FunctionButtonData("⚙️ 设置", "个性化配置", Color(0xFF607D8B), { viewModel.showSettings() }),
+            )
+
+            buttons.chunked(2).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    row.forEach { data ->
+                        FunctionButton(
+                            title = data.title,
+                            subtitle = data.subtitle,
+                            color = data.color,
+                            onClick = data.onClick,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (row.size == 1) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+
+    VoiceFloatingActionButton(
+        viewModel = viewModel,
+        modifier = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(16.dp)
+    )
+}
+
+}
+
+@Composable
+fun TopStatusBar(statusText: String, viewModel: MainViewModel) {
+    val pomodoroTime by viewModel.pomodoroTime.collectAsState()
+    Row(
+            modifier =
+                    Modifier.fillMaxWidth()
+                            .background(Color(0xFF16213E), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(statusText, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(
+                "🍅 ${formatTime(pomodoroTime)}",
+                color = Color.White,
+                fontSize = 14.sp
+        )
+    }
+}
+
+@Composable
+fun FingerCountHint(fingerCount: Int) {
+    val hintText =
+            when (fingerCount) {
+                5 -> "✅ 即将拍照解题，请将手移开..."
+                4 -> "🎬 即将生成动画，请将手移开..."
+                1 -> "☝️ 即将知识延伸，请将手移开..."
+                else -> "$fingerCount 根手指"
+            }
+
+    Text(
+            text = hintText,
+            color = Color(0xFF00FF00),
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier =
+                    Modifier.fillMaxWidth()
+                            .background(Color(0xAA000000), RoundedCornerShape(8.dp))
+                            .padding(16.dp),
+            textAlign = TextAlign.Center
+    )
+}
+
+@Composable
+fun FunctionGrid(viewModel: MainViewModel) {
+    val buttons = listOf(
+        FunctionButtonData("📸 拍照解题", "伸出5根手指", Color(0xFF2196F3)) { viewModel.onButtonSolve() },
+        FunctionButtonData("🎬 AI动画", "伸出4根手指", Color(0xFF9C27B0)) { viewModel.onButtonAnimation() },
+        FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800)) { viewModel.loadDataReport() },
+        FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50)) { viewModel.loadAiReport() },
+        FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4)) { viewModel.onButtonExtend() },
+        FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548)) { viewModel.showHistory() },
+        FunctionButtonData("⚙️ 设置", "个性化配置", Color(0xFF607D8B)) { viewModel.showSettings() },
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        buttons.chunked(2).forEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                row.forEach { data ->
+                    FunctionButton(
+                        title = data.title,
+                        subtitle = data.subtitle,
+                        color = data.color,
+                        onClick = data.onClick,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (row.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FunctionButton(
+        title: String,
+        subtitle: String,
+        color: Color,
+        onClick: () -> Unit,
+        modifier: Modifier = Modifier
+) {
+    Button(
+            onClick = onClick,
+            modifier = modifier.height(80.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = color.copy(alpha = 0.8f)),
+            shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(subtitle, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun LoadingOverlay(message: String = "处理中...") {
+    Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xCC0A0A1A)),
+            contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(color = Color(0xFF00D2FF))
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(message, color = Color.White, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+fun WelcomeDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("👢 欢迎使用学习助手 2.1", color = Color.White) },
+            text = {
+                Text(
+                        """📗 使用说明：
+                
+🖐️ 手势操作（在主页伸出对应手指并保持1秒）：
+  · 5指 → 拍照解题
+  · 4指 → AI动画
+  · 3指 → 数据报告
+  · 2指 → AI报告
+  · 1指 → 知识延伸
+
+📋 也可直接点击按钮触发功能
+
+⚠️ 拍照前请将手移开摄像头
+⚙️ 更多设置在右上角""",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 14.sp
+                )
+            },
+            confirmButton = { Button(onClick = onDismiss) { Text("开始使用") } },
+            containerColor = Color(0xFF16213E)
+    )
+}
+
+@Composable
+fun HistoryViewScreen(
+    viewModel: MainViewModel,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val historyStartDate by viewModel.historyStartDate.collectAsState()
+    val historyEndDate by viewModel.historyEndDate.collectAsState()
+    
+    var records by remember { mutableStateOf<List<ApiService.HistoryRecord>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf("") }
+    var selectedRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
+    
+    var isSelectMode by remember { mutableStateOf(false) }
+    var selectedIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var isDeleting by remember { mutableStateOf(false) }
+    var dateError by remember { mutableStateOf("") }
+    
+    fun loadHistory() {
+        // Feature 16: 日期格式验证
+        val dateRegex = Regex("^\\d{4}-\\d{2}-\\d{2}$")
+        if (historyStartDate.isNotEmpty() && !dateRegex.matches(historyStartDate)) {
+            dateError = "开始日期格式错误，请使用格式: 2026-01-01"
+            return
+        }
+        if (historyEndDate.isNotEmpty() && !dateRegex.matches(historyEndDate)) {
+            dateError = "截止日期格式错误，请使用格式: 2026-12-31"
+            return
+        }
+        dateError = ""
+        
+        isLoading = true
+        errorMessage = ""
+        viewModel.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apiService = ApiService()
+                val result = apiService.getHistory(
+                    startDate = historyStartDate,
+                    endDate = historyEndDate
+                )
+                withContext(Dispatchers.Main) {
+                    records = result
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = "加载失败: ${e.message}"
+                    isLoading = false
+                }
+            }
+        }
+    }
+    
+    fun batchDelete() {
+        if (selectedIds.isEmpty()) return
+        isDeleting = true
+        viewModel.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apiService = ApiService()
+                apiService.batchDeleteHistory(selectedIds.toList())
+                withContext(Dispatchers.Main) {
+                    isDeleting = false
+                    isSelectMode = false
+                    selectedIds = emptySet()
+                    loadHistory()
+                    Toast.makeText(context, "已删除 ${selectedIds.size} 条记录", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isDeleting = false
+                    Toast.makeText(context, "删除失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+    
+    LaunchedEffect(Unit) {
+        loadHistory()
+    }
+    
+    LaunchedEffect(historyStartDate, historyEndDate) {
+        loadHistory()
+    }
+    
+    if (selectedRecord != null) {
+        HistoryDetailScreen(
+            record = selectedRecord!!,
+            onBack = { selectedRecord = null }
+        )
+        return
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A2E))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (isSelectMode) {
+                Button(
+                    onClick = {
+                        isSelectMode = false
+                        selectedIds = emptySet()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("取消", color = Color.White) }
+                
+                Text("已选 ${selectedIds.size} 项", color = Color(0xFF00D2FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                
+                Button(
+                    onClick = { batchDelete() },
+                    enabled = selectedIds.isNotEmpty() && !isDeleting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                ) {
+                    if (isDeleting) {
+                        CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("🗑️ 删除", color = Color.White, fontSize = 14.sp)
+                    }
+                }
+            } else {
+                Button(
+                    onClick = onBack,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("返回", color = Color.White) }
+                
+                Text("📋 历史记录", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                
+                IconButton(onClick = { loadHistory() }) {
+                    Text("🔄", color = Color.White, fontSize = 20.sp)
+                }
+            }
+        }
+        
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = historyStartDate,
+                onValueChange = { viewModel.historyStartDate.value = it; dateError = "" },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("开始日期 (2026-01-01)", color = Color.Gray, fontSize = 12.sp) },
+                singleLine = true,
+                isError = dateError.isNotEmpty(),
+                colors = darkTextFieldColors(),
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+            )
+            Text("至", color = Color.Gray, fontSize = 12.sp)
+            OutlinedTextField(
+                value = historyEndDate,
+                onValueChange = { viewModel.historyEndDate.value = it; dateError = "" },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("截止日期 (2026-12-31)", color = Color.Gray, fontSize = 12.sp) },
+                singleLine = true,
+                isError = dateError.isNotEmpty(),
+                colors = darkTextFieldColors(),
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+            )
+        }
+        
+        // Feature 16: 日期格式错误提示
+        if (dateError.isNotEmpty()) {
+            Text(
+                dateError,
+                color = Color(0xFFF44336),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+        }
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        when {
+            isLoading -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Color(0xFF00D2FF))
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("加载中...", color = Color.Gray, fontSize = 14.sp)
+                    }
+                }
+            }
+            errorMessage.isNotEmpty() -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("⚠️", fontSize = 32.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(errorMessage, color = Color(0xFFFF5722), fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(onClick = { loadHistory() }) {
+                            Text("重试")
+                        }
+                    }
+                }
+            }
+            records.isEmpty() -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("📥", fontSize = 48.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("暂无历史记录", color = Color.Gray, fontSize = 16.sp)
+                        Text("开始学习后将自动记录", color = Color.Gray.copy(alpha = 0.6f), fontSize = 13.sp)
+                    }
+                }
+            }
+            else -> {
+                val listState = rememberLazyListState()
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(records, key = { it.id }) { record ->
+                        HistoryRecordCard(
+                            record = record,
+                            isSelectMode = isSelectMode,
+                            isSelected = selectedIds.contains(record.id),
+                            onClick = {
+                                if (isSelectMode) {
+                                    selectedIds = if (selectedIds.contains(record.id)) {
+                                        selectedIds - record.id
+                                    } else {
+                                        selectedIds + record.id
+                                    }
+                                } else {
+                                    selectedRecord = record
+                                }
+                            },
+                            onLongClick = {
+                                if (!isSelectMode) {
+                                    isSelectMode = true
+                                    selectedIds = setOf(record.id)
+                                }
+                            }
+                        )
+                    }
+                }
+                
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "共${records.size} 条记录 | ${records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size} 门学科",
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        modifier = Modifier.align(Alignment.CenterVertically)
+                    )
+                    
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                isSelectMode = !isSelectMode
+                                if (!isSelectMode) selectedIds = emptySet()
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isSelectMode) Color(0xFF00D2FF) else Color(0xFF2D2D44)
+                            )
+                        ) {
+                            Text(
+                                if (isSelectMode) "☑️ 完成" else "☑️ 选择",
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                        }
+                        
+                        Button(
+                            onClick = {
+                                android.widget.Toast.makeText(context, "正在清除...", android.widget.Toast.LENGTH_SHORT).show()
+                                viewModel.clearHistory()
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    loadHistory()
+                                }, 500)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                        ) {
+                            Text("🗑️ 清除全部", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryRecordCard(
+    record: ApiService.HistoryRecord,
+    isSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit = {}
+) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) Color(0xFF1A3A5C) else Color(0xFF16213E)
+        ),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(modifier = Modifier.padding(12.dp)) {
+            if (isSelectMode) {
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { onClick() },
+                    colors = CheckboxDefaults.colors(
+                        checkedColor = Color(0xFF00D2FF),
+                        uncheckedColor = Color.Gray
+                    ),
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+            }
+            
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val displayTime = try {
+                        if (record.timestamp.isNotEmpty()) {
+                            record.timestamp.substring(0, 19).replace("T", " ")
+                        } else ""
+                    } catch (e: Exception) { record.timestamp }
+                    
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(displayTime, color = Color.Gray, fontSize = 11.sp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        if (record.grade.isNotEmpty()) {
+                            Surface(
+                                color = Color(0xFF7B2FBE).copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.grade,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        if (record.subject.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Surface(
+                                color = Color(0xFF2196F3).copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.subject,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        if (record.difficulty.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            val diffColor = when (record.difficulty) {
+                                "易", "较易" -> Color(0xFF4CAF50)
+                                "中" -> Color(0xFFFF9800)
+                                "较难", "难" -> Color(0xFFF44336)
+                                else -> Color.Gray
+                            }
+                            Surface(
+                                color = diffColor.copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.difficulty,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
+                    Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 11.sp)
+                }
+                
+                Spacer(modifier = Modifier.height(6.dp))
+                
+                if (record.knowledgePoints.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        record.knowledgePoints.take(3).forEach { kp ->
+                            Surface(
+                                color = Color(0xFF00D2FF).copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    kp,
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.8f),
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        if (record.knowledgePoints.size > 3) {
+                            Text(
+                                "+${record.knowledgePoints.size - 3}",
+                                color = Color.Gray,
+                                fontSize = 9.sp,
+                                modifier = Modifier.align(Alignment.CenterVertically)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                
+                if (record.ocrText.isNotEmpty()) {
+                    Text(
+                        text = record.ocrText,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                
+                if (record.solutionSteps.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = record.solutionSteps
+                            .replace(Regex("#+\\s*"), "")
+                            .take(150),
+                        color = Color(0xFF00D2FF).copy(alpha = 0.8f),
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    if (isSelectMode) "点击切换选择" else "点击查看详情 ▶",
+                    color = Color(0xFF00D2FF).copy(alpha = 0.6f),
+                    fontSize = 11.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryDetailScreen(
+    record: ApiService.HistoryRecord,
+    onBack: () -> Unit
+) {
+    val displayTime = try {
+        if (record.timestamp.isNotEmpty()) {
+            record.timestamp.substring(0, 19).replace("T", " ")
+        } else ""
+    } catch (e: Exception) { record.timestamp }
+    
+    // Feature 17: 展开/收起状态
+    var showSolutionSteps by remember { mutableStateOf(true) }
+    var showFullSolution by remember { mutableStateOf(false) }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A2E))
+    ) {
+        // Feature 14: fixed return bar
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onBack,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("← 返回列表", color = Color.White) }
+                
+                Text(
+                    "📝 记录详情",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                
+                Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 12.sp)
+            }
+        }
+        
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("🕔 时间", color = Color.Gray, fontSize = 13.sp)
+                        Text(displayTime, color = Color.White, fontSize = 13.sp)
+                    }
+                    
+                    if (record.grade.isNotEmpty() || record.subject.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (record.grade.isNotEmpty()) {
+                                Text("📎 年级:", color = Color.Gray, fontSize = 13.sp)
+                                Text(record.grade, color = Color(0xFF7B2FBE), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                            if (record.subject.isNotEmpty()) {
+                                Text("📉 学科:", color = Color.Gray, fontSize = 13.sp)
+                                Text(record.subject, color = Color(0xFF2196F3), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                    
+                    if (record.difficulty.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row {
+                            Text("📊 难度:", color = Color.Gray, fontSize = 13.sp)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            val diffColor = when (record.difficulty) {
+                                "易", "较易" -> Color(0xFF4CAF50)
+                                "中" -> Color(0xFFFF9800)
+                                "较难", "难" -> Color(0xFFF44336)
+                                else -> Color.Gray
+                            }
+                            Text(record.difficulty, color = diffColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    
+                    if (record.knowledgePoints.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("🔖 知识点", color = Color.Gray, fontSize = 13.sp)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            record.knowledgePoints.forEach { kp ->
+                                Surface(
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        kp,
+                                        color = Color(0xFF00D2FF),
+                                        fontSize = 11.sp,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (record.ocrText.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("📥 原图", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(record.ocrText, color = Color.White, fontSize = 13.sp)
+                    }
+                }
+            }
+            
+            if (record.solutionSteps.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("💡 解题思路", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        
+                        if (showSolutionSteps) {
+                            MarkdownView(content = record.solutionSteps, fontSize = 14f)
+                        } else {
+                            val preview = record.solutionSteps
+                                .replace(Regex("#+\\s*"), "")
+                                .take(200)
+                            Text(preview + "...", color = Color.White, fontSize = 13.sp)
+                        }
+                        
+                        TextButton(
+                            onClick = { showSolutionSteps = !showSolutionSteps },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                if (showSolutionSteps) "▲ 收起解题思路" else "▼ 展开解题思路",
+                                color = Color(0xFF00D2FF),
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+            }
+            
+            if (record.fullSolution.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("📝 完整解析", color = Color(0xFF7B2FBE), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        
+                        if (showFullSolution) {
+                            MarkdownView(content = record.fullSolution, fontSize = 14f)
+                        } else {
+                            val preview = record.fullSolution
+                                .replace(Regex("#+\\s*"), "")
+                                .take(200)
+                            Text(preview + "...", color = Color.White, fontSize = 13.sp)
+                        }
+                        
+                        TextButton(
+                            onClick = { showFullSolution = !showFullSolution },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                if (showFullSolution) "▲ 收起完整解析" else "▼ 展开完整解析",
+                                color = Color(0xFF7B2FBE),
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
+    val gestureEnabled by viewModel.gestureEnabled.collectAsState()
+    val voiceEnabled by viewModel.voiceEnabled.collectAsState()
+    val tomatoEnabled by viewModel.tomatoEnabled.collectAsState()
+    val serverAddress by viewModel.serverAddress.collectAsState()
+    val fontSize by viewModel.fontSize.collectAsState()
+    val showModules by viewModel.showModules.collectAsState()
+    val aiEngine by viewModel.aiEngine.collectAsState()
+    val historyStartDate by viewModel.historyStartDate.collectAsState()
+    val historyEndDate by viewModel.historyEndDate.collectAsState()
+    val pomodoroWorkDuration by viewModel.pomodoroWorkDuration.collectAsState()
+    val pomodoroRestDuration by viewModel.pomodoroRestDuration.collectAsState()
+
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("⚙️ 设置", color = Color.White)
+                    TextButton(onClick = onDismiss) { Text("关闭", color = Color(0xFF00D2FF)) }
+                }
+            },
+            text = {
+                Column(
+                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SettingSwitch(
+                            title = "🖐️ 手势识别",
+                            subtitle = "开启后可在主页通过手势触发功能",
+                            checked = gestureEnabled,
+                            onCheckedChange = { viewModel.gestureEnabled.value = it }
+                    )
+
+                    SettingSwitch(
+                            title = "🎤 语音识别",
+                            subtitle = "暂未开放，敬请期待",
+                            checked = voiceEnabled,
+                            onCheckedChange = {},
+                            enabled = false
+                    )
+
+                    SettingSwitch(
+                            title = "🍅 番茄钟",
+                            subtitle = "${pomodoroWorkDuration}分钟学习，${pomodoroRestDuration}分钟休息",
+                            checked = tomatoEnabled,
+                            onCheckedChange = { viewModel.tomatoEnabled.value = it }
+                    )
+                    
+                    if (tomatoEnabled) {
+                        Text(
+                            "工作时长: ${pomodoroWorkDuration}分钟",
+                            color = Color.White,
+                            fontSize = 13.sp
+                        )
+                        Slider(
+                            value = pomodoroWorkDuration.toFloat(),
+                            onValueChange = { viewModel.pomodoroWorkDuration.value = it.toInt() },
+                            valueRange = 5f..60f,
+                            steps = 11,
+                            colors = SliderDefaults.colors(thumbColor = Color(0xFFFF5722), activeTrackColor = Color(0xFFFF5722))
+                        )
+                        Text(
+                            "休息时长: ${pomodoroRestDuration}分钟",
+                            color = Color.White,
+                            fontSize = 13.sp
+                        )
+                        Slider(
+                            value = pomodoroRestDuration.toFloat(),
+                            onValueChange = { viewModel.pomodoroRestDuration.value = it.toInt() },
+                            valueRange = 1f..30f,
+                            steps = 29,
+                            colors = SliderDefaults.colors(thumbColor = Color(0xFF4CAF50), activeTrackColor = Color(0xFF4CAF50))
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Text(
+                            "🔧 服务器地址",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    OutlinedTextField(
+                            value = serverAddress,
+                            onValueChange = {
+                                viewModel.serverAddress.value = it
+                                viewModel.updateServerAddress("http://$it")
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            colors =
+                                    OutlinedTextFieldDefaults.colors(
+                                            focusedTextColor = Color.White,
+                                            unfocusedTextColor = Color.White,
+                                            focusedBorderColor = Color(0xFF00D2FF),
+                                            unfocusedBorderColor = Color.Gray,
+                                    )
+                    )
+
+                    Text(
+                            "📝 字体大小: ${fontSize.toInt()}sp",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("小", color = Color.Gray, fontSize = 12.sp)
+                        Slider(
+                                value = fontSize,
+                                onValueChange = { viewModel.fontSize.value = it },
+                                valueRange = 12f..28f,
+                                modifier = Modifier.weight(1f),
+                                colors = SliderDefaults.colors(thumbColor = Color(0xFF00D2FF))
+                        )
+                        Text("大", color = Color.Gray, fontSize = 28.sp)
+                    }
+                    // 字体预览
+                    Text(
+                        "预览文字 ABC 123 学习助手",
+                        color = Color.White,
+                        fontSize = fontSize.sp,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Text(
+                            "📂 显示模块",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    showModules.forEach { (key, value) ->
+                        SettingSwitch(
+                                title =
+                                        when (key) {
+                                            "solution_steps" -> "解题思路"
+                                            "full_solution" -> "完整解析"
+                                            "mind_map" -> "思维导图"
+                                            "suggested_questions" -> "延伸问题"
+                                            "mistakes" -> "易错点详解"
+                                            "extension" -> "知识拓展"
+                                            else -> key
+                                        },
+                                checked = value,
+                                onCheckedChange = {
+                                    viewModel.showModules.value =
+                                            showModules.toMutableMap().apply { put(key, it) }
+                                }
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Text(
+                            "🤖 AI 引擎",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                                selected = aiEngine == "deepseek",
+                                onClick = { viewModel.aiEngine.value = "deepseek" },
+                                label = { Text("DeepSeek", fontSize = 12.sp) },
+                                colors =
+                                        FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF2196F3)
+                                        )
+                        )
+                        FilterChip(
+                                selected = aiEngine == "hunyuan",
+                                onClick = { viewModel.aiEngine.value = "hunyuan" },
+                                label = { Text("混元", fontSize = 12.sp) },
+                                colors =
+                                        FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFFFF9800)
+                                        )
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Text(
+                            "📅 历史记录范围",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                                value = historyStartDate,
+                                onValueChange = { viewModel.historyStartDate.value = it },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("开始日期 (2026-01-01)", color = Color.Gray) },
+                                singleLine = true,
+                                colors = darkTextFieldColors()
+                        )
+                        OutlinedTextField(
+                                value = historyEndDate,
+                                onValueChange = { viewModel.historyEndDate.value = it },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("截止日期 (2026-12-31)", color = Color.Gray) },
+                                singleLine = true,
+                                colors = darkTextFieldColors()
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Button(
+                            onClick = { viewModel.clearHistory() },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                    ) { Text("🗑️ 清除历史记录") }
+                }
+            },
+            confirmButton = {},
+            containerColor = Color(0xFF16213E)
+    )
+}
+
+@Composable
+fun SettingSwitch(
+        title: String,
+        subtitle: String = "",
+        checked: Boolean,
+        onCheckedChange: (Boolean) -> Unit,
+        enabled: Boolean = true
+) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                    title,
+                    color = if (enabled) Color.White else Color.Gray,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+            )
+            if (subtitle.isNotEmpty()) {
+                Text(subtitle, color = Color.Gray, fontSize = 11.sp)
+            }
+        }
+        Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                enabled = enabled,
+                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF00D2FF))
+        )
+    }
+}
+
+@Composable
+fun darkTextFieldColors() =
+        OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedBorderColor = Color(0xFF00D2FF),
+                unfocusedBorderColor = Color.Gray,
+        )
+
+// ==================== Feature 11: 番茄钟休息全屏界面 ====================
+
+@Composable
+fun PomodoroRestScreen(viewModel: MainViewModel) {
+    val restTime by viewModel.restTimeRemaining.collectAsState()
+    
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                "☕ 休息时间",
+                color = Color.White,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                formatTime(restTime),
+                color = Color(0xFF00D2FF),
+                fontSize = 72.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                "休息一下，让眼睛放松",
+                color = Color.Gray,
+                fontSize = 18.sp
+            )
+            Spacer(modifier = Modifier.height(32.dp))
+            Button(
+                onClick = { viewModel.skipRest() },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+            ) {
+                Text("跳过休息", color = Color.White, fontSize = 16.sp)
+            }
+        }
+    }
+}
+
+// ==================== Feature 4: 掌握程度弹窗 ====================
+
+@Composable
+fun MasteryDialog(onSelect: (String) -> Unit) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("📊 掌握程度", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("你对这道题的掌握程度如何？", color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                
+                Button(
+                    onClick = { onSelect("completely_mastered") },
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("✅ 完全掌握", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+                
+                Button(
+                    onClick = { onSelect("partially_mastered") },
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("⚠️ 部分掌握", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+                
+                Button(
+                    onClick = { onSelect("not_mastered") },
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("❌ 完全没掌握", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        confirmButton = {},
+        containerColor = Color(0xFF16213E)
+    )
+}
+
+// ==================== Feature 9/10: 倒计时确认弹窗 ====================
+
+@Composable
+fun CountdownConfirmDialog(
+    title: String,
+    content: String,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var countdown by remember { mutableStateOf(3) }
+    var isCounting by remember { mutableStateOf(true) }
+    
+    LaunchedEffect(Unit) {
+        while (isCounting && countdown > 0) {
+            delay(1000)
+            countdown--
+        }
+        if (isCounting && countdown == 0) {
+            isCounting = false
+            onConfirm()
+        }
+    }
+    
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text(title, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                if (content.isNotEmpty()) {
+                    Surface(
+                        color = Color(0xFF1A1A2E),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            content,
+                            color = Color.White.copy(alpha = 0.9f),
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(12.dp),
+                            maxLines = 6,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+                Text(
+                    if (countdown > 0) "将在 ${countdown} 秒后自动确认..." else "正在处理...",
+                    color = Color.Gray,
+                    fontSize = 13.sp
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    isCounting = false
+                    onConfirm()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+            ) {
+                Text(
+                    if (countdown > 0) "确认(${countdown})" else "确认",
+                    color = Color.White,
+                    fontSize = 14.sp
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                isCounting = false
+                onCancel()
+            }) {
+                Text("取消", color = Color(0xFFF44336), fontSize = 14.sp)
+            }
+        },
+        containerColor = Color(0xFF16213E)
+    )
+}
+
+// ==================== Feature 20: GeoGebra 图形绘制 ====================
+
+@Composable
+fun GeoGebraScreen(onBack: () -> Unit) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text("📐 GeoGebra 图形", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(60.dp))
+            }
+        }
+        
+        // 快捷示例按钮
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val examples = listOf(
+                "正弦曲线" to "f(x)=sin(x)",
+                "抛物线" to "f(x)=x^2",
+                "三角形" to "Polygon((0,0),(3,0),(1,2))",
+                "圆" to "Circle((0,0),2)",
+                "切线" to "f(x)=sin(x)\nt=Slider(0,2*pi,0.01)\nA=(t,f(t))\nTangent(A,f)"
+            )
+            
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(examples.size) { idx ->
+                    val (name, cmds) = examples[idx]
+                    Button(
+                        onClick = {
+                            // Commands are passed as URL parameter, but we can't easily
+                            // re-execute without reloading. Store in a local variable.
+                        },
+                        modifier = Modifier.height(36.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                    ) {
+                        Text(name, color = Color.White, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+        
+        AndroidView(
+            factory = { ctx ->
+                android.webkit.WebView(ctx).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.allowFileAccess = true
+                    settings.useWideViewPort = true
+                    settings.loadWithOverviewMode = true
+                    settings.builtInZoomControls = false
+                    settings.displayZoomControls = false
+                    settings.setSupportZoom(false)
+                    isClickable = false
+                    isFocusable = false
+                    
+                    val geogebraHtml = """
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <meta charset="utf-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                            <script src="https://www.geogebra.org/apps/deployggb.js"></script>
+                            <style>
+                                * { margin: 0; padding: 0; }
+                                html, body { width: 100%; height: 100%; overflow: hidden; background: #1A1A2E; }
+                                #ggb-element { width: 100%; height: 100%; }
+                                .toolbar-hint {
+                                    position: absolute;
+                                    bottom: 10px;
+                                    left: 10px;
+                                    color: rgba(255,255,255,0.5);
+                                    font-size: 12px;
+                                    font-family: sans-serif;
+                                    pointer-events: none;
+                                }
+                            </style>
+                        </head>
+                        <body>
+                            <div id="ggb-element"></div>
+                            <div class="toolbar-hint">💡 使用底部工具栏绘制图形 | 上方按钮可快速预览示例</div>
+                            <script>
+                                var params = {
+                                    "appName": "graphing",
+                                    "width": window.innerWidth,
+                                    "height": window.innerHeight - 50,
+                                    "showToolBar": true,
+                                    "showAlgebraInput": true,
+                                    "showMenuBar": false,
+                                    "enableShiftDragZoom": true,
+                                    "language": "zh",
+                                    "borderColor": "#1A1A2E",
+                                    "bgColor": "#1A1A2E",
+                                    "perspective": "T",
+                                    "buttonShadows": true,
+                                    "showLogging": false,
+                                    "useBrowserStorage": false,
+                                    "showResetIcon": true,
+                                    "enableLabelDrags": false,
+                                    "enableRightClick": false,
+                                    "errorDialogsActive": false
+                                };
+                                var applet = new GGBApplet(params, true);
+                                window.ggbApplet = null;
+                                applet.setHTML5Codebase('https://www.geogebra.org/apps/latest/web3d/');
+                                applet.inject('ggb-element', 'preferHTML5');
+                                
+                                // 存储applet引用供后续使用
+                                setTimeout(function() {
+                                    window.ggbApplet = window.ggbApplet || document.querySelector('iframe')?.contentWindow?.ggbApplet;
+                                }, 2000);
+                            </script>
+                        </body>
+                        </html>
+                    """.trimIndent()
+                    
+                    loadDataWithBaseURL("https://www.geogebra.org", geogebraHtml, "text/html", "UTF-8", null)
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+    }
+}
