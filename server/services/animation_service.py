@@ -85,6 +85,17 @@ except Exception:
         
         if html_file.exists():
             print(f"动画生成成功: {html_file}")
+            # Bug 3: 添加移动端适配 - 注入viewport和响应式样式
+            html_content = html_file.read_text(encoding='utf-8')
+            viewport_meta = '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
+            responsive_css = '<style>html,body{width:100%;height:100%;margin:0;padding:0;overflow-x:hidden;} .plotly-graph-div{width:100% !important;} .main-svg{width:100% !important;}</style>'
+            if '<head>' in html_content:
+                html_content = html_content.replace('<head>', f'<head>\n{viewport_meta}\n{responsive_css}')
+            elif '<html>' in html_content:
+                html_content = html_content.replace('<html>', f'<html>\n<head>\n{viewport_meta}\n{responsive_css}\n</head>')
+            else:
+                html_content = f'<!DOCTYPE html>\n<html>\n<head>\n{viewport_meta}\n{responsive_css}\n</head>\n<body>\n{html_content}\n</body>\n</html>'
+            html_file.write_text(html_content, encoding='utf-8')
             py_file.unlink()  # 删除 .py 文件
             return str(html_file)
         else:

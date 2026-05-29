@@ -119,7 +119,9 @@ async def root():
 # Feature 7: 处理favicon.ico请求避免404日志
 @app.get("/favicon.ico")
 async def favicon():
-    return FileResponse(str(HISTORY_DIR / "favicon.ico")) if (HISTORY_DIR / "favicon.ico").exists() else {"detail": "Not Found"}
+    # 返回204 No Content以避免404日志，且不影响功能
+    from fastapi.responses import Response
+    return Response(status_code=204)
 
 @app.post("/solve")
 async def solve_problem(file: UploadFile = File(...)):
@@ -152,8 +154,8 @@ async def solve_stream(request_id: str):
             # 将事件转换为SSE格式
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             
-            # 如果事件中包含大量文本（如solution），让出控制权
-            if event.get("stage") in ("solution", "mindmap"):
+            # 如果事件中包含大量文本，让出控制权
+            if event.get("stage") in ("solution", "mindmap", "solution_chunk"):
                 await asyncio.sleep(0.01)
         
         # 发送完成事件
@@ -168,6 +170,19 @@ async def solve_stream(request_id: str):
             "X-Accel-Buffering": "no",  # 禁用nginx缓冲
         }
     )
+
+@app.post("/solve/confirm/{request_id}")
+async def confirm_solve(request_id: str):
+    """用户确认OCR结果后继续解题流程"""
+    if solve_pipeline.confirm_continue(request_id):
+        return {"status": "ok", "message": "已确认，继续处理"}
+    return {"status": "error", "message": "request_id无效或已过期"}
+
+@app.post("/solve/cancel/{request_id}")
+async def cancel_solve(request_id: str):
+    """用户取消解题流程"""
+    solve_pipeline.cancel_solve(request_id)
+    return {"status": "ok", "message": "已取消"}
 
 @app.get("/static/svgs/{rest_of_path:path}")
 async def get_svg(rest_of_path: str):
@@ -269,6 +284,15 @@ async def get_report(filename: str):
         return FileResponse(file_path, media_type="text/html")
     return {"detail": "Not Found"}
 
+@app.get("/static/{filename:path}")
+async def get_history_image(filename: str):
+    """获取历史图片等静态文件"""
+    # 检查history目录
+    file_path = HISTORY_DIR / filename
+    if file_path.exists():
+        return FileResponse(file_path)
+    return {"detail": "Not Found"}
+
 @app.post("/extend")
 async def knowledge_extension(file: UploadFile = File(...)):
     """知识延伸"""
@@ -339,6 +363,13 @@ async def get_history(request: dict):
             if subject:
                 all_subjects.add(subject)
             
+            # 生成原图URL
+            image_url = ""
+            if r.original_image_path:
+                image_path = Path(r.original_image_path)
+                if image_path.exists():
+                    image_url = f"/static/{image_path.name}"
+            
             result.append({
                 "id": r.id,
                 "timestamp": r.timestamp.isoformat() if r.timestamp is not None else "",
@@ -350,6 +381,7 @@ async def get_history(request: dict):
                 "knowledge_points": knowledge_points,
                 "solution_steps": clean_steps,
                 "full_solution": clean_solution,
+                "image_url": image_url,
             })
         
         return {

@@ -65,7 +65,7 @@ class AIService:
         
         yield {"stage": "steps", "content": steps_response}
         
-        # === 第三阶段：完整解析与LaTeX图形 ===
+        # === 第三阶段：完整解析与LaTeX图形（流式输出） ===
         solution_prompt = """请给出完整的解题过程和答案。
     要求：
     1. 步骤完整，逻辑清晰
@@ -79,7 +79,14 @@ class AIService:
         
         messages.append({"role": "assistant", "content": steps_response})
         messages.append({"role": "user", "content": solution_prompt})
-        solution_response = self._call_api(messages, max_tokens=8000)
+        
+        # 流式输出完整解析
+        accumulated_solution = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=8000):
+            accumulated_solution = chunk
+            yield {"stage": "solution_chunk", "content": accumulated_solution}
+        
+        solution_response = accumulated_solution
         
         yield {"stage": "solution", "content": solution_response}
         
@@ -220,7 +227,7 @@ class AIService:
         return self._call_api(messages)
     
     def _call_api(self, messages, max_tokens=None):
-        """调用AI API"""
+        """调用AI API (非流式)"""
         print(f"[AI] 调用API，模型={self.model}，消息数={len(messages)}")
         for attempt in range(3):
             try:
@@ -241,6 +248,44 @@ class AIService:
                     raise
                 time.sleep(1)
         return ""
+    
+    def _call_api_streaming(self, messages, max_tokens=None):
+        """
+        调用AI API (流式) - 逐chunk生成
+        用于实现实时流式输出体验
+        
+        Yields:
+            str: 每个chunk的文本内容
+        """
+        print(f"[AI-Stream] 开始流式调用，模型={self.model}，消息数={len(messages)}")
+        for attempt in range(3):
+            try:
+                print(f"[AI-Stream] 尝试 {attempt + 1}/3...")
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=max_tokens or self.max_tokens,
+                    stream=True,
+                )
+                reasoning_content = ""
+                content = ""
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta:
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                            reasoning_content += delta.reasoning_content
+                        elif delta.content:
+                            content += delta.content
+                            yield content  # 增量返回完整累积内容用于淡入式显示
+                print(f"[AI-Stream] 流式调用成功，总长度={len(content)}")
+                return
+            except Exception as e:
+                print(f"[AI-Stream] 第{attempt + 1}次尝试失败: {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+        return
     
     def _build_system_prompt(self, ocr_text: str, search_result: Optional[str] = None) -> str:
         """构建系统提示"""

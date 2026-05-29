@@ -23,6 +23,8 @@ from typing import Dict, Generator, Optional, Union
 # SSE事件队列 - 存储每个request_id的事件流
 _event_queues: Dict[str, deque] = {}
 _event_threads: Dict[str, threading.Thread] = {}
+# 用户确认等待标志
+_pending_confirm: Dict[str, threading.Event] = {}
 
 class SolvePipeline:
     """解题流水线"""
@@ -68,6 +70,23 @@ class SolvePipeline:
         if queue is not None:
             queue.append({"stage": stage, "content": content})
     
+    def confirm_continue(self, request_id: str):
+        """用户确认OCR结果后，继续流程"""
+        event = _pending_confirm.get(request_id)
+        if event:
+            event.set()
+            return True
+        return False
+    
+    def cancel_solve(self, request_id: str):
+        """用户取消后，清理并结束"""
+        self._emit_event(request_id, "info", "用户已取消")
+        self._emit_event(request_id, "complete", {"request_id": request_id, "cancelled": True})
+        event = _pending_confirm.get(request_id)
+        if event:
+            event.set()  # 让worker线程继续执行并退出
+        self._cleanup(request_id)
+    
     def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None):
         """后台解题工作线程"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
@@ -93,6 +112,20 @@ class SolvePipeline:
                 self._emit_event(request_id, "complete", None)
                 return
             
+            # ========== 等待用户确认OCR结果 ==========
+            self._emit_event(request_id, "waiting_confirm", {
+                "text": ocr_text
+            })
+            confirm_event = threading.Event()
+            _pending_confirm[request_id] = confirm_event
+            # 等待最多30秒用户确认
+            if not confirm_event.wait(timeout=30):
+                # 超时未确认，继续流程（等同于确认）
+                print(f"[{request_id}] OCR确认超时，自动继续")
+            else:
+                print(f"[{request_id}] 用户已确认OCR结果")
+            _pending_confirm.pop(request_id, None)
+            
             # ========== 阶段2: 题库搜索 ==========
             self._emit_event(request_id, "info", "正在搜索题库...")
             
@@ -109,9 +142,10 @@ class SolvePipeline:
                     "time": search_time
                 })
             
-            # ========== 阶段3: AI多轮对话 ==========
+            # ========== 阶段3: AI多轮对话（流式） ==========
             self._emit_event(request_id, "info", "AI正在分析题目...")
-            solution_content = None
+            solution_content = ""
+            solution_chunks = []  # 存储每个流式chunk
             
             # 使用流式处理AI对话的各个阶段
             for event in ai_service.solve_problem_stream(ocr_text, search_result):
@@ -122,6 +156,11 @@ class SolvePipeline:
                     self._emit_event(request_id, "question_info", content)
                 elif stage == "steps":
                     self._emit_event(request_id, "solution_steps", content)
+                elif stage == "solution_chunk":
+                    # 流式chunk: content 是累积到当前的完整文本
+                    solution_content = content
+                    solution_chunks.append(content)
+                    self._emit_event(request_id, "solution_chunk", content)
                 elif stage == "solution":
                     solution_content = content
                     self._emit_event(request_id, "solution", content)

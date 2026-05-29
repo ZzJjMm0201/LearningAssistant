@@ -62,7 +62,37 @@ class ReportGenerator:
                 all_mistakes.extend(r.question_info.get("easy_mistakes", []))
         mistake_counts = dict(Counter(all_mistakes).most_common(10))
         
+        # 掌握程度统计
+        mastery_dir = HISTORY_DIR / "mastery_records"
+        mastery_levels = {"completely_mastered": "完全掌握", "partially_mastered": "部分掌握", "not_mastered": "完全没掌握"}
+        mastery_counts = {}
+        if mastery_dir.exists():
+            for f in mastery_dir.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding='utf-8'))
+                    level = data.get("mastery_level", "")
+                    mastery_counts[level] = mastery_counts.get(level, 0) + 1
+                except:
+                    pass
+        
+        # 每日做题趋势
+        daily_counts = {}
+        for r in records:
+            day = r.timestamp.strftime('%m-%d') if r.timestamp else "未知"
+            daily_counts[day] = daily_counts.get(day, 0) + 1
+        daily_dates = sorted(daily_counts.keys())[-14:]  # 最近14天
+        daily_values = [daily_counts.get(d, 0) for d in daily_dates]
+        
         # 生成图表
+        # 禁用所有图表的交互功能（缩放、点击放大等）
+        config = {
+            'displayModeBar': False,  # 隐藏模式栏
+            'staticPlot': True,       # 静态图，完全禁用交互
+            'responsive': True,
+            'editable': False,
+            'scrollZoom': False,
+        }
+        
         # 1. 学科分布饼图
         fig1 = px.pie(
             names=list(subject_counts.keys()),
@@ -72,6 +102,9 @@ class ReportGenerator:
         )
         fig1.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=350)
         fig1.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig1.update_layout(dragmode=False, hovermode=False)
+        fig1.update_xaxes(fixedrange=True)
+        fig1.update_yaxes(fixedrange=True)
         
         # 2. 难度分布柱状图
         difficulty_order = ["易", "较易", "中", "较难", "难"]
@@ -91,8 +124,12 @@ class ReportGenerator:
             yaxis_title="题目数量",
             margin=dict(l=20, r=20, t=50, b=20),
             height=350,
+            dragmode=False,
+            hovermode=False,
         )
         fig2.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig2.update_xaxes(fixedrange=True)
+        fig2.update_yaxes(fixedrange=True)
         
         # 3. 高频知识点横向柱状图
         fig3 = go.Figure(data=[
@@ -110,8 +147,12 @@ class ReportGenerator:
             margin=dict(l=20, r=20, t=50, b=20),
             height=400,
             yaxis=dict(autorange="reversed"),
+            dragmode=False,
+            hovermode=False,
         )
         fig3.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig3.update_xaxes(fixedrange=True)
+        fig3.update_yaxes(fixedrange=True)
         
         # 4. 易错点统计
         fig4 = go.Figure(data=[
@@ -124,13 +165,54 @@ class ReportGenerator:
                 textposition="auto",
             )
         ])
+        
+        # 5. 每日做题趋势（折线图）
+        fig5 = go.Figure(data=[
+            go.Scatter(
+                x=daily_dates,
+                y=daily_values,
+                mode='lines+markers',
+                marker=dict(color='#00D2FF', size=8),
+                line=dict(color='#00D2FF', width=2),
+                fill='tozeroy',
+                fillcolor='rgba(0, 210, 255, 0.1)',
+            )
+        ])
+        fig5.update_layout(
+            title="每日做题趋势（最近14天）",
+            margin=dict(l=20, r=20, t=50, b=20),
+            height=300,
+            dragmode=False,
+            hovermode=False,
+        )
+        fig5.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig5.update_xaxes(fixedrange=True)
+        fig5.update_yaxes(fixedrange=True)
+        
+        # 6. 掌握程度分布
+        if mastery_counts:
+            fig6 = px.pie(
+                names=[mastery_levels.get(k, k) for k in mastery_counts.keys()],
+                values=list(mastery_counts.values()),
+                title="掌握程度分布",
+                hole=0.4,
+                color_discrete_sequence=["#4CAF50", "#FFC107", "#F44336"],
+            )
+            fig6.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=300, dragmode=False, hovermode=False)
+            fig6.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig6.update_xaxes(fixedrange=True)
+            fig6.update_yaxes(fixedrange=True)
         fig4.update_layout(
             title="常见易错点 TOP10",
             margin=dict(l=20, r=20, t=50, b=20),
             height=400,
             yaxis=dict(autorange="reversed"),
+            dragmode=False,
+            hovermode=False,
         )
         fig4.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig4.update_xaxes(fixedrange=True)
+        fig4.update_yaxes(fixedrange=True)
         
         # 组装 HTML
         period = f"{cutoff_date.strftime('%Y-%m-%d')} 至 {datetime.utcnow().strftime('%Y-%m-%d')}"
@@ -168,7 +250,7 @@ class ReportGenerator:
             <div class="label">总做题数</div>
         </div>
         <div class="stat-card">
-            <div class="number">{len(subjects)}</div>
+            <div class="number">{len(subject_counts)}</div>
             <div class="label">涉及学科</div>
         </div>
         <div class="stat-card">
@@ -192,6 +274,9 @@ class ReportGenerator:
     <div class="chart-container">
         {fig4.to_html(full_html=False, include_plotlyjs=False)}
     </div>
+    
+    {'<div class="chart-container">' + fig5.to_html(full_html=False, include_plotlyjs=False) + '</div>' if daily_dates else ''}
+    {'<div class="chart-container">' + fig6.to_html(full_html=False, include_plotlyjs=False) + '</div>' if mastery_counts else ''}
 </body>
 </html>
 """

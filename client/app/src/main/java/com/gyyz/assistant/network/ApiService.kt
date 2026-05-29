@@ -289,6 +289,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
                     knowledgePoints = knowledgePoints,
                     solutionSteps = obj.optString("solution_steps"),
                     fullSolution = obj.optString("full_solution"),
+                    imageUrl = obj.optString("image_url", ""),
                 )
             }
         }
@@ -305,6 +306,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
         val knowledgePoints: List<String> = emptyList(),
         val solutionSteps: String = "",
         val fullSolution: String = "",
+        val imageUrl: String = "",
     )
 
     data class AuthResult(val token: String, val user: AuthUser)

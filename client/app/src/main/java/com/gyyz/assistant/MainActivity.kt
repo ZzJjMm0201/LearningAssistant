@@ -2240,15 +2240,16 @@ fun MarkdownView(
 private fun prepareMarkdownContent(content: String): String {
     if (content.isEmpty()) return ""
     var processed = content
-    processed = processed.replace(Regex("(?<!\\$)\\$(?!\\$)")) { "$$" }
-    processed =
-            processed.replace(Regex("""\\\[(.*")\\\]""", RegexOption.DOT_MATCHES_ALL)) { match ->
-                "\n\$\$\n${match.groupValues[1].trim()}\n\$\$\n"
-            }
-    processed =
-            processed.replace(Regex("""\\\((.*")\\\)""")) { match ->
-                "\$\$${match.groupValues[1].trim()}\$\$"
-            }
+    // 1. Preserve existing $$...$$ blocks (don't touch them)
+    // 2. Convert \(...\) to $...$ (inline LaTeX)
+    processed = processed.replace(Regex("""\\\((.*?)\\\)""", RegexOption.DOT_MATCHES_ALL)) { match ->
+        "\$${match.groupValues[1].trim()}\$"
+    }
+    // 3. Convert \[...\] to $$...$$ (display LaTeX)
+    processed = processed.replace(Regex("""\\\[(.*?)\\\]""", RegexOption.DOT_MATCHES_ALL)) { match ->
+        "\n\$\$\n${match.groupValues[1].trim()}\n\$\$\n"
+    }
+    // 4. Fix orphan newlines before headers/lists (ensure blank line before block elements)
     processed = processed.replace(Regex("([^\n])\n(#{1,6}\\s|>\\s|\\*\\s|\\d+\\.\\s)"), "$1\n\n$2")
 
     return processed
@@ -2450,13 +2451,16 @@ fun MainMenuScreen(
     statusText: String,
     gestureEnabled: Boolean = false,
 ) {
+    val voiceEnabled by viewModel.voiceEnabled.collectAsState()
+    val showWelcome by viewModel.showWelcomeDialog.collectAsState()
+    
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF0A0A1A))
         ) {
-        TopStatusBar(statusText = statusText, viewModel = viewModel)
+        TopStatusBar(statusText = statusText, viewModel = viewModel, showSettingsButton = true, showHelpButton = true)
 
         val fingerCount by viewModel.detectedFingerCount.collectAsState()
         if (gestureEnabled && fingerCount > 0) {
@@ -2473,13 +2477,12 @@ fun MainMenuScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             val buttons = listOf(
-                FunctionButtonData("📸 拍照解题", "伸出5根手指", Color(0xFF2196F3), { viewModel.onButtonSolve() }),
+                FunctionButtonData("🤔 AI解题", "伸出5根手指", Color(0xFF2196F3), { viewModel.onButtonSolve() }),
                 FunctionButtonData("🎬 AI动画", "伸出4根手指", Color(0xFF9C27B0), { viewModel.onButtonAnimation() }),
                 FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800), { viewModel.loadDataReport() }),
                 FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50), { viewModel.loadAiReport() }),
                 FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4), { viewModel.onButtonExtend() }),
                 FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548), { viewModel.showHistory() }),
-                FunctionButtonData("⚙️ 设置", "个性化配置", Color(0xFF607D8B), { viewModel.showSettings() }),
             )
 
             buttons.chunked(2).forEach { row ->
@@ -2506,18 +2509,20 @@ fun MainMenuScreen(
         }
     }
 
-    VoiceFloatingActionButton(
-        viewModel = viewModel,
-        modifier = Modifier
-            .align(Alignment.BottomEnd)
-            .padding(16.dp)
-    )
+    if (voiceEnabled) {
+        VoiceFloatingActionButton(
+            viewModel = viewModel,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp)
+        )
+    }
 }
 
 }
 
 @Composable
-fun TopStatusBar(statusText: String, viewModel: MainViewModel) {
+fun TopStatusBar(statusText: String, viewModel: MainViewModel, showSettingsButton: Boolean = false, showHelpButton: Boolean = false) {
     val pomodoroTime by viewModel.pomodoroTime.collectAsState()
     Row(
             modifier =
@@ -2526,12 +2531,25 @@ fun TopStatusBar(statusText: String, viewModel: MainViewModel) {
                             .padding(12.dp),
             horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text(statusText, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(statusText, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+        // Bug 19: 操作说明按钮
+        if (showHelpButton) {
+            TextButton(onClick = { viewModel.showWelcomeDialog.value = true }) {
+                Text("❓", color = Color.White, fontSize = 18.sp)
+            }
+        }
         Text(
                 "🍅 ${formatTime(pomodoroTime)}",
                 color = Color.White,
-                fontSize = 14.sp
+                fontSize = 14.sp,
+                modifier = Modifier.padding(horizontal = 4.dp)
         )
+        // Bug 20: 设置按钮移动到右上角（emoji图标）
+        if (showSettingsButton) {
+            TextButton(onClick = { viewModel.showSettings() }) {
+                Text("⚙️", color = Color.White, fontSize = 20.sp)
+            }
+        }
     }
 }
 
@@ -2539,7 +2557,7 @@ fun TopStatusBar(statusText: String, viewModel: MainViewModel) {
 fun FingerCountHint(fingerCount: Int) {
     val hintText =
             when (fingerCount) {
-                5 -> "✅ 即将拍照解题，请将手移开..."
+                5 -> "✅ 即将AI解题，请将手移开..."
                 4 -> "🎬 即将生成动画，请将手移开..."
                 1 -> "☝️ 即将知识延伸，请将手移开..."
                 else -> "$fingerCount 根手指"
@@ -2561,7 +2579,7 @@ fun FingerCountHint(fingerCount: Int) {
 @Composable
 fun FunctionGrid(viewModel: MainViewModel) {
     val buttons = listOf(
-        FunctionButtonData("📸 拍照解题", "伸出5根手指", Color(0xFF2196F3)) { viewModel.onButtonSolve() },
+        FunctionButtonData("🤔 AI解题", "伸出5根手指", Color(0xFF2196F3)) { viewModel.onButtonSolve() },
         FunctionButtonData("🎬 AI动画", "伸出4根手指", Color(0xFF9C27B0)) { viewModel.onButtonAnimation() },
         FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800)) { viewModel.loadDataReport() },
         FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50)) { viewModel.loadAiReport() },
@@ -2639,7 +2657,7 @@ fun WelcomeDialog(onDismiss: () -> Unit) {
                         """📗 使用说明：
                 
 🖐️ 手势操作（在主页伸出对应手指并保持1秒）：
-  · 5指 → 拍照解题
+  · 5指 → AI解题
   · 4指 → AI动画
   · 3指 → 数据报告
   · 2指 → AI报告
@@ -3369,10 +3387,9 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
 
                     SettingSwitch(
                             title = "🎤 语音识别",
-                            subtitle = "暂未开放，敬请期待",
+                            subtitle = "开启后主页显示麦克风按钮，点击或说出指令操作",
                             checked = voiceEnabled,
-                            onCheckedChange = {},
-                            enabled = false
+                            onCheckedChange = { viewModel.voiceEnabled.value = it }
                     )
 
                     SettingSwitch(
@@ -3553,6 +3570,14 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
                     ) { Text("🗑️ 清除历史记录") }
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Button(
+                            onClick = { viewModel.logout(); onDismiss() },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
+                    ) { Text("🚪 退出登录 (${viewModel.loggedInUsername.collectAsState().value})") }
                 }
             },
             confirmButton = {},
