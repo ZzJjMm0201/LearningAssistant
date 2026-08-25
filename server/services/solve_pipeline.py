@@ -32,7 +32,7 @@ class SolvePipeline:
     def __init__(self):
         self.db = SessionLocal()
     
-    def start_solve(self, image_path: Path, session_id: Optional[str] = None) -> str:
+    def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -40,7 +40,7 @@ class SolvePipeline:
         
         thread = threading.Thread(
             target=self._solve_worker,
-            args=(request_id, image_path, session_id)
+            args=(request_id, image_path, session_id, base_host, user_id)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -49,7 +49,7 @@ class SolvePipeline:
         return request_id
     
     def get_events(self, request_id: str) -> Generator[Dict, None, None]:
-        """获取SSE事件流"""
+        """获取SSE事件流（同步生成器，仅供后台线程使用）"""
         queue = _event_queues.get(request_id)
         if not queue:
             yield {"stage": "error", "content": "无效的request_id"}
@@ -63,6 +63,10 @@ class SolvePipeline:
                     break
             else:
                 time.sleep(0.1)
+
+    def get_queue(self, request_id: str):
+        """获取事件队列（供异步端点轮询，避免阻塞事件循环）"""
+        return _event_queues.get(request_id)
     
     def _emit_event(self, request_id: str, stage: str, content):
         """发送事件到队列"""
@@ -87,7 +91,7 @@ class SolvePipeline:
             event.set()  # 让worker线程继续执行并退出
         self._cleanup(request_id)
     
-    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None):
+    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None):
         """后台解题工作线程"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
@@ -185,7 +189,16 @@ class SolvePipeline:
                         processed_solution = process_latex_blocks(str(solution_content), svg_dir)
                         
                         import re
-                        base_url = f"http://10.100.55.167:8000/static/svgs_{request_id}"
+                        # 动态构造图片URL：优先使用请求的Host头，回退到server_ip.txt
+                        host = (base_host or "").strip()
+                        if not host:
+                            try:
+                                ip_file = Path(__file__).resolve().parent.parent.parent / "server_ip.txt"
+                                host = ip_file.read_text(encoding="utf-8").strip()
+                            except Exception:
+                                host = "127.0.0.1:8000"
+                        host = host.removeprefix("http://").removeprefix("https://").rstrip("/")
+                        base_url = f"http://{host}/static/svgs_{request_id}"
                         processed_solution = re.sub(
                             r'!\[([^\]]*)\]\((diagram_[^)]+\.(?:svg|png))\)',  # ← 改为 (?:svg|png)
                             rf'![\1]({base_url}/\2)',
@@ -207,6 +220,7 @@ class SolvePipeline:
                         search_result=search_result,
                         search_time=search_time,
                         messages=messages,
+                        user_id=user_id,
                     )
                     
                     self._emit_event(request_id, "complete", {
@@ -225,21 +239,21 @@ class SolvePipeline:
         finally:
             self._cleanup(request_id)
     
-    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None) -> str:
+    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None) -> str:
         """启动知识延伸流程"""
         request_id = session_id or str(uuid.uuid4())
         _event_queues[request_id] = deque()
         
         thread = threading.Thread(
             target=self._extension_worker,
-            args=(request_id, image_path, session_id)
+            args=(request_id, image_path, session_id, user_id)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
         thread.start()
         return request_id
 
-    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None):
+    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None):
         """知识延伸工作线程"""
         print(f"[{request_id}] ========== 知识延伸流程启动 ==========")
         
@@ -293,7 +307,7 @@ class SolvePipeline:
     
     def _save_record(self, request_id: str, session_id: Optional[str], ocr_text: str, 
                 ocr_time: float, search_result: Optional[str], search_time: float,
-                messages: list):
+                messages: list, user_id: Optional[int] = None):
         """保存解题记录到数据库"""
         try:
             question_info = {}
@@ -337,6 +351,7 @@ class SolvePipeline:
             # 保存到数据库
             record = SubmissionRecord(
                 session_id=session_id or request_id,
+                user_id=user_id,
                 ocr_text=ocr_text,
                 ocr_time_seconds=ocr_time,
                 question_info=question_info,
@@ -363,6 +378,7 @@ class SolvePipeline:
             for msg in messages:
                 conv = ConversationHistory(
                     session_id=session_id or request_id,
+                    user_id=user_id,
                     role=msg["role"],
                     content=msg["content"],
                 )

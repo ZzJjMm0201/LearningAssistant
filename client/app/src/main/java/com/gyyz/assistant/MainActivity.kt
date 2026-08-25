@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 
@@ -34,6 +35,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -174,6 +176,10 @@ class MainViewModel : ViewModel() {
     val ocrConfirmText = MutableStateFlow("")
     val ocrConfirmTitle = MutableStateFlow("确认识别结果")
 
+    // 待确认的解题 request_id（用于把确认结果回传给服务端，避免30秒超时等待）
+    private val _pendingOcrRequestId = MutableStateFlow("")
+    val pendingOcrRequestId: StateFlow<String> = _pendingOcrRequestId.asStateFlow()
+
     // Feature 3: 提问loading状态
     val isAskingQuestion = MutableStateFlow(false)
 
@@ -182,6 +188,12 @@ class MainViewModel : ViewModel() {
     val restTimeRemaining = MutableStateFlow(0)
     val pomodoroWorkDuration = MutableStateFlow(25)
     val pomodoroRestDuration = MutableStateFlow(5)
+
+    // 番茄钟增强：正计时模式 + 暂停/继续 + 设置弹窗
+    val pomodoroMode = MutableStateFlow(false)   // false=倒计时, true=正计时
+    val elapsedTime = MutableStateFlow(0)        // 正计时经过秒数
+    val pomodoroRunning = MutableStateFlow(true) // 暂停/继续
+    val showPomodoroSettings = MutableStateFlow(false)
 
     // Feature 20: GeoGebra
     val showGeoGebraScreen = MutableStateFlow(false)
@@ -264,26 +276,90 @@ class MainViewModel : ViewModel() {
         pomodoroJob = viewModelScope.launch {
             while (isActive && tomatoEnabled.value) {
                 delay(1000)
-                if (_pomodoroTime.value > 0) {
-                    _pomodoroTime.value -= 1
+                if (!pomodoroRunning.value) continue
+                if (pomodoroMode.value) {
+                    // 正计时模式：从0向上计时
+                    elapsedTime.value += 1
                 } else {
-                    // Feature 11: 番茄钟完成 → 全屏休息
-                    _statusText.value = "完成一个番茄钟！休息一下吧~"
-                    isResting.value = true
-                    restTimeRemaining.value = pomodoroRestDuration.value * 60
-                    // 关闭手势、语音、摄像头（通过Tracking状态控制）
-                    _appState.value = AppState.Tracking
-                    // 休息倒计时
-                    while (isActive && restTimeRemaining.value > 0) {
-                        delay(1000)
-                        restTimeRemaining.value -= 1
+                    // 倒计时模式
+                    if (_pomodoroTime.value > 0) {
+                        _pomodoroTime.value -= 1
+                    } else {
+                        // Feature 11: 番茄钟完成 → 全屏休息
+                        _statusText.value = "完成一个番茄钟！休息一下吧~"
+                        isResting.value = true
+                        restTimeRemaining.value = pomodoroRestDuration.value * 60
+                        // 关闭手势、语音、摄像头（通过Tracking状态控制）
+                        _appState.value = AppState.Tracking
+                        // 休息倒计时
+                        while (isActive && restTimeRemaining.value > 0) {
+                            delay(1000)
+                            restTimeRemaining.value -= 1
+                        }
+                        isResting.value = false
+                        _statusText.value = "休息结束，继续学习！"
+                        _pomodoroTime.value = pomodoroWorkDuration.value * 60
                     }
-                    isResting.value = false
-                    _statusText.value = "休息结束，继续学习！"
-                    _pomodoroTime.value = pomodoroWorkDuration.value * 60
                 }
             }
         }
+    }
+
+    /**
+     * 修改工作时长（设置面板/番茄钟弹窗调用）：立即生效并重置当前倒计时
+     */
+    fun applyPomodoroWorkDuration(minutes: Int) {
+        val m = minutes.coerceIn(1, 180)
+        pomodoroWorkDuration.value = m
+        if (!pomodoroMode.value && !isResting.value) {
+            _pomodoroTime.value = m * 60
+        }
+    }
+
+    /**
+     * 修改休息时长
+     */
+    fun applyPomodoroRestDuration(minutes: Int) {
+        pomodoroRestDuration.value = minutes.coerceIn(1, 60)
+    }
+
+    /**
+     * 切换计时模式（倒计时 ↔ 正计时）
+     */
+    fun setPomodoroMode(stopwatch: Boolean) {
+        pomodoroMode.value = stopwatch
+        elapsedTime.value = 0
+        _pomodoroTime.value = pomodoroWorkDuration.value * 60
+        pomodoroRunning.value = true
+    }
+
+    /**
+     * 应用番茄钟设置（模式 + 时长）
+     */
+    fun applyPomodoroSettings(workMin: Int, restMin: Int, stopwatch: Boolean) {
+        pomodoroWorkDuration.value = workMin.coerceIn(1, 180)
+        pomodoroRestDuration.value = restMin.coerceIn(1, 60)
+        pomodoroMode.value = stopwatch
+        elapsedTime.value = 0
+        _pomodoroTime.value = pomodoroWorkDuration.value * 60
+        pomodoroRunning.value = true
+        isResting.value = false
+    }
+
+    /**
+     * 暂停/继续计时
+     */
+    fun togglePomodoro() {
+        pomodoroRunning.value = !pomodoroRunning.value
+    }
+
+    /**
+     * 重置计时
+     */
+    fun resetPomodoro() {
+        elapsedTime.value = 0
+        _pomodoroTime.value = pomodoroWorkDuration.value * 60
+        pomodoroRunning.value = true
     }
 
     private fun startTracking() {
@@ -399,6 +475,21 @@ class MainViewModel : ViewModel() {
         _statusText.value = "正在拍照..."
     }
 
+    fun confirmOcr() {
+        // 若当前弹窗是解题流程的OCR确认，则通知服务端继续，避免白白等待30秒
+        val rid = _pendingOcrRequestId.value
+        _pendingOcrRequestId.value = ""
+        if (rid.isNotEmpty()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    apiService.confirmSolve(rid)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "OCR确认回传失败: ${e.message}")
+                }
+            }
+        }
+    }
+
     fun onPhotoReady(photoFile: java.io.File) {
         Log.d("MainViewModel", "照片就绪，开始上传: ${photoFile.absolutePath}")
         cancelCurrentSSE = false  // Feature 5: 重置取消标志
@@ -471,6 +562,8 @@ class MainViewModel : ViewModel() {
             var mindMap = ""
             var suggestedQuestions = emptyList<String>()
             var ocrText = ""
+            // 流式显示节流：每100ms最多刷新一次UI，避免AR眼镜低性能CPU卡顿
+            var lastSolutionUpdate = 0L
 
             while (true) {
                 // Feature 5: 检查取消标志
@@ -510,7 +603,8 @@ class MainViewModel : ViewModel() {
                                     "ocr_complete" -> {
                                         ocrText = json.optString("content", "")
                                         _statusText.value = "正在搜索题库..."
-                                        // Feature 9: OCR确认弹窗
+                                        // Feature 9: OCR确认弹窗（确认后将回传服务端继续流程）
+                                        _pendingOcrRequestId.value = requestId
                                         showOcrConfirmDialog.value = true
                                         ocrConfirmText.value = ocrText
                                         ocrConfirmTitle.value = "确认识别结果"
@@ -522,14 +616,35 @@ class MainViewModel : ViewModel() {
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_STEPS,
+                                                        requestId = requestId,
                                                         solutionSteps = solutionSteps
                                                 )
+                                    }
+                                    "solution_chunk" -> {
+                                        // 流式增量：content 是累积到当前的完整文本，节流刷新实现“打字机”效果
+                                        val chunk = json.optString("content", "")
+                                        if (chunk.isNotEmpty()) {
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastSolutionUpdate >= 100) {
+                                                lastSolutionUpdate = now
+                                                fullSolution = chunk
+                                                _statusText.value = "AI正在生成完整解析..."
+                                                _appState.value =
+                                                        AppState.Solving(
+                                                                stage = SolveStage.DISPLAY_FULL,
+                                                                requestId = requestId,
+                                                                solutionSteps = solutionSteps,
+                                                                fullSolution = chunk
+                                                        )
+                                            }
+                                        }
                                     }
                                     "solution", "solution_rendered" -> {
                                         fullSolution = json.optString("content", "")
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_FULL,
+                                                        requestId = requestId,
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution
                                                 )
@@ -541,6 +656,7 @@ class MainViewModel : ViewModel() {
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_MINDMAP,
+                                                        requestId = requestId,
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
                                                         mindMap = formattedMindMap
@@ -555,6 +671,7 @@ class MainViewModel : ViewModel() {
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.INTERACTIVE,
+                                                        requestId = requestId,
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
                                                         mindMap = mindMap,
@@ -565,6 +682,7 @@ class MainViewModel : ViewModel() {
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.COMPLETED,
+                                                        requestId = requestId,
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
                                                         mindMap = mindMap,
@@ -658,7 +776,8 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    fun loadAiReport() {
+    fun loadAiReport(days: Int? = null) {
+        val reportDaysVal = days ?: reportDays.value
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) {
@@ -666,7 +785,7 @@ class MainViewModel : ViewModel() {
                     _statusText.value = "正在生成AI学情报告..."
                 }
 
-                val response = apiService.getAiReport(7)
+                val response = apiService.getAiReport(reportDaysVal)
 
                 withContext(Dispatchers.Main) {
                     if (response.status == "ok") {
@@ -687,7 +806,8 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    fun loadDataReport() {
+    fun loadDataReport(days: Int? = null) {
+        val reportDaysVal = days ?: reportDays.value
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) {
@@ -695,7 +815,7 @@ class MainViewModel : ViewModel() {
                     _statusText.value = "正在生成数据学情报告..."
                 }
 
-                val response = apiService.getDataReport(7)
+                val response = apiService.getDataReport(reportDaysVal)
 
                 withContext(Dispatchers.Main) {
                     if (response.status == "ok") {
@@ -719,6 +839,9 @@ class MainViewModel : ViewModel() {
             }
         }
     }
+
+    // 报告统计周期（0=全部历史）
+    val reportDays = MutableStateFlow(7)
 
     fun requestKnowledgeExtension(photoFile: java.io.File) {
         Log.d("MainViewModel", "请求知识延伸: ${photoFile.absolutePath}")
@@ -852,6 +975,7 @@ class MainViewModel : ViewModel() {
         isAskingQuestion.value = false
         showMasteryDialog.value = false
         showOcrConfirmDialog.value = false
+        _pendingOcrRequestId.value = ""
         _appState.value = AppState.Tracking
         _statusText.value = "跟踪学习中..."
     }
@@ -878,7 +1002,7 @@ class MainViewModel : ViewModel() {
     val gestureEnabled = MutableStateFlow(false)
     val voiceEnabled = MutableStateFlow(false)
     val tomatoEnabled = MutableStateFlow(false)
-    val serverAddress = MutableStateFlow("10.100.55.167:8000")
+    val serverAddress = MutableStateFlow("10.100.55.231:8000")
     val themeColor = MutableStateFlow(Color(0xFF00D2FF))
     val fontSize = MutableStateFlow(16f)
 
@@ -1059,6 +1183,18 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // 相册选图（模拟器无可用相机时的替代方案）
+                var pendingGalleryAction by remember { mutableStateOf<String?>(null) }
+                val galleryLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.GetContent()
+                ) { uri ->
+                    val action = pendingGalleryAction
+                    pendingGalleryAction = null
+                    if (uri != null && action != null) {
+                        handleGalleryImage(uri, action, viewModel)
+                    }
+                }
+
                 MainScreen(
                     hasCameraPermission = hasCameraPermission.collectAsState().value,
                     gestureRecognizer = gestureRecognizerState.collectAsState().value,
@@ -1068,7 +1204,12 @@ class MainActivity : ComponentActivity() {
                         isCameraReady.value = true
                         Log.d(TAG, "ImageCapture 已就绪")
                     },
-                    cameraRebindTrigger = cameraRebindTrigger.collectAsState().value
+                    cameraRebindTrigger = cameraRebindTrigger.collectAsState().value,
+                    onPickImage = { action ->
+                        pendingGalleryAction = action
+                        galleryLauncher.launch("image/*")
+                    },
+                    isCameraReady = isCameraReady.collectAsState().value
                 )
             }
         }
@@ -1228,6 +1369,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun handleGalleryImage(uri: android.net.Uri, action: String, viewModel: MainViewModel) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val file = java.io.File(cacheDir, "gallery_${System.currentTimeMillis()}.jpg")
+                contentResolver.openInputStream(uri)?.use { input ->
+                    file.outputStream().use { output -> input.copyTo(output) }
+                } ?: throw Exception("无法读取所选图片")
+                Log.d(TAG, "相册图片已保存: ${file.absolutePath}")
+                withContext(Dispatchers.Main) {
+                    when (action) {
+                        "solve" -> viewModel.onPhotoReady(file)
+                        "animation" -> viewModel.requestAnimation(file)
+                        "extend" -> viewModel.requestKnowledgeExtension(file)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "读取相册图片失败: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    viewModel.onPhotoError("读取图片失败: ${e.message}")
+                }
+            }
+        }
+    }
+
     private fun takePhotoAndUploadExtend(capture: ImageCapture, viewModel: MainViewModel) {
         val photoFile = java.io.File(externalCacheDir, "extend_${System.currentTimeMillis()}.jpg")
 
@@ -1263,6 +1428,8 @@ fun MainScreen(
     viewModel: MainViewModel,
     onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
     cameraRebindTrigger: Int = 0,
+    onPickImage: ((String) -> Unit)? = null,
+    isCameraReady: Boolean = false,
 ) {
     val appState by viewModel.appState.collectAsState()
     val statusText by viewModel.statusText.collectAsState()
@@ -1312,6 +1479,8 @@ fun MainScreen(
                     viewModel = viewModel,
                     statusText = statusText,
                     gestureEnabled = gestureEnabled,
+                    onPickImage = onPickImage,
+                    isCameraReady = isCameraReady,
                 )
             is AppState.Solving ->
                 SolvingScreen(
@@ -1332,6 +1501,15 @@ fun MainScreen(
                             onBack = { viewModel.backToTracking() },
                             reportUrl = if (isDataReport) state.reportText else "",
                             reportText = if (!isDataReport) state.reportText else "",
+                            reportDays = viewModel.reportDays.collectAsState().value,
+                            onSelectDays = { days ->
+                                viewModel.reportDays.value = days
+                                if (isDataReport) {
+                                    viewModel.loadDataReport(days)
+                                } else {
+                                    viewModel.loadAiReport(days)
+                                }
+                            }
                     )
                 }
             }
@@ -1368,6 +1546,15 @@ fun MainScreen(
                     onDismiss = { viewModel.showSettingsDialog.value = false }
             )
         }
+
+        // 番茄钟设置弹窗（点击顶部 🍅 时间打开）
+        val showPomodoroSettings by viewModel.showPomodoroSettings.collectAsState()
+        if (showPomodoroSettings) {
+            PomodoroSettingsDialog(
+                    viewModel = viewModel,
+                    onDismiss = { viewModel.showPomodoroSettings.value = false }
+            )
+        }
         if (showHistory) {
             HistoryViewScreen(
                 viewModel = viewModel,
@@ -1392,16 +1579,18 @@ fun MainScreen(
             )
         }
 
-        // Feature 9: OCR确认弹窗
+        // Feature 9: OCR确认弹窗（确认后回传服务端，立即继续解题流程）
         if (showOcr) {
             CountdownConfirmDialog(
                 title = ocrConfirmTitle,
                 content = ocrConfirmText,
                 onConfirm = {
                     viewModel.showOcrConfirmDialog.value = false
+                    viewModel.confirmOcr()
                 },
                 onCancel = {
                     viewModel.showOcrConfirmDialog.value = false
+                    viewModel.confirmOcr()
                     viewModel.backToTracking()
                 }
             )
@@ -1416,6 +1605,26 @@ fun MainScreen(
     }
 }
 
+
+private fun resolveCameraSelector(provider: ProcessCameraProvider): CameraSelector? {
+    // 优先后置摄像头；没有则回退前置（模拟器只有前置 Webcam 时也能用）；再不行选任意可用摄像头
+    if (provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
+        return CameraSelector.DEFAULT_BACK_CAMERA
+    }
+    if (provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
+        Log.w("CameraPreview", "未找到后置摄像头，回退到前置摄像头")
+        return CameraSelector.DEFAULT_FRONT_CAMERA
+    }
+    val infos = provider.availableCameraInfos
+    if (infos.isNotEmpty()) {
+        Log.w("CameraPreview", "回退到任意可用摄像头，共${infos.size}个")
+        // 不依赖镜头朝向：直接取第一个可用摄像头
+        return CameraSelector.Builder()
+            .addCameraFilter { candidates -> candidates.take(1) }
+            .build()
+    }
+    return null
+}
 
 @Composable
 fun CameraPreviewView(
@@ -1446,7 +1655,7 @@ fun CameraPreviewView(
 
     LaunchedEffect(Unit) {
         var retryCount = 0
-        val maxRetries = 5
+        val maxRetries = 2
         while (retryCount < maxRetries && cameraState.value == null) {
             try {
                 val cameraProvider = withContext(Dispatchers.IO) {
@@ -1461,6 +1670,16 @@ fun CameraPreviewView(
                 if (cameraProvider != null) {
                     cameraState.value = cameraProvider
                     Log.d("CameraPreview", "CameraProvider 获取成功")
+                    // 诊断：打印可用摄像头的朝向信息
+                    try {
+                        val infos = cameraProvider.availableCameraInfos
+                        Log.d("CameraPreview", "可用摄像头数: ${infos.size}")
+                        infos.forEach { info ->
+                            Log.d("CameraPreview", "  摄像头: lensFacing=${info.lensFacing}, 支持BACK=${cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)}, 支持FRONT=${cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)}")
+                        }
+                    } catch (e: Exception) {
+                        Log.w("CameraPreview", "枚举摄像头信息失败: ${e.message}")
+                    }
                 } else {
                     retryCount++
                     if (retryCount < maxRetries) {
@@ -1476,7 +1695,7 @@ fun CameraPreviewView(
             }
         }
         if (cameraState.value == null) {
-            Log.e("CameraPreview", "CameraProvider 获取失败，已重试 $maxRetries 次")
+            Log.e("CameraPreview", "CameraProvider 获取失败，相机功能不可用（可改用相册选图）")
         }
     }
 
@@ -1508,10 +1727,15 @@ fun CameraPreviewView(
         }
 
         try {
+            val selector = resolveCameraSelector(cameraProvider)
+            if (selector == null) {
+                Log.e("CameraPreview", "没有可用摄像头")
+                return@LaunchedEffect
+            }
             withContext(Dispatchers.Main) {
                 cameraProvider.bindToLifecycle(
                     currentLifecycle,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    selector,
                     *useCases.toTypedArray()
                 )
             }
@@ -1524,6 +1748,8 @@ fun CameraPreviewView(
             Log.d("CameraPreview", "相机绑定成功")
         } catch (e: Exception) {
             Log.e("CameraPreview", "相机绑定失败", e)
+            // 绑定失败时触发重绑，并等待下一次机会
+            isBound.value = false
         }
     }
 
@@ -1553,9 +1779,14 @@ fun CameraPreviewView(
         }
         
         try {
+            val selector = resolveCameraSelector(cameraProvider)
+            if (selector == null) {
+                Log.e("CameraPreview", "没有可用摄像头")
+                return@LaunchedEffect
+            }
             cameraProvider.bindToLifecycle(
                 lifecycleOwner,
-                CameraSelector.DEFAULT_BACK_CAMERA,
+                selector,
                 *useCases.toTypedArray()
             )
             imageCaptureRef.value = imageCapture
@@ -1563,6 +1794,7 @@ fun CameraPreviewView(
             Log.d("CameraPreview", "Gesture: ${if (gestureRecognizer != null) "enabled" else "disabled"}")
         } catch (e: Exception) {
             Log.e("CameraPreview", "Failed to update gesture analyzer", e)
+            isBound.value = false
         }
     }
 
@@ -1959,7 +2191,9 @@ fun ReportScreen(
         report: AppState.Report,
         onBack: () -> Unit,
         reportUrl: String = "",
-        reportText: String = ""
+        reportText: String = "",
+        reportDays: Int = 7,
+        onSelectDays: ((Int) -> Unit)? = null,
 ) {
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
         // Feature 14: 固定返回按钮在顶部
@@ -1979,6 +2213,26 @@ fun ReportScreen(
             }
         }
 
+        // 统计周期选择
+        if (onSelectDays != null) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                listOf(7 to "近7天", 30 to "近30天", 90 to "近90天", 0 to "全部").forEach { (days, label) ->
+                    FilterChip(
+                            selected = reportDays == days,
+                            onClick = { onSelectDays(days) },
+                            label = { Text(label, fontSize = 12.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF00D2FF),
+                                    selectedLabelColor = Color.Black
+                            )
+                    )
+                }
+            }
+        }
+
         if (reportUrl.isNotEmpty()) {
             AndroidView(
                     factory = { ctx ->
@@ -1986,14 +2240,11 @@ fun ReportScreen(
                             settings.javaScriptEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
-                            // Feature 15: 禁用缩放和交互
+                            // 禁止缩放但允许滚动（修复报告页面划不动的问题）
                             settings.builtInZoomControls = false
                             settings.displayZoomControls = false
                             settings.setSupportZoom(false)
                             setInitialScale(50)
-                            isClickable = false
-                            isFocusable = false
-                            setOnTouchListener { _, _ -> true }  // 拦截所有触摸事件
                             loadUrl(reportUrl)
                         }
                     },
@@ -2158,6 +2409,38 @@ fun formatTime(seconds: Int): String {
     val mins = seconds / 60
     val secs = seconds % 60
     return "%02d:%02d".format(mins, secs)
+}
+
+fun formatStopwatch(seconds: Int): String {
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+/**
+ * 清洗OCR/历史文本中的HTML标签（<div>、<img>等），保留可读内容
+ */
+private fun cleanHtmlText(text: String): String {
+    if (text.isEmpty()) return text
+    var t = text.replace(Regex("<[^>]*>"), " ")
+    // 压缩空白
+    t = t.replace(Regex("[ \\t]+"), " ")
+    t = t.replace(Regex("\\n{3,}"), "\\n\\n")
+    return t.trim()
+}
+
+/**
+ * 生成纯文本预览：去除HTML标签与Markdown标记，截断到指定长度
+ */
+private fun plainPreview(text: String, max: Int = 30): String {
+    var t = cleanHtmlText(text)
+    // 去掉Markdown标记：标题、粗体/斜体、行内代码、公式分隔符
+    t = t.replace(Regex("^#{1,6}\\s*", RegexOption.MULTILINE), "")
+    t = t.replace("**", "").replace("`", "")
+    t = t.replace(Regex("\\$\\$?" ), "")
+    t = t.replace(Regex("\\s+"), " ").trim()
+    return if (t.length > max) t.take(max) + "…" else t
 }
 
 @Composable
@@ -2450,9 +2733,12 @@ fun MainMenuScreen(
     viewModel: MainViewModel,
     statusText: String,
     gestureEnabled: Boolean = false,
+    onPickImage: ((String) -> Unit)? = null,
+    isCameraReady: Boolean = true,
 ) {
     val voiceEnabled by viewModel.voiceEnabled.collectAsState()
     val showWelcome by viewModel.showWelcomeDialog.collectAsState()
+    var showPickDialog by remember { mutableStateOf(false) }
     
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -2461,6 +2747,22 @@ fun MainMenuScreen(
                 .background(Color(0xFF0A0A1A))
         ) {
         TopStatusBar(statusText = statusText, viewModel = viewModel, showSettingsButton = true, showHelpButton = true)
+
+        // 相机不可用时：醒目提示改用相册选图
+        if (!isCameraReady) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                color = Color(0x66F44336),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    "⚠️ 相机不可用（模拟器/无摄像头环境），请使用下方“🖼️ 相册选图”功能",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
 
         val fingerCount by viewModel.detectedFingerCount.collectAsState()
         if (gestureEnabled && fingerCount > 0) {
@@ -2505,6 +2807,24 @@ fun MainMenuScreen(
                 }
             }
 
+            // 相册选图：无可用相机（如虚拟机/模拟器）时也能体验完整功能
+            if (onPickImage != null) {
+                Button(
+                    onClick = { showPickDialog = true },
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isCameraReady) Color(0xFF2D2D44) else Color(0xFF00D2FF)
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        "🖼️ 从相册选图${if (isCameraReady) "（相机不可用时使用）" else "（当前推荐）"}",
+                        color = if (isCameraReady) Color.White else Color.Black,
+                        fontSize = 14.sp
+                    )
+                }
+            }
+
             Spacer(modifier = Modifier.height(32.dp))
         }
     }
@@ -2519,11 +2839,40 @@ fun MainMenuScreen(
     }
 }
 
+    if (showPickDialog) {
+        AlertDialog(
+            onDismissRequest = { showPickDialog = false },
+            title = { Text("🖼️ 从相册选图", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("选择图片后将用于：", color = Color.Gray, fontSize = 13.sp)
+                    listOf(
+                        "🤔 AI解题" to "solve",
+                        "🎬 AI动画" to "animation",
+                        "📎 知识延伸" to "extend",
+                    ).forEach { (label, action) ->
+                        Button(
+                            onClick = {
+                                showPickDialog = false
+                                onPickImage?.invoke(action)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                        ) { Text(label, color = Color.White, fontSize = 14.sp) }
+                    }
+                }
+            },
+            confirmButton = {},
+            containerColor = Color(0xFF16213E)
+        )
+    }
 }
 
 @Composable
 fun TopStatusBar(statusText: String, viewModel: MainViewModel, showSettingsButton: Boolean = false, showHelpButton: Boolean = false) {
     val pomodoroTime by viewModel.pomodoroTime.collectAsState()
+    val pomodoroMode by viewModel.pomodoroMode.collectAsState()
+    val elapsedTime by viewModel.elapsedTime.collectAsState()
     Row(
             modifier =
                     Modifier.fillMaxWidth()
@@ -2538,12 +2887,14 @@ fun TopStatusBar(statusText: String, viewModel: MainViewModel, showSettingsButto
                 Text("❓", color = Color.White, fontSize = 18.sp)
             }
         }
-        Text(
-                "🍅 ${formatTime(pomodoroTime)}",
-                color = Color.White,
-                fontSize = 14.sp,
-                modifier = Modifier.padding(horizontal = 4.dp)
-        )
+        // 番茄钟：点击打开设置（支持倒计时/正计时）
+        TextButton(onClick = { viewModel.showPomodoroSettings.value = true }) {
+            Text(
+                    if (pomodoroMode) "⏱ ${formatStopwatch(elapsedTime)}" else "🍅 ${formatTime(pomodoroTime)}",
+                    color = Color.White,
+                    fontSize = 14.sp
+            )
+        }
         // Bug 20: 设置按钮移动到右上角（emoji图标）
         if (showSettingsButton) {
             TextButton(onClick = { viewModel.showSettings() }) {
@@ -3110,7 +3461,7 @@ fun HistoryRecordCard(
                 
                 if (record.ocrText.isNotEmpty()) {
                     Text(
-                        text = record.ocrText,
+                        text = cleanHtmlText(record.ocrText),
                         color = Color.White,
                         fontSize = 13.sp,
                         maxLines = 3,
@@ -3121,9 +3472,7 @@ fun HistoryRecordCard(
                 if (record.solutionSteps.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = record.solutionSteps
-                            .replace(Regex("#+\\s*"), "")
-                            .take(150),
+                        text = plainPreview(record.solutionSteps, 30),
                         color = Color(0xFF00D2FF).copy(alpha = 0.8f),
                         fontSize = 12.sp,
                         maxLines = 2,
@@ -3274,7 +3623,7 @@ fun HistoryDetailScreen(
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text("📥 原图", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text(record.ocrText, color = Color.White, fontSize = 13.sp)
+                        Text(cleanHtmlText(record.ocrText), color = Color.White, fontSize = 13.sp)
                     }
                 }
             }
@@ -3291,10 +3640,7 @@ fun HistoryDetailScreen(
                         if (showSolutionSteps) {
                             MarkdownView(content = record.solutionSteps, fontSize = 14f)
                         } else {
-                            val preview = record.solutionSteps
-                                .replace(Regex("#+\\s*"), "")
-                                .take(200)
-                            Text(preview + "...", color = Color.White, fontSize = 13.sp)
+                            Text(plainPreview(record.solutionSteps, 30), color = Color.White, fontSize = 13.sp)
                         }
                         
                         TextButton(
@@ -3323,10 +3669,7 @@ fun HistoryDetailScreen(
                         if (showFullSolution) {
                             MarkdownView(content = record.fullSolution, fontSize = 14f)
                         } else {
-                            val preview = record.fullSolution
-                                .replace(Regex("#+\\s*"), "")
-                                .take(200)
-                            Text(preview + "...", color = Color.White, fontSize = 13.sp)
+                            Text(plainPreview(record.fullSolution, 30), color = Color.White, fontSize = 13.sp)
                         }
                         
                         TextButton(
@@ -3407,9 +3750,9 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         )
                         Slider(
                             value = pomodoroWorkDuration.toFloat(),
-                            onValueChange = { viewModel.pomodoroWorkDuration.value = it.toInt() },
-                            valueRange = 5f..60f,
-                            steps = 11,
+                            onValueChange = { viewModel.applyPomodoroWorkDuration(it.toInt()) },
+                            valueRange = 1f..120f,
+                            steps = 23,
                             colors = SliderDefaults.colors(thumbColor = Color(0xFFFF5722), activeTrackColor = Color(0xFFFF5722))
                         )
                         Text(
@@ -3419,8 +3762,8 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         )
                         Slider(
                             value = pomodoroRestDuration.toFloat(),
-                            onValueChange = { viewModel.pomodoroRestDuration.value = it.toInt() },
-                            valueRange = 1f..30f,
+                            onValueChange = { viewModel.applyPomodoroRestDuration(it.toInt()) },
+                            valueRange = 1f..60f,
                             steps = 29,
                             colors = SliderDefaults.colors(thumbColor = Color(0xFF4CAF50), activeTrackColor = Color(0xFF4CAF50))
                         )
@@ -3622,6 +3965,122 @@ fun darkTextFieldColors() =
                 focusedBorderColor = Color(0xFF00D2FF),
                 unfocusedBorderColor = Color.Gray,
         )
+
+// ==================== Feature 11: 番茄钟设置弹窗（点击顶部计时打开） ====================
+
+@Composable
+fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
+    val work by viewModel.pomodoroWorkDuration.collectAsState()
+    val rest by viewModel.pomodoroRestDuration.collectAsState()
+    val mode by viewModel.pomodoroMode.collectAsState()
+    val running by viewModel.pomodoroRunning.collectAsState()
+    val tomatoEnabled by viewModel.tomatoEnabled.collectAsState()
+
+    var workInput by remember(work) { mutableStateOf(work.toString()) }
+    var restInput by remember(rest) { mutableStateOf(rest.toString()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("🍅 番茄钟设置", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                SettingSwitch(
+                    title = "启用番茄钟",
+                    subtitle = "关闭后不进行任何计时",
+                    checked = tomatoEnabled,
+                    onCheckedChange = { viewModel.tomatoEnabled.value = it }
+                )
+
+                Text("⏱ 计时模式", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !mode,
+                        onClick = { viewModel.setPomodoroMode(false) },
+                        label = { Text("⏳ 倒计时", fontSize = 13.sp) },
+                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFFFF5722))
+                    )
+                    FilterChip(
+                        selected = mode,
+                        onClick = { viewModel.setPomodoroMode(true) },
+                        label = { Text("⏱ 正计时", fontSize = 13.sp) },
+                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF00D2FF))
+                    )
+                }
+
+                if (!mode) {
+                    Text("工作时长（分钟，可输入）", color = Color.White, fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = workInput,
+                        onValueChange = { workInput = it.filter { c -> c.isDigit() }.take(3) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        colors = darkTextFieldColors()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(15, 25, 45, 60, 90).forEach { min ->
+                            TextButton(onClick = { workInput = min.toString() }) {
+                                Text("${min}分", color = Color(0xFF00D2FF), fontSize = 13.sp)
+                            }
+                        }
+                    }
+
+                    Text("休息时长（分钟，可输入）", color = Color.White, fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = restInput,
+                        onValueChange = { restInput = it.filter { c -> c.isDigit() }.take(2) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        colors = darkTextFieldColors()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(5, 10, 15, 30).forEach { min ->
+                            TextButton(onClick = { restInput = min.toString() }) {
+                                Text("${min}分", color = Color(0xFF4CAF50), fontSize = 13.sp)
+                            }
+                        }
+                    }
+                } else {
+                    Text(
+                        "正计时：从 0 开始累计学习时间，可暂停/重置，适合自由学习场景",
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    TextButton(onClick = { viewModel.togglePomodoro() }) {
+                        Text(if (running) "⏸ 暂停" else "▶ 继续", color = Color(0xFF00D2FF), fontSize = 14.sp)
+                    }
+                    TextButton(onClick = { viewModel.resetPomodoro() }) {
+                        Text("🔄 重置", color = Color.Gray, fontSize = 14.sp)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val w = workInput.toIntOrNull() ?: 25
+                    val r = restInput.toIntOrNull() ?: 5
+                    viewModel.applyPomodoroSettings(w, r, mode)
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+            ) {
+                Text("✅ 应用", color = Color.White, fontSize = 14.sp)
+            }
+        },
+        containerColor = Color(0xFF16213E)
+    )
+}
 
 // ==================== Feature 11: 番茄钟休息全屏界面 ====================
 

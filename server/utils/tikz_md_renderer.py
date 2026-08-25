@@ -12,7 +12,23 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+def is_real_png(path: Path) -> bool:
+    """检查文件是否为真正的PNG（通过魔数判断）"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == b"\x89PNG\r\n\x1a\n"
+    except Exception:
+        return False
+
+
 def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelatex") -> bool:
+    """
+    将LaTeX/TikZ代码渲染为图片。
+
+    output_path 为预期的PNG路径；渲染成功后：
+    - 优先输出真正的PNG（output_path）
+    - 同时输出SVG（output_path.with_suffix('.svg')）供回退使用
+    """
     # MiKTeX兼容：如果engine是标准名但找不到，尝试miktex-前缀
     engine_exe = engine
     if not shutil.which(engine):
@@ -80,15 +96,76 @@ def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelat
         pdf_file = tmpdir / "diagram.pdf"
         if not pdf_file.exists():
             return False
-        
+
         svg_file = tmpdir / "diagram.svg"
-        if _pdf_to_svg(pdf_file, svg_file):
-            shutil.copy(svg_file, output_path)
-            print(f"  图形渲染成功: {output_path}")
+        svg_ok = _pdf_to_svg(pdf_file, svg_file)
+        if svg_ok:
+            shutil.copy(svg_file, output_path.with_suffix(".svg"))
+
+        # 优先转换为真正的PNG（客户端Glide可直接解码）
+        png_file = tmpdir / "diagram.png"
+        png_ok = _pdf_to_png(pdf_file, png_file)
+        if png_ok and png_file.exists():
+            shutil.copy(png_file, output_path)
+            print(f"  图形渲染成功(PNG): {output_path}")
             return True
-        
-        print(f"  警告: PDF已生成但无法转换为SVG")
+
+        if svg_ok:
+            print(f"  图形渲染成功(SVG): {output_path.with_suffix('.svg')} (PNG转换不可用)")
+            return True
+
+        print(f"  警告: PDF已生成但无法转换为SVG/PNG")
         return False
+
+
+def _pdf_to_png(pdf_path: Path, png_path: Path) -> bool:
+    """PDF转换为PNG（供Glide直接显示）"""
+    # 方法1: pdftocairo（MiKTeX自带，最可靠）
+    if shutil.which("pdftocairo"):
+        try:
+            output_prefix = str(png_path.with_suffix(""))
+            result = subprocess.run(
+                ["pdftocairo", "-png", "-singlefile", "-r", "150", str(pdf_path), output_prefix],
+                capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0 and is_real_png(png_path):
+                print(f"  pdftocairo 转PNG成功")
+                return True
+        except Exception as e:
+            print(f"  pdftocairo 转PNG异常: {e}")
+
+    # 方法2: Inkscape 直接导出PNG
+    inkscape_path = shutil.which("inkscape")
+    if inkscape_path:
+        try:
+            result = subprocess.run(
+                [inkscape_path, str(pdf_path), "--export-type=png", "--export-filename", str(png_path), "--export-dpi=150"],
+                capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0 and is_real_png(png_path):
+                print(f"  Inkscape 转PNG成功")
+                return True
+        except Exception as e:
+            print(f"  Inkscape 转PNG异常: {e}")
+
+    # 方法3: 从SVG转PNG（若SVG已生成）
+    svg_file = pdf_path.with_suffix(".svg")
+    if svg_file.exists() and inkscape_path:
+        try:
+            result = subprocess.run(
+                [inkscape_path, str(svg_file), "--export-type=png", "--export-filename", str(png_path), "--export-dpi=150"],
+                capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0 and is_real_png(png_path):
+                print(f"  Inkscape(SVG) 转PNG成功")
+                return True
+        except Exception as e:
+            print(f"  Inkscape(SVG) 转PNG异常: {e}")
+
+    return False
 
 def _pdf_to_svg(pdf_path: Path, svg_path: Path) -> bool:
     """PDF转换为SVG"""

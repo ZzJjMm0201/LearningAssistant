@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, Boolean, JSON, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from server.config import DATABASE_URL
@@ -14,6 +14,9 @@ class SubmissionRecord(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(64), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    # 所属用户（多用户隔离；NULL=旧数据，所有用户可见以兼容）
+    user_id = Column(Integer, nullable=True, index=True)
     
     # OCR结果
     ocr_text = Column(Text)
@@ -61,6 +64,9 @@ class TrackingRecord(Base):
     session_id = Column(String(64), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     
+    # 所属用户（多用户隔离）
+    user_id = Column(Integer, nullable=True, index=True)
+    
     # 专注度数据
     focus_state = Column(String(32))  # writing, thinking, page_turning, seeking_help
     duration_seconds = Column(Float)
@@ -90,15 +96,31 @@ class ConversationHistory(Base):
     session_id = Column(String(64), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     
+    # 所属用户（多用户隔离）
+    user_id = Column(Integer, nullable=True, index=True)
+    
     role = Column(String(16))  # user / assistant / system
     content = Column(Text)
     
     metadata_json = Column(JSON, nullable=True)
 
 def init_database():
-    """初始化数据库"""
+    """初始化数据库（含轻量迁移：为旧表补充新增列）"""
+    import sqlalchemy
     engine = create_engine(DATABASE_URL, echo=False)
     Base.metadata.create_all(engine)
+    # 轻量迁移：老版本数据库没有 user_id 列时自动补充
+    try:
+        with engine.connect() as conn:
+            inspector = sqlalchemy.inspect(engine)
+            for table in ("submission_records", "tracking_records", "conversation_history"):
+                cols = [c["name"] for c in inspector.get_columns(table)]
+                if "user_id" not in cols:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER"))
+                    conn.commit()
+                    print(f"[迁移] {table} 添加 user_id 列")
+    except Exception as e:
+        print(f"[迁移] 检查/添加 user_id 列失败（不影响启动）: {e}")
     return sessionmaker(bind=engine)
 
 

@@ -19,7 +19,7 @@ import java.io.ByteArrayOutputStream
 class SolveViewModel : ViewModel() {
     
     companion object {
-        private const val BASE_URL = "http://10.100.55.167:8000"
+        private const val BASE_URL = "http://10.100.55.231:8000"
     }
     
     private val apiService = ApiService()

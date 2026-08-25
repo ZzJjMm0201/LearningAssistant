@@ -95,18 +95,18 @@ class OCRService:
         if self._local_ready:
             futures[self._executor.submit(self._recognize_local, image_path)] = "local"
         
-            # 收集结果
-            try:
-                for future in as_completed(futures, timeout=120):
-                    source = futures[future]
-                    try:
-                        text, elapsed = future.result()
-                        results[source] = (text, elapsed)
-                        print(f"[OCR] {source} 完成，耗时{elapsed}s，文本长度={len(text)}")
-                    except Exception as e:
-                        print(f"[OCR] {source} 异常: {e}")
-            except TimeoutError:
-                print("[OCR] 部分识别通道超时，将使用已成功返回的结果继续处理")
+        # 收集结果（无论本地通道是否就绪，都要收集API通道的结果，否则会白白丢弃）
+        try:
+            for future in as_completed(futures, timeout=120):
+                source = futures[future]
+                try:
+                    text, elapsed = future.result()
+                    results[source] = (text, elapsed)
+                    print(f"[OCR] {source} 完成，耗时{elapsed}s，文本长度={len(text)}")
+                except Exception as e:
+                    print(f"[OCR] {source} 异常: {e}")
+        except TimeoutError:
+            print("[OCR] 部分识别通道超时，将使用已成功返回的结果继续处理")
         
         # 合并策略
         api_text = results.get("api", ("", 0))[0]

@@ -9,7 +9,7 @@ import os
 import hashlib
 from pathlib import Path
 from typing import List, Tuple
-from server.utils.tikz_md_renderer import render_latex_blocks
+from server.utils.tikz_md_renderer import render_latex_blocks, is_real_png
 
 def extract_latex_blocks(text: str) -> List[Tuple[str, str, int, int]]:
     """
@@ -54,11 +54,12 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
         svg_path = output_dir / f"diagram_{block_id}.svg"
         png_path = output_dir / f"diagram_{block_id}.png"
         
-        # 渲染LaTeX为SVG
+        # 渲染LaTeX为SVG + 真实PNG
         success = render_latex_blocks(code, png_path, engine="xelatex")
         
         if success:
-            if png_path.exists():
+            # 优先使用真正的PNG（客户端Glide可直接解码）
+            if is_real_png(png_path):
                 replacement = f"![图解]({png_path.name})"
             elif svg_path.exists():
                 replacement = f"![图解]({svg_path.name})"

@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -124,7 +124,7 @@ async def favicon():
     return Response(status_code=204)
 
 @app.post("/solve")
-async def solve_problem(file: UploadFile = File(...)):
+async def solve_problem(request: Request, file: UploadFile = File(...)):
     request_id = str(uuid.uuid4())
     
     image_path = HISTORY_DIR / f"{request_id}.jpg"
@@ -132,10 +132,12 @@ async def solve_problem(file: UploadFile = File(...)):
         content = await file.read()
         f.write(content)
     
-    # 用同一个 request_id 启动流程
+    # 用同一个 request_id 启动流程；传入请求Host用于构造LaTeX图片URL，user_id用于数据隔离
     solve_pipeline.start_solve(
         image_path=image_path,
-        session_id=request_id  # ← 传入相同ID
+        session_id=request_id,  # ← 传入相同ID
+        base_host=request.headers.get("host") or None,
+        user_id=get_current_user(request),
     )
     
     return {
@@ -146,17 +148,27 @@ async def solve_problem(file: UploadFile = File(...)):
 
 @app.get("/solve/stream/{request_id}")
 async def solve_stream(request_id: str):
-    """SSE流式推送解题结果"""
+    """SSE流式推送解题结果（异步轮询，不阻塞事件循环）"""
     
     async def event_stream():
-        # ===== 从真正的解题流程获取事件 =====
-        for event in solve_pipeline.get_events(request_id):
-            # 将事件转换为SSE格式
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            
-            # 如果事件中包含大量文本，让出控制权
-            if event.get("stage") in ("solution", "mindmap", "solution_chunk"):
-                await asyncio.sleep(0.01)
+        queue = solve_pipeline.get_queue(request_id)
+        if queue is None:
+            yield f"data: {json.dumps({'stage': 'error', 'content': '无效的request_id'}, ensure_ascii=False)}\n\n"
+            return
+        while True:
+            if queue:
+                event = queue.popleft()
+                # 将事件转换为SSE格式
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                
+                # 如果事件中包含大量文本，让出控制权
+                if event.get("stage") in ("solution", "mindmap", "solution_chunk"):
+                    await asyncio.sleep(0.01)
+                
+                if event.get("stage") == "complete":
+                    break
+            else:
+                await asyncio.sleep(0.05)
         
         # 发送完成事件
         yield "data: {\"stage\": \"complete\", \"content\": \"解题完成\"}\n\n"
@@ -194,12 +206,33 @@ async def get_svg(rest_of_path: str):
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
-    """多轮对话 - 继续提问"""
-    response = ai_service.continue_conversation(
-        request.context or [],
-        request.question
-    )
-    return {"answer": response, "session_id": request.session_id}
+    """多轮对话 - 继续提问（从数据库加载该会话的历史上下文）"""
+    db = SessionLocal()
+    try:
+        from server.database.models import ConversationHistory as CH
+        # 从数据库读取该会话的历史消息作为上下文
+        history = (
+            db.query(CH)
+            .filter(CH.session_id == request.session_id)
+            .order_by(CH.id.asc())
+            .all()
+        )
+        messages: list = [{"role": h.role, "content": h.content} for h in history]
+        if not messages:
+            # 无历史时用空上下文，避免AI无背景作答
+            messages = []
+
+        response = ai_service.continue_conversation(messages, request.question)
+
+        # 保存本次问答到数据库，保证后续追问上下文连续
+        for role, content in (("user", request.question), ("assistant", response)):
+            conv = CH(session_id=request.session_id, role=role, content=content)
+            db.add(conv)
+        db.commit()
+
+        return {"answer": response, "session_id": request.session_id}
+    finally:
+        db.close()
 
 @app.post("/animation")
 async def create_animation(file: UploadFile = File(...)):
@@ -237,12 +270,12 @@ async def get_animation(filename: str):
     return {"detail": "Not Found"}
 
 @app.post("/report/data")
-async def data_report(request: ReportRequest):
-    """生成数据版学情报告"""
+async def data_report(request: Request, body: ReportRequest):
+    """生成数据版学情报告（按用户隔离）"""
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
-        html_path = generator.generate_data_report_html(request.days)
+        html_path = generator.generate_data_report_html(body.days, user_id=get_current_user(request))
         
         if html_path:
             filename = Path(html_path).name
@@ -256,12 +289,12 @@ async def data_report(request: ReportRequest):
         db.close()
 
 @app.post("/report/ai")
-async def ai_report(request: ReportRequest):
-    """生成AI版学情报告"""
+async def ai_report(request: Request, body: ReportRequest):
+    """生成AI版学情报告（按用户隔离）"""
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
-        summary = generator.get_report_summary(request.days)
+        summary = generator.get_report_summary(body.days, user_id=get_current_user(request))
         
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
@@ -294,36 +327,48 @@ async def get_history_image(filename: str):
     return {"detail": "Not Found"}
 
 @app.post("/extend")
-async def knowledge_extension(file: UploadFile = File(...)):
+async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     """知识延伸"""
     request_id = str(uuid.uuid4())
     image_path = HISTORY_DIR / f"{request_id}.jpg"
     with open(image_path, "wb") as f:
         f.write(await file.read())
     
-    solve_pipeline.start_knowledge_extension(image_path, request_id)
+    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request))
     
     return {"request_id": request_id, "status": "processing"}
 
 @app.get("/extend/stream/{request_id}")
 async def extend_stream(request_id: str):
-    """SSE流式推送知识延伸结果"""
+    """SSE流式推送知识延伸结果（异步轮询，不阻塞事件循环）"""
     async def event_stream():
-        for event in solve_pipeline.get_events(request_id):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        queue = solve_pipeline.get_queue(request_id)
+        if queue is None:
+            yield f"data: {json.dumps({'stage': 'error', 'content': '无效的request_id'}, ensure_ascii=False)}\n\n"
+            return
+        while True:
+            if queue:
+                event = queue.popleft()
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event.get("stage") == "complete":
+                    break
+            else:
+                await asyncio.sleep(0.05)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.post("/history")
-async def get_history(request: dict):
-    """获取历史记录（返回完整内容，清除图片链接）"""
+async def get_history(request: Request, body: dict):
+    """获取历史记录（按用户隔离；返回完整内容，清除图片链接）"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
+        from sqlalchemy import or_
         from datetime import datetime
         import re
         
-        start_date = request.get("start_date", "")
-        end_date = request.get("end_date", "")
+        start_date = body.get("start_date", "")
+        end_date = body.get("end_date", "")
+        user_id = get_current_user(request)
         
         query = db.query(SubmissionRecord)
         
@@ -331,6 +376,14 @@ async def get_history(request: dict):
             query = query.filter(SubmissionRecord.timestamp >= datetime.fromisoformat(start_date))
         if end_date:
             query = query.filter(SubmissionRecord.timestamp <= datetime.fromisoformat(end_date))
+        
+        # 多用户隔离：登录用户看自己的+公共(NULL)；未登录只能看公共(NULL)
+        if user_id is not None:
+            query = query.filter(
+                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+            )
+        else:
+            query = query.filter(SubmissionRecord.user_id.is_(None))
         
         records = query.order_by(SubmissionRecord.timestamp.desc()).limit(50).all()
         
@@ -394,26 +447,37 @@ async def get_history(request: dict):
         db.close()
 
 @app.delete("/history")
-async def clear_history():
-    """清除所有历史记录"""
+async def clear_history(request: Request):
+    """清除历史记录（仅本人记录；未登录时仅清空无主数据）"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
-        db.query(SubmissionRecord).delete()
+        from sqlalchemy import or_
+        user_id = get_current_user(request)
+        if user_id is not None:
+            db.query(SubmissionRecord).filter(
+                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+            ).delete(synchronize_session=False)
+        else:
+            db.query(SubmissionRecord).filter(SubmissionRecord.user_id.is_(None)).delete(synchronize_session=False)
         db.commit()
         return {"status": "ok", "message": "历史记录已清除"}
     finally:
         db.close()
 
 @app.delete("/history/{record_id}")
-async def delete_history_record(record_id: int):
-    """删除单条历史记录"""
+async def delete_history_record(record_id: int, request: Request):
+    """删除单条历史记录（校验归属）"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
+        user_id = get_current_user(request)
         record = db.query(SubmissionRecord).filter(SubmissionRecord.id == record_id).first()
         if not record:
             raise HTTPException(status_code=404, detail="记录不存在")
+        # 未登录只能删公共(NULL)记录；登录用户只能删自己的记录
+        if record.user_id is not None and (user_id is None or record.user_id != user_id):
+            raise HTTPException(status_code=403, detail="无权删除他人的记录")
         db.delete(record)
         db.commit()
         return {"status": "ok", "message": f"记录 {record_id} 已删除"}
@@ -421,28 +485,39 @@ async def delete_history_record(record_id: int):
         db.close()
 
 @app.post("/history/batch-delete")
-async def batch_delete_history(request: dict):
-    """批量删除历史记录"""
+async def batch_delete_history(request: Request, body: dict):
+    """批量删除历史记录（校验归属）"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
-        ids = request.get("ids", [])
+        from sqlalchemy import or_
+        ids = body.get("ids", [])
         if not ids:
             return {"status": "error", "message": "未指定要删除的记录ID"}
-        deleted = db.query(SubmissionRecord).filter(SubmissionRecord.id.in_(ids)).delete(synchronize_session=False)
+        user_id = get_current_user(request)
+        query = db.query(SubmissionRecord).filter(SubmissionRecord.id.in_(ids))
+        if user_id is not None:
+            query = query.filter(
+                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+            )
+        else:
+            query = query.filter(SubmissionRecord.user_id.is_(None))
+        deleted = query.delete(synchronize_session=False)
         db.commit()
         return {"status": "ok", "message": f"已删除 {deleted} 条记录", "deleted_count": deleted}
     finally:
         db.close()
 
 @app.post("/tracking/sync")
-async def sync_tracking_data(data: list[TrackingData]):
-    """同步跟踪学习数据"""
+async def sync_tracking_data(request: Request, data: list[TrackingData]):
+    """同步跟踪学习数据（记录所属用户）"""
     db = SessionLocal()
     try:
+        user_id = get_current_user(request)
         for item in data:
             record = TrackingRecord(
                 session_id=item.session_id,
+                user_id=user_id,
                 focus_state=item.focus_state,
                 duration_seconds=item.duration_seconds,
                 page_number=item.page_number,
@@ -508,6 +583,22 @@ async def health_check():
         "features": FEATURE_FLAGS,
     }
 
+
+# ==================== 用户认证辅助 ====================
+
+def get_current_user(request: Request) -> Optional[int]:
+    """从 Authorization: Bearer <token> 解析当前用户ID；未登录返回 None"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            uid = verify_token(token)
+            if uid is not None:
+                return uid
+        except Exception:
+            return None
+    return None
+
 # ==================== Feature 4: 掌握程度 ====================
 
 class MasteryRequest(BaseModel):
@@ -515,18 +606,19 @@ class MasteryRequest(BaseModel):
     mastery_level: str
 
 @app.post("/mastery")
-async def save_mastery(request: MasteryRequest):
-    """保存掌握程度记录"""
+async def save_mastery(request: Request, body: MasteryRequest):
+    """保存掌握程度记录（记录所属用户）"""
     mastery_dir = HISTORY_DIR / "mastery_records"
     mastery_dir.mkdir(exist_ok=True)
     
     record = {
-        "request_id": request.request_id,
-        "mastery_level": request.mastery_level,
-        "timestamp": datetime.now().isoformat()
+        "request_id": body.request_id,
+        "mastery_level": body.mastery_level,
+        "timestamp": datetime.now().isoformat(),
+        "user_id": get_current_user(request),
     }
     
-    file_path = mastery_dir / f"{request.request_id}.json"
+    file_path = mastery_dir / f"{body.request_id}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
     
@@ -643,7 +735,54 @@ if __name__ == "__main__":
     
     discovery = DiscoveryService(server_host=local_ip, api_port=8000)
     discovery.start()
-    
+
+    # ===== 诊断: 记录收到的终止信号，帮助定位服务被意外关闭的原因 =====
+    import signal as _signal_mod
+    import sys as _sys_mod
+    import time as _time_mod
+    from uvicorn.server import Server as _UvicornServer
+
+    _server_start_ts = _time_mod.time()
+    _SIGINT_GRACE_SECONDS = 30.0  # 启动保护窗口：此时间内首次SIGINT仅记录不退出
+    _sigint_state = {"count": 0}
+    _orig_handle_exit = _UvicornServer.handle_exit
+
+    def _dump_console_processes():
+        """枚举与本进程共享同一控制台的进程PID（Windows上Ctrl+C会发给其中所有进程）"""
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            buf = (ctypes.c_uint * 64)()
+            n = k32.GetConsoleProcessList(buf, 64)
+            pids = list(buf[:n])
+            print(f"[诊断] 共享控制台的进程PID: {pids}（本进程={os.getpid()}）")
+            print("[诊断] 若列表中存在本进程之外的进程（如助手/代理工具），它可能正是Ctrl+C的来源")
+        except Exception as e:
+            print(f"[诊断] 无法枚举控制台进程: {e}")
+
+    def _diagnose_handle_exit(self, sig, frame):
+        try:
+            sig_name = _signal_mod.Signals(sig).name
+        except ValueError:
+            sig_name = str(sig)
+        elapsed = _time_mod.time() - _server_start_ts
+        now_str = datetime.now().strftime('%H:%M:%S')
+        # 启动保护：30秒内的首次SIGINT仅记录并忽略，防止工具/终端误发Ctrl+C杀掉服务
+        if sig == _signal_mod.SIGINT and elapsed < _SIGINT_GRACE_SECONDS:
+            _sigint_state["count"] += 1
+            if _sigint_state["count"] == 1:
+                print(f"\n[诊断] {now_str} 启动仅{elapsed:.0f}秒即收到 SIGINT (Ctrl+C)，已忽略以保持服务运行。"
+                      f"若确实要停止服务，请再次按 Ctrl+C。")
+                _dump_console_processes()
+                return
+        print(f"\n[诊断] {now_str} 收到终止信号: {sig_name} ({sig})，"
+              f"距启动约{elapsed:.0f}秒，stdin_isatty={_sys_mod.stdin.isatty()}，服务即将关闭。"
+              f"若未手动按 Ctrl+C，请检查是否有其他程序/终端操作发送了该信号。")
+        _dump_console_processes()
+        return _orig_handle_exit(self, sig, frame)
+
+    _UvicornServer.handle_exit = _diagnose_handle_exit
+
     try:
         uvicorn.run(app, host="0.0.0.0", port=8000)
     finally:

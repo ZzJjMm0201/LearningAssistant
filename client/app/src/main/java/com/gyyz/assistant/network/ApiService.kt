@@ -11,7 +11,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
+class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
     companion object {
         private const val PREFS_NAME = "learning_assistant_prefs"
@@ -76,14 +76,11 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
     }
 
     /**
-     * 构建带Authorization header的请求
+     * 为任意请求追加认证头（统一入口）
      */
-    private fun buildAuthenticatedRequest(url: String): Request.Builder {
-        val builder = Request.Builder().url(url)
-        authToken?.let { token ->
-            builder.addHeader("Authorization", "Bearer $token")
-        }
-        return builder
+    private fun Request.Builder.withAuth(): Request.Builder {
+        authToken?.let { addHeader("Authorization", "Bearer $it") }
+        return this
     }
 
     private val client = OkHttpClient.Builder()
@@ -103,6 +100,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/solve")
                 .post(requestBody)
+                .withAuth()
                 .build()
 
             val response = client.newCall(request).execute()
@@ -112,6 +110,26 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
         }
     }
     
+    /**
+     * 确认OCR结果，让解题流水线立即继续（不确认则服务端等30秒超时）
+     */
+    suspend fun confirmSolve(requestId: String) {
+        return withContext(Dispatchers.IO) {
+            try {
+                val body = "{}".toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("$BASE_URL/solve/confirm/$requestId")
+                    .post(body)
+                    .withAuth()
+                    .build()
+                client.newCall(request).execute().close()
+            } catch (e: Exception) {
+                // 确认失败不阻塞主流程（服务端超时后也会自动继续）
+                android.util.Log.w("ApiService", "confirmSolve失败: ${e.message}")
+            }
+        }
+    }
+
     /**
      * 多轮对话提问
      */
@@ -127,6 +145,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/ask")
                 .post(requestBody)
+                .withAuth()
                 .build()
 
             val response = client.newCall(request).execute()
@@ -151,6 +170,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/animation")
                 .post(requestBody)
+                .withAuth()
                 .build()
 
             val response = client.newCall(request).execute()
@@ -168,7 +188,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply { put("days", days) }
             val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url("$BASE_URL/report/data").post(body).build()
+            val request = Request.Builder().url("$BASE_URL/report/data").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
             ReportResponse(
@@ -184,7 +204,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply { put("days", days) }
             val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url("$BASE_URL/report/ai").post(body).build()
+            val request = Request.Builder().url("$BASE_URL/report/ai").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
             ReportResponse(
@@ -207,6 +227,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/extend")
                 .post(requestBody)
+                .withAuth()
                 .build()
 
             val response = client.newCall(request).execute()
@@ -221,6 +242,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/history")
                 .delete()
+                .withAuth()
                 .build()
 
             val response = client.newCall(request).execute()
@@ -235,6 +257,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/history/$recordId")
                 .delete()
+                .withAuth()
                 .build()
             val response = client.newCall(request).execute()
             if (!response.isSuccessful) {
@@ -249,7 +272,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
                 put("ids", JSONArray(ids))
             }
             val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url("$BASE_URL/history/batch-delete").post(body).build()
+            val request = Request.Builder().url("$BASE_URL/history/batch-delete").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
             if (!response.isSuccessful) {
@@ -266,7 +289,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
                 put("end_date", endDate)
             }
             val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url("$BASE_URL/history").post(body).build()
+            val request = Request.Builder().url("$BASE_URL/history").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
             val arr = respJson.optJSONArray("records") ?: return@withContext emptyList()
@@ -436,6 +459,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.167:8000") {
             val request = Request.Builder()
                 .url("$BASE_URL/mastery")
                 .post(requestBody)
+                .withAuth()
                 .build()
             client.newCall(request).execute()
         }
