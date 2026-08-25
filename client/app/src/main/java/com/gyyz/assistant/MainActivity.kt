@@ -2302,7 +2302,7 @@ fun KnowledgeScreen(
             }
 
             if (state.mistakes.isNotEmpty() && showModules.getOrDefault("mistakes", true)) {
-                SolutionCard("Mistakes", state.mistakes, Color(0xFFFF5722))
+                SolutionCard("📝 易错点总结", state.mistakes, Color(0xFFFF5722))
             }
 
             if (state.extension.isNotEmpty() && showModules.getOrDefault("extension", true)) {
