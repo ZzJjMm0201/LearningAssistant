@@ -57,7 +57,8 @@ class AIService:
     要求：
     1. 分步骤说明，每步简洁明了
     2. 指出解题的关键突破口
-    3. 200字左右即可"""
+    3. 200字左右即可
+    4. 直接输出纯文本！禁止使用JSON格式、代码块或其他任何结构化标记，不要模仿上一轮的JSON输出"""
         
         messages.append({"role": "assistant", "content": info_response})
         messages.append({"role": "user", "content": steps_prompt})

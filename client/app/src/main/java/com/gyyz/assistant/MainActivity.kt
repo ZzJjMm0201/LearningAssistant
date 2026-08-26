@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -86,15 +87,19 @@ sealed class AppState {
             val stage: SolveStage = SolveStage.UPLOADING,
             val requestId: String = "",
             val questionInfo: String = "",
+            val subject: String = "",
             val solutionSteps: String = "",
             val fullSolution: String = "",
             val mindMap: String = "",
             val suggestedQuestions: List<String> = emptyList(),
             val suggestedQA: List<QAItem> = emptyList(),
             val qaList: List<QAItem> = emptyList(),
+            val stepsStreaming: Boolean = false,
+            val solutionStreaming: Boolean = false,
+            val mindmapStreaming: Boolean = false,
     ) : AppState()
 
-    data class Report(val reportText: String = "", val isLoading: Boolean = true) : AppState()
+    data class Report(val reportText: String = "", val isLoading: Boolean = true, val streaming: Boolean = false) : AppState()
 
     object History : AppState()
 
@@ -104,7 +109,9 @@ sealed class AppState {
             val summary: String = "",
             val mistakes: String = "",
             val extension: String = "",
-            val suggestedQuestions: List<String> = emptyList()
+            val suggestedQuestions: List<String> = emptyList(),
+            val mistakesStreaming: Boolean = false,
+            val extensionStreaming: Boolean = false
     ) : AppState()
 }
 
@@ -180,6 +187,11 @@ class MainViewModel : ViewModel() {
     val showMasteryDialog = MutableStateFlow(false)
     // 掌握程度按钮可见性（解答完成后显示在模块下方，不再自动弹窗）
     val masteryVisible = MutableStateFlow(false)
+    val masterySaved = MutableStateFlow(false)
+    val masteryLevel = MutableStateFlow("")
+    // GeoGebra：生成该题的交互式数学图形
+    val geoGebraUrl = MutableStateFlow("")
+    private var lastPhotoFile: java.io.File? = null
     val currentSolvingRequestId = MutableStateFlow("")
 
     // Feature 9/10: OCR/手势确认弹窗
@@ -505,6 +517,9 @@ class MainViewModel : ViewModel() {
         Log.d("MainViewModel", "照片就绪，开始上传: ${photoFile.absolutePath}")
         cancelCurrentSSE = false  // Feature 5: 重置取消标志
         masteryVisible.value = false  // 新一次解题开始时隐藏掌握程度按钮
+        masterySaved.value = false
+        masteryLevel.value = ""
+        lastPhotoFile = photoFile
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -575,6 +590,7 @@ class MainViewModel : ViewModel() {
             var suggestedQuestions = emptyList<String>()
             var suggestedQA = emptyList<QAItem>()
             var qaList = emptyList<QAItem>()
+            var subject = ""
             var ocrText = ""
             // 流式显示节流：每100ms最多刷新一次UI，避免AR眼镜低性能CPU卡顿
             var lastSolutionUpdate = 0L
@@ -626,7 +642,11 @@ class MainViewModel : ViewModel() {
                                         ocrConfirmTitle.value = "确认识别结果"
                                     }
                                     "search_complete" -> _statusText.value = "AI正在分析..."
-                                    "question_info" -> _statusText.value = "正在生成解题思路..."
+                                    "question_info" -> {
+                                        _statusText.value = "正在生成解题思路..."
+                                        // 记录学科，用于GeoGebra入口（仅数学题可用）
+                                        subject = json.optJSONObject("content")?.optString("subject", "") ?: ""
+                                    }
                                     "solution_steps_chunk" -> {
                                         // 流式增量：解题思路打字机效果
                                         val chunk = json.optString("content", "")
@@ -634,18 +654,19 @@ class MainViewModel : ViewModel() {
                                             val now = System.currentTimeMillis()
                                             if (now - lastStepsUpdate >= 100) {
                                                 lastStepsUpdate = now
-                                                solutionSteps = chunk
+                                                solutionSteps = extractStepsText(chunk)
                                                 _appState.value =
                                                         AppState.Solving(
                                                                 stage = SolveStage.DISPLAY_STEPS,
                                                                 requestId = requestId,
-                                                                solutionSteps = chunk
+                                                                solutionSteps = solutionSteps,
+                                                                stepsStreaming = true
                                                         )
                                             }
                                         }
                                     }
                                     "solution_steps" -> {
-                                        solutionSteps = json.optString("content", "")
+                                        solutionSteps = extractStepsText(json.optString("content", ""))
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_STEPS,
@@ -667,7 +688,8 @@ class MainViewModel : ViewModel() {
                                                                 stage = SolveStage.DISPLAY_FULL,
                                                                 requestId = requestId,
                                                                 solutionSteps = solutionSteps,
-                                                                fullSolution = chunk
+                                                                fullSolution = fullSolution,
+                                                                solutionStreaming = true
                                                         )
                                             }
                                         }
@@ -696,7 +718,8 @@ class MainViewModel : ViewModel() {
                                                                 requestId = requestId,
                                                                 solutionSteps = solutionSteps,
                                                                 fullSolution = fullSolution,
-                                                                mindMap = mindMap
+                                                                mindMap = mindMap,
+                                                                mindmapStreaming = true
                                                         )
                                             }
                                         }
@@ -743,7 +766,8 @@ class MainViewModel : ViewModel() {
                                                         mindMap = mindMap,
                                                         suggestedQuestions = suggestedQuestions,
                                                         suggestedQA = suggestedQA,
-                                                        qaList = qaList
+                                                        qaList = qaList,
+                                                        subject = subject
                                                 )
                                     }
                                     "complete" -> {
@@ -756,7 +780,8 @@ class MainViewModel : ViewModel() {
                                                         mindMap = mindMap,
                                                         suggestedQuestions = suggestedQuestions,
                                                         suggestedQA = suggestedQA,
-                                                        qaList = qaList
+                                                        qaList = qaList,
+                                                        subject = subject
                                                 )
                                         _statusText.value = "解答完成"
                                         // 掌握程度改为模块下方按钮（不再弹窗）
@@ -794,14 +819,9 @@ class MainViewModel : ViewModel() {
                         )
 
                 withContext(Dispatchers.Main) {
-                    val updatedSolution =
-                            currentState.fullSolution + "\n\n---\n\n**Q: $question**\n\n$answer"
-
+                    // 问答追加到对话记录（气泡展示），不再混入完整解析
                     _appState.value =
                             currentState.copy(
-                                    fullSolution = updatedSolution,
-                                    suggestedQuestions = emptyList(),
-                                    suggestedQA = emptyList(),
                                     qaList = currentState.qaList + QAItem(question, answer)
                             )
                     _statusText.value = "已回答"
@@ -812,6 +832,48 @@ class MainViewModel : ViewModel() {
                     _statusText.value = "提问失败: ${e.message}"
                     isAskingQuestion.value = false
                 }
+            }
+        }
+    }
+
+    fun saveMastery(level: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                apiService.saveMastery(currentSolvingRequestId.value, level)
+                withContext(Dispatchers.Main) {
+                    masteryLevel.value = when (level) {
+                        "completely_mastered" -> "完全掌握"
+                        "partially_mastered" -> "部分掌握"
+                        else -> "完全没掌握"
+                    }
+                    masterySaved.value = true
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusText.value = "保存掌握程度失败: ${e.message}" }
+            }
+        }
+    }
+
+    fun generateGeoGebra() {
+        val photo = lastPhotoFile
+        if (photo == null) {
+            _statusText.value = "没有可用的题目图片"
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { _statusText.value = "正在生成数学图形..." }
+                val resp = apiService.requestAnimation(photo.readBytes())
+                withContext(Dispatchers.Main) {
+                    if (resp.status == "ok") {
+                        geoGebraUrl.value = "${apiService.getBaseUrl()}${resp.url}"
+                        showGeoGebraScreen.value = true
+                    } else {
+                        _statusText.value = "图形生成失败: ${resp.message}"
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusText.value = "图形生成失败: ${e.message}" }
             }
         }
     }
@@ -857,16 +919,23 @@ class MainViewModel : ViewModel() {
                     _statusText.value = "正在生成AI学情报告..."
                 }
 
-                // SSE流式接收，打字机效果
+                // SSE流式接收，打字机效果（150ms节流；流式期间只显示纯文本，完成后Markdown渲染）
                 val sb = StringBuilder()
+                var lastReportUpdate = 0L
                 apiService.getAiReportStream(reportDaysVal) { chunk ->
                     sb.append(chunk)
-                    withContext(Dispatchers.Main) {
-                        _appState.value = AppState.Report(reportText = sb.toString(), isLoading = false)
+                    val now = System.currentTimeMillis()
+                    if (now - lastReportUpdate >= 150) {
+                        lastReportUpdate = now
+                        val text = sb.toString()
+                        withContext(Dispatchers.Main) {
+                            _appState.value = AppState.Report(reportText = text, isLoading = false, streaming = true)
+                        }
                     }
                 }
 
                 withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Report(reportText = sb.toString(), isLoading = false, streaming = false)
                     _statusText.value = "AI报告已生成"
                 }
             } catch (e: Exception) {
@@ -999,7 +1068,8 @@ class MainViewModel : ViewModel() {
                                             _appState.value =
                                                     AppState.Knowledge(
                                                             summary = summary,
-                                                            mistakes = chunk
+                                                            mistakes = mistakes,
+                                                            mistakesStreaming = true
                                                     )
                                             _statusText.value = "正在生成易错点详解..."
                                         }
@@ -1026,7 +1096,8 @@ class MainViewModel : ViewModel() {
                                                     AppState.Knowledge(
                                                             summary = summary,
                                                             mistakes = mistakes,
-                                                            extension = chunk
+                                                            extension = extension,
+                                                            extensionStreaming = true
                                                     )
                                             _statusText.value = "正在生成知识拓展..."
                                         }
@@ -1550,7 +1621,6 @@ fun MainScreen(
     val showWelcome by viewModel.showWelcomeDialog.collectAsState()
     val showSettings by viewModel.showSettingsDialog.collectAsState()
     val showHistory by viewModel.showHistoryScreen.collectAsState()
-    val showMastery by viewModel.showMasteryDialog.collectAsState()
     val showOcr by viewModel.showOcrConfirmDialog.collectAsState()
     val ocrConfirmTitle by viewModel.ocrConfirmTitle.collectAsState()
     val ocrConfirmText by viewModel.ocrConfirmText.collectAsState()
@@ -1642,6 +1712,7 @@ fun MainScreen(
                             showModules = showModules,
                             onAskQuestion = { viewModel.askQuestion(it) },
                             onBack = { viewModel.backToTracking() },
+                            viewModel = viewModel,
                     )
         }
 
@@ -1671,23 +1742,6 @@ fun MainScreen(
             )
         }
 
-        // Feature 4: 掌握程度弹窗
-        if (showMastery) {
-            MasteryDialog(
-                onSelect = { level ->
-                    viewModel.showMasteryDialog.value = false
-                    viewModel.viewModelScope.launch(Dispatchers.IO) {
-                        try {
-                            val api = ApiService()
-                            api.saveMastery(viewModel.currentSolvingRequestId.value, level)
-                        } catch (e: Exception) {
-                            Log.e("MainViewModel", "保存掌握程度失败: ${e.message}")
-                        }
-                    }
-                }
-            )
-        }
-
         // Feature 9: OCR确认弹窗（确认后回传服务端，立即继续解题流程）
         if (showOcr) {
             CountdownConfirmDialog(
@@ -1705,9 +1759,10 @@ fun MainScreen(
             )
         }
 
-        // Feature 20: GeoGebra图形页面
+        // Feature 20: GeoGebra图形页面（生成该题的交互式数学图形）
         if (showGeoGebra) {
             GeoGebraScreen(
+                url = viewModel.geoGebraUrl.value,
                 onBack = { viewModel.showGeoGebraScreen.value = false }
             )
         }
@@ -2144,6 +2199,7 @@ fun SolvingScreen(
 ) {
     Box(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
         val solvingFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
+        var questionInput by remember { mutableStateOf("") }
         Column(
                 modifier =
                         Modifier.fillMaxSize()
@@ -2190,174 +2246,241 @@ fun SolvingScreen(
                 }
             }
 
-            if (solveState.solutionSteps.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
+            if (solveState.solutionSteps.isNotEmpty()) {
                 SolutionCard(
                         title = "💡 解题思路",
                         content = solveState.solutionSteps,
                         color = Color(0xFF00D2FF),
-                        fontSize = solvingFontSize
+                        fontSize = solvingFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("solution_steps", true),
+                        streaming = solveState.stepsStreaming
                 )
             }
 
-            if (solveState.fullSolution.isNotEmpty() && showModules.getOrDefault("full_solution", true)) {
+            if (solveState.fullSolution.isNotEmpty()) {
                 SolutionCard(
                         title = "📝 完整解析",
                         content = solveState.fullSolution,
                         color = Color(0xFF7B2FBE),
-                        fontSize = solvingFontSize
+                        fontSize = solvingFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("full_solution", true),
+                        streaming = solveState.solutionStreaming
                 )
             }
 
-            if (solveState.mindMap.isNotEmpty() && showModules.getOrDefault("mind_map", true)) {
+            if (solveState.mindMap.isNotEmpty()) {
                 SolutionCard(
                         title = "🗺️ 思维导图",
                         content = solveState.mindMap,
                         color = Color(0xFF00C853),
-                        fontSize = solvingFontSize
+                        fontSize = solvingFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("mind_map", true),
+                        streaming = solveState.mindmapStreaming
                 )
             }
 
-            if ((solveState.suggestedQA.isNotEmpty() || solveState.suggestedQuestions.isNotEmpty()) && showModules.getOrDefault("suggested_questions", true)) {
+            // 互动问答区：预测问题 + 对话记录 + 输入框（解题进入互动阶段后显示）
+            if ((solveState.stage == SolveStage.INTERACTIVE || solveState.stage == SolveStage.COMPLETED) && showModules.getOrDefault("suggested_questions", true)) {
+                if (solveState.suggestedQA.isNotEmpty() || solveState.suggestedQuestions.isNotEmpty()) {
+                    Text(
+                            text = "💬 您可能还想问：",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                    )
+
+                    if (solveState.suggestedQA.isNotEmpty()) {
+                        // 新版：AI预测问题自带答案，点击展开/收起
+                        solveState.suggestedQA.forEach { item ->
+                            var expanded by remember(item.question) { mutableStateOf(false) }
+                            Card(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF2D2D44))
+                            ) {
+                                Column(
+                                        modifier =
+                                                Modifier.fillMaxWidth()
+                                                        .clickable { expanded = !expanded }
+                                                        .padding(12.dp)
+                                ) {
+                                    Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                                item.question,
+                                                color = Color.White,
+                                                fontSize = 14.sp,
+                                                modifier = Modifier.weight(1f)
+                                        )
+                                        Text(
+                                                if (expanded) "▲" else "▼",
+                                                color = Color(0xFF00D2FF),
+                                                fontSize = 12.sp
+                                        )
+                                    }
+                                    if (expanded && item.answer.isNotEmpty()) {
+                                        Text(
+                                                text = "📝 ${item.answer}",
+                                                color = Color(0xFFB0BEC5),
+                                                fontSize = 14.sp,
+                                                modifier = Modifier.padding(top = 8.dp)
+                                        )
+                                        TextButton(
+                                                onClick = { onAskQuestion(item.question) },
+                                                enabled = !isAskingQuestion
+                                        ) {
+                                            Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        solveState.suggestedQuestions.forEach { question ->
+                            Button(
+                                    onClick = { onAskQuestion(question) },
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
+                                    enabled = !isAskingQuestion
+                            ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                        }
+                    }
+                }
+
+                // 与AI的对话记录（你问 → AI答，气泡样式）
+                if (solveState.qaList.isNotEmpty()) {
+                    Text(
+                            text = "💬 对话记录：",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 12.dp, bottom = 6.dp)
+                    )
+                    solveState.qaList.forEach { item ->
+                        // 用户问题（右对齐蓝色气泡）
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            Surface(
+                                    color = Color(0xFF1565C0),
+                                    shape = RoundedCornerShape(12.dp, 12.dp, 4.dp, 12.dp),
+                                    modifier = Modifier.fillMaxWidth(0.85f).padding(vertical = 4.dp)
+                            ) {
+                                Text(
+                                        item.question,
+                                        color = Color.White,
+                                        fontSize = 14.sp,
+                                        modifier = Modifier.padding(10.dp)
+                                )
+                            }
+                        }
+                        // AI回答（左对齐灰色气泡）
+                        if (item.answer.isNotEmpty()) {
+                            Row(modifier = Modifier.fillMaxWidth()) {
+                                Surface(
+                                        color = Color(0xFF2D2D44),
+                                        shape = RoundedCornerShape(12.dp, 12.dp, 12.dp, 4.dp),
+                                        modifier = Modifier.fillMaxWidth(0.92f).padding(vertical = 4.dp)
+                                ) {
+                                    Text(
+                                            item.answer,
+                                            color = Color(0xFFE0E0E0),
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 输入框：与AI基于本题继续对话（替代原来的固定快捷按钮）
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                            value = questionInput,
+                            onValueChange = { questionInput = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("输入你的问题，与AI继续对话...", color = Color.Gray, fontSize = 13.sp) },
+                            textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFF00D2FF),
+                                    unfocusedBorderColor = Color(0xFF2D2D44),
+                                    cursorColor = Color(0xFF00D2FF)
+                            ),
+                            singleLine = true,
+                            enabled = !isAskingQuestion
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                            onClick = {
+                                val q = questionInput.trim()
+                                if (q.isNotEmpty() && !isAskingQuestion) {
+                                    questionInput = ""
+                                    onAskQuestion(q)
+                                }
+                            },
+                            enabled = !isAskingQuestion,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                    ) { Text("发送", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                }
+
+                // Feature 20: GeoGebra（仅数学题可用；点击生成该题的交互式数学图形）
+                val isMath = solveState.subject.contains("数学") || solveState.subject.contains("几何") ||
+                        solveState.subject.contains("代数") || solveState.subject.contains("函数")
+                if (isMath) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                            onClick = { viewModel?.generateGeoGebra() },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
+                            enabled = !isAskingQuestion
+                    ) { Text("📐 查看GeoGebra图形", color = Color.White, fontSize = 14.sp) }
+                }
+            }
+
+            // 掌握程度：解答完成后显示标题 + 三个选项横向排布（不再弹窗）
+            val showMasteryBtn by (viewModel?.masteryVisible ?: MutableStateFlow(false)).collectAsState()
+            if (showMasteryBtn && solveState.stage == SolveStage.COMPLETED) {
                 Text(
-                        text = "💬 您可能还想问：",
+                        text = "📊 掌握程度",
                         color = Color.White,
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
-
-                if (solveState.suggestedQA.isNotEmpty()) {
-                    // 新版：AI预测问题自带答案，点击展开/收起
-                    solveState.suggestedQA.forEach { item ->
-                        var expanded by remember(item.question) { mutableStateOf(false) }
-                        Card(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF2D2D44))
-                        ) {
-                            Column(
-                                    modifier =
-                                            Modifier.fillMaxWidth()
-                                                    .clickable { expanded = !expanded }
-                                                    .padding(12.dp)
-                            ) {
-                                Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                            item.question,
-                                            color = Color.White,
-                                            fontSize = 14.sp,
-                                            modifier = Modifier.weight(1f)
-                                    )
-                                    Text(
-                                            if (expanded) "▲" else "▼",
-                                            color = Color(0xFF00D2FF),
-                                            fontSize = 12.sp
-                                    )
-                                }
-                                if (expanded && item.answer.isNotEmpty()) {
-                                    Text(
-                                            text = "📝 ${item.answer}",
-                                            color = Color(0xFFB0BEC5),
-                                            fontSize = 14.sp,
-                                            modifier = Modifier.padding(top = 8.dp)
-                                    )
-                                    TextButton(
-                                            onClick = { onAskQuestion(item.question) },
-                                            enabled = !isAskingQuestion
-                                    ) {
-                                        Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    solveState.suggestedQuestions.forEach { question ->
-                        Button(
-                                onClick = { onAskQuestion(question) },
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
-                                enabled = !isAskingQuestion
-                        ) { Text(question, color = Color.White, fontSize = 14.sp) }
-                    }
-                }
-
-                // 追问记录（用户追问过的问答对）
-                if (solveState.qaList.isNotEmpty()) {
+                if (viewModel?.masterySaved?.value == true) {
                     Text(
-                            text = "📌 追问记录：",
-                            color = Color.White.copy(alpha = 0.7f),
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                            text = "✅ 已记录：${viewModel?.masteryLevel?.value ?: ""}",
+                            color = Color(0xFF4CAF50),
+                            fontSize = 14.sp
                     )
-                    solveState.qaList.forEach { item ->
-                        Card(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3A4B))
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Text(
-                                        text = "Q: ${item.question}",
-                                        color = Color.White,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.Bold
-                                )
-                                if (item.answer.isNotEmpty()) {
-                                    Text(
-                                            text = "A: ${item.answer}",
-                                            color = Color(0xFFB0BEC5),
-                                            fontSize = 13.sp,
-                                            modifier = Modifier.padding(top = 6.dp)
-                                    )
-                                }
-                            }
-                        }
+                } else {
+                    Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                                onClick = { viewModel?.saveMastery("completely_mastered") },
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                        ) { Text("✅ 完全掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                        Button(
+                                onClick = { viewModel?.saveMastery("partially_mastered") },
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
+                        ) { Text("⚠️ 部分掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                        Button(
+                                onClick = { viewModel?.saveMastery("not_mastered") },
+                                modifier = Modifier.weight(1f).height(44.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                        ) { Text("❌ 完全没掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
                     }
                 }
-
-                // Feature 2: 两个固定按钮指令
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                        text = "📌 固定指令：",
-                        color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 4.dp)
-                )
-                Button(
-                        onClick = { onAskQuestion("有没有更加简单或便捷的方法？") },
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
-                        enabled = !isAskingQuestion
-                ) { Text("🟢 有没有更加简单或便捷的方法？", color = Color.White, fontSize = 14.sp) }
-                Button(
-                        onClick = { onAskQuestion("请添加更多图形以辅助理解") },
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0D47A1)),
-                        enabled = !isAskingQuestion
-                ) { Text("🔵 请添加更多图形以辅助理解", color = Color.White, fontSize = 14.sp) }
-
-                // Feature 20: GeoGebra按钮
-                Button(
-                        onClick = { viewModel?.showGeoGebraScreen?.value = true },
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
-                        enabled = !isAskingQuestion
-                ) { Text("📐 查看GeoGebra图形", color = Color.White, fontSize = 14.sp) }
-            }
-
-            // 掌握程度按钮：解答完成后显示在模块下方，点击弹出掌握程度选择（不再自动弹窗）
-            val showMasteryBtn by (viewModel?.masteryVisible ?: MutableStateFlow(false)).collectAsState()
-            if (showMasteryBtn && solveState.stage == SolveStage.COMPLETED) {
-                Button(
-                        onClick = { viewModel?.showMasteryDialog?.value = true },
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C))
-                ) { Text("📊 掌握程度", color = Color.White, fontSize = 15.sp) }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -2371,20 +2494,51 @@ fun SolvingScreen(
 }
 
 @Composable
-fun SolutionCard(title: String, content: String, color: Color, fontSize: Float = 18f) {
+fun SolutionCard(
+    title: String,
+    content: String,
+    color: Color,
+    fontSize: Float = 18f,
+    initiallyCollapsed: Boolean = false,
+    streaming: Boolean = false,
+) {
+    var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
     Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
             colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E))
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                    text = title,
-                    color = color,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
+            Row(
+                    modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                        text = title,
+                        color = color,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                )
+                Text(
+                        text = if (expanded) "▲" else "▼",
+                        color = color.copy(alpha = 0.7f),
+                        fontSize = 14.sp
+                )
+            }
+            if (expanded) {
+                Spacer(modifier = Modifier.height(8.dp))
+                if (streaming) {
+                    // 流式输出中：先显示纯文本（打字机效果），全部完成后再做Markdown渲染，避免卡顿
+                    Text(
+                            text = content,
+                            color = Color.White,
+                            fontSize = fontSize.sp,
+                            lineHeight = (fontSize * 1.4f).sp
+                    )
+                } else {
+                    MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
+                }
+            }
         }
     }
 }
@@ -2454,7 +2608,21 @@ fun ReportScreen(
                     modifier = Modifier.fillMaxSize()
             )
         } else if (reportText.isNotEmpty()) {
-            MarkdownView(content = reportText, modifier = Modifier.fillMaxSize().padding(16.dp))
+            if (report.streaming) {
+                // 流式期间只显示纯文本（打字机效果），完成后才做Markdown渲染，避免卡顿
+                Column(
+                        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
+                ) {
+                    Text(
+                            text = reportText,
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            lineHeight = 24.sp
+                    )
+                }
+            } else {
+                MarkdownView(content = reportText, modifier = Modifier.fillMaxSize().padding(16.dp))
+            }
         } else if (report.isLoading) {
             LoadingOverlay("正在生成报告...")
         }
@@ -2467,12 +2635,14 @@ fun KnowledgeScreen(
         showModules: Map<String, Boolean> = emptyMap(),
         onAskQuestion: (String) -> Unit,
         onBack: () -> Unit,
+        viewModel: MainViewModel? = null,
 ) {
     Column(
             modifier =
                     Modifier.fillMaxSize()
                             .background(Color(0xFF1A1A2E))
     ) {
+        val knowledgeFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
         // Feature 14: 固定返回按钮在顶部
         Surface(
             modifier = Modifier.fillMaxWidth(),
@@ -2500,16 +2670,36 @@ fun KnowledgeScreen(
                 LoadingOverlay("正在分析内容...")
             }
 
-            if (state.summary.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
-                SolutionCard("📝 知识点总结", state.summary, Color(0xFF00D2FF))
+            if (state.summary.isNotEmpty()) {
+                SolutionCard(
+                        title = "📝 知识点总结",
+                        content = state.summary,
+                        color = Color(0xFF00D2FF),
+                        fontSize = knowledgeFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("solution_steps", true)
+                )
             }
 
-            if (state.mistakes.isNotEmpty() && showModules.getOrDefault("mistakes", true)) {
-                SolutionCard("📝 易错点总结", state.mistakes, Color(0xFFFF5722))
+            if (state.mistakes.isNotEmpty()) {
+                SolutionCard(
+                        title = "📝 易错点总结",
+                        content = state.mistakes,
+                        color = Color(0xFFFF5722),
+                        fontSize = knowledgeFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("mistakes", true),
+                        streaming = state.mistakesStreaming
+                )
             }
 
-            if (state.extension.isNotEmpty() && showModules.getOrDefault("extension", true)) {
-                SolutionCard("🚀 知识拓展", state.extension, Color(0xFF7B2FBE))
+            if (state.extension.isNotEmpty()) {
+                SolutionCard(
+                        title = "🚀 知识拓展",
+                        content = state.extension,
+                        color = Color(0xFF7B2FBE),
+                        fontSize = knowledgeFontSize,
+                        initiallyCollapsed = !showModules.getOrDefault("extension", true),
+                        streaming = state.extensionStreaming
+                )
             }
 
             if (state.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
@@ -2573,8 +2763,9 @@ fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
             }
         }
 
-        // WebView引用，供缩放按钮控制
+        // WebView引用，供缩放按钮控制（JS缩放，避免页面user-scalable=no导致zoomIn/zoomOut无效）
         var webViewRef by remember { mutableStateOf<android.webkit.WebView?>(null) }
+        var zoomScale by remember { mutableStateOf(1f) }
 
         Box(modifier = Modifier.weight(1f)) {
             AndroidView(
@@ -2585,10 +2776,9 @@ fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
                             settings.domStorageEnabled = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
-                            // 启用缩放（双击/手势 + 下方按钮）
-                            settings.builtInZoomControls = true
+                            settings.builtInZoomControls = false
                             settings.displayZoomControls = false
-                            settings.setSupportZoom(true)
+                            settings.setSupportZoom(false)
                             loadUrl(animationUrl)
                             webViewRef = this
                         }
@@ -2609,18 +2799,28 @@ fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
                     verticalAlignment = Alignment.CenterVertically
             ) {
                 Button(
-                        onClick = { webViewRef?.zoomOut() },
+                        onClick = {
+                            zoomScale = (zoomScale * 0.8f).coerceAtLeast(0.5f)
+                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
+                        },
                         modifier = Modifier.size(width = 64.dp, height = 40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
                 ) { Text("−", color = Color.White, fontSize = 20.sp) }
                 Text("缩放", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp))
                 Button(
-                        onClick = { webViewRef?.zoomIn() },
+                        onClick = {
+                            zoomScale = (zoomScale * 1.25f).coerceAtMost(5f)
+                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
+                        },
                         modifier = Modifier.size(width = 64.dp, height = 40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
                 ) { Text("+", color = Color.White, fontSize = 20.sp) }
                 Spacer(modifier = Modifier.width(12.dp))
-                TextButton(onClick = { webViewRef?.reload() }) {
+                TextButton(onClick = {
+                    zoomScale = 1f
+                    webViewRef?.evaluateJavascript("document.body.style.zoom = '1';", null)
+                    webViewRef?.reload()
+                }) {
                     Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
                 }
             }
@@ -2737,7 +2937,8 @@ fun MarkdownView(
                     setTextColor(android.graphics.Color.WHITE)
                     textSize = fontSize
                     setPadding(30, 20, 30, 20)
-                    setLineSpacing(8f, 1.3f)
+                    // 行间距随字体大小缩放，避免放大文字时行距变窄
+                    setLineSpacing(fontSize * 0.45f, 1.4f)
                     setTextIsSelectable(true)
                     setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
                     // 允许长内容在固定高度容器内滚动（弹窗/详情页）
@@ -2759,6 +2960,32 @@ fun MarkdownView(
             },
             modifier = modifier
     )
+}
+
+/**
+ * 解题思路 JSON 兑底：AI 偶尔会把解题思路输出成
+ * {"solution_steps":[...],"key_breakthrough":...} 结构，提取为纯文本
+ */
+private fun extractStepsText(text: String): String {
+    val trimmed = text.trim()
+    if (trimmed.startsWith("{") && trimmed.contains("solution_steps")) {
+        return try {
+            val obj = JSONObject(trimmed)
+            val steps = obj.optJSONArray("solution_steps")
+            val sb = StringBuilder()
+            if (steps != null) {
+                for (i in 0 until steps.length()) {
+                    sb.append("${i + 1}. ").append(steps.optString(i, "")).append("\n")
+                }
+            }
+            val kb = obj.optString("key_breakthrough", "")
+            if (kb.isNotEmpty()) sb.append("\n💡 关键突破口：").append(kb)
+            sb.toString().ifBlank { text }
+        } catch (e: Exception) {
+            text
+        }
+    }
+    return text
 }
 
 /**
@@ -3293,6 +3520,7 @@ fun HistoryViewScreen(
     val context = LocalContext.current
     val historyStartDate by viewModel.historyStartDate.collectAsState()
     val historyEndDate by viewModel.historyEndDate.collectAsState()
+    val serverAddress by viewModel.serverAddress.collectAsState()
     
     var records by remember { mutableStateOf<List<ApiService.HistoryRecord>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
@@ -3522,6 +3750,7 @@ fun HistoryViewScreen(
                     items(records, key = { it.id }) { record ->
                         HistoryRecordCard(
                             record = record,
+                            serverAddress = serverAddress,
                             isSelectMode = isSelectMode,
                             isSelected = selectedIds.contains(record.id),
                             onClick = {
@@ -3597,6 +3826,7 @@ fun HistoryViewScreen(
 @Composable
 fun HistoryRecordCard(
     record: ApiService.HistoryRecord,
+    serverAddress: String = "10.100.55.231:8000",
     isSelectMode: Boolean = false,
     isSelected: Boolean = false,
     onClick: () -> Unit,
@@ -3718,7 +3948,23 @@ fun HistoryRecordCard(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
                 
-                if (record.ocrText.isNotEmpty()) {
+                // 题目以原图展示（服务端保存了用户拍摄/上传的图片），OCR文本不再作为题目
+                if (record.imageUrl.isNotEmpty()) {
+                    val fullImageUrl = "http://$serverAddress${record.imageUrl}"
+                    AndroidView(
+                            factory = { ctx ->
+                                android.widget.ImageView(ctx).apply {
+                                    scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                                    setBackgroundColor(android.graphics.Color.parseColor("#12122A"))
+                                    com.bumptech.glide.Glide.with(ctx)
+                                            .load(fullImageUrl)
+                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor("#2D2D44")))
+                                            .into(this)
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)
+                    )
+                } else if (record.ocrText.isNotEmpty()) {
                     Text(
                         text = cleanHtmlText(record.ocrText),
                         color = Color.White,
@@ -3980,15 +4226,12 @@ fun HistoryDetailScreen(
 fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val gestureEnabled by viewModel.gestureEnabled.collectAsState()
     val voiceEnabled by viewModel.voiceEnabled.collectAsState()
-    val tomatoEnabled by viewModel.tomatoEnabled.collectAsState()
     val serverAddress by viewModel.serverAddress.collectAsState()
     val fontSize by viewModel.fontSize.collectAsState()
     val showModules by viewModel.showModules.collectAsState()
     val aiEngine by viewModel.aiEngine.collectAsState()
     val historyStartDate by viewModel.historyStartDate.collectAsState()
     val historyEndDate by viewModel.historyEndDate.collectAsState()
-    val pomodoroWorkDuration by viewModel.pomodoroWorkDuration.collectAsState()
-    val pomodoroRestDuration by viewModel.pomodoroRestDuration.collectAsState()
 
     AlertDialog(
             onDismissRequest = onDismiss,
@@ -4019,40 +4262,6 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                             checked = voiceEnabled,
                             onCheckedChange = { viewModel.voiceEnabled.value = it }
                     )
-
-                    SettingSwitch(
-                            title = "🍅 番茄钟",
-                            subtitle = "${pomodoroWorkDuration}分钟学习，${pomodoroRestDuration}分钟休息",
-                            checked = tomatoEnabled,
-                            onCheckedChange = { viewModel.tomatoEnabled.value = it }
-                    )
-                    
-                    if (tomatoEnabled) {
-                        Text(
-                            "工作时长: ${pomodoroWorkDuration}分钟",
-                            color = Color.White,
-                            fontSize = 13.sp
-                        )
-                        Slider(
-                            value = pomodoroWorkDuration.toFloat(),
-                            onValueChange = { viewModel.applyPomodoroWorkDuration(it.toInt()) },
-                            valueRange = 1f..120f,
-                            steps = 23,
-                            colors = SliderDefaults.colors(thumbColor = Color(0xFFFF5722), activeTrackColor = Color(0xFFFF5722))
-                        )
-                        Text(
-                            "休息时长: ${pomodoroRestDuration}分钟",
-                            color = Color.White,
-                            fontSize = 13.sp
-                        )
-                        Slider(
-                            value = pomodoroRestDuration.toFloat(),
-                            onValueChange = { viewModel.applyPomodoroRestDuration(it.toInt()) },
-                            valueRange = 1f..60f,
-                            steps = 29,
-                            colors = SliderDefaults.colors(thumbColor = Color(0xFF4CAF50), activeTrackColor = Color(0xFF4CAF50))
-                        )
-                    }
 
                     Divider(color = Color.White.copy(alpha = 0.2f))
 
@@ -4541,7 +4750,7 @@ fun CountdownConfirmDialog(
 // ==================== Feature 20: GeoGebra 图形绘制 ====================
 
 @Composable
-fun GeoGebraScreen(onBack: () -> Unit) {
+fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
@@ -4554,122 +4763,83 @@ fun GeoGebraScreen(onBack: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Button(onClick = onBack) { Text("← 返回") }
-                Text("📐 GeoGebra 图形", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("📐 数学图形", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.width(60.dp))
             }
         }
-        
-        // 快捷示例按钮
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            val examples = listOf(
-                "正弦曲线" to "f(x)=sin(x)",
-                "抛物线" to "f(x)=x^2",
-                "三角形" to "Polygon((0,0),(3,0),(1,2))",
-                "圆" to "Circle((0,0),2)",
-                "切线" to "f(x)=sin(x)\nt=Slider(0,2*pi,0.01)\nA=(t,f(t))\nTangent(A,f)"
+
+        if (url.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Color(0xFF00D2FF))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("正在生成数学图形...", color = Color.White, fontSize = 14.sp)
+                }
+            }
+            return@Column
+        }
+
+        // WebView引用，供缩放按钮控制（JS缩放，避免页面user-scalable=no导致缩放失效）
+        var webViewRef by remember { mutableStateOf<android.webkit.WebView?>(null) }
+        var zoomScale by remember { mutableStateOf(1f) }
+
+        Box(modifier = Modifier.weight(1f)) {
+            AndroidView(
+                    factory = { ctx ->
+                        android.webkit.WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.allowFileAccess = true
+                            settings.domStorageEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
+                            settings.builtInZoomControls = false
+                            settings.displayZoomControls = false
+                            settings.setSupportZoom(false)
+                            loadUrl(url)
+                            webViewRef = this
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
             )
-            
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                items(examples.size) { idx ->
-                    val (name, cmds) = examples[idx]
-                    Button(
+        }
+
+        // 缩放控制条
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
                         onClick = {
-                            // Commands are passed as URL parameter, but we can't easily
-                            // re-execute without reloading. Store in a local variable.
+                            zoomScale = (zoomScale * 0.8f).coerceAtLeast(0.5f)
+                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
                         },
-                        modifier = Modifier.height(36.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
-                    ) {
-                        Text(name, color = Color.White, fontSize = 12.sp)
-                    }
+                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("−", color = Color.White, fontSize = 20.sp) }
+                Text("缩放", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp))
+                Button(
+                        onClick = {
+                            zoomScale = (zoomScale * 1.25f).coerceAtMost(5f)
+                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
+                        },
+                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("+", color = Color.White, fontSize = 20.sp) }
+                Spacer(modifier = Modifier.width(12.dp))
+                TextButton(onClick = {
+                    zoomScale = 1f
+                    webViewRef?.evaluateJavascript("document.body.style.zoom = '1';", null)
+                    webViewRef?.reload()
+                }) {
+                    Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
                 }
             }
         }
-        
-        AndroidView(
-            factory = { ctx ->
-                android.webkit.WebView(ctx).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.allowFileAccess = true
-                    settings.useWideViewPort = true
-                    settings.loadWithOverviewMode = true
-                    settings.builtInZoomControls = false
-                    settings.displayZoomControls = false
-                    settings.setSupportZoom(false)
-                    isClickable = false
-                    isFocusable = false
-                    
-                    val geogebraHtml = """
-                        <!DOCTYPE html>
-                        <html>
-                        <head>
-                            <meta charset="utf-8">
-                            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-                            <script src="https://www.geogebra.org/apps/deployggb.js"></script>
-                            <style>
-                                * { margin: 0; padding: 0; }
-                                html, body { width: 100%; height: 100%; overflow: hidden; background: #1A1A2E; }
-                                #ggb-element { width: 100%; height: 100%; }
-                                .toolbar-hint {
-                                    position: absolute;
-                                    bottom: 10px;
-                                    left: 10px;
-                                    color: rgba(255,255,255,0.5);
-                                    font-size: 12px;
-                                    font-family: sans-serif;
-                                    pointer-events: none;
-                                }
-                            </style>
-                        </head>
-                        <body>
-                            <div id="ggb-element"></div>
-                            <div class="toolbar-hint">💡 使用底部工具栏绘制图形 | 上方按钮可快速预览示例</div>
-                            <script>
-                                var params = {
-                                    "appName": "graphing",
-                                    "width": window.innerWidth,
-                                    "height": window.innerHeight - 50,
-                                    "showToolBar": true,
-                                    "showAlgebraInput": true,
-                                    "showMenuBar": false,
-                                    "enableShiftDragZoom": true,
-                                    "language": "zh",
-                                    "borderColor": "#1A1A2E",
-                                    "bgColor": "#1A1A2E",
-                                    "perspective": "T",
-                                    "buttonShadows": true,
-                                    "showLogging": false,
-                                    "useBrowserStorage": false,
-                                    "showResetIcon": true,
-                                    "enableLabelDrags": false,
-                                    "enableRightClick": false,
-                                    "errorDialogsActive": false
-                                };
-                                var applet = new GGBApplet(params, true);
-                                window.ggbApplet = null;
-                                applet.setHTML5Codebase('https://www.geogebra.org/apps/latest/web3d/');
-                                applet.inject('ggb-element', 'preferHTML5');
-                                
-                                // 存储applet引用供后续使用
-                                setTimeout(function() {
-                                    window.ggbApplet = window.ggbApplet || document.querySelector('iframe')?.contentWindow?.ggbApplet;
-                                }, 2000);
-                            </script>
-                        </body>
-                        </html>
-                    """.trimIndent()
-                    
-                    loadDataWithBaseURL("https://www.geogebra.org", geogebraHtml, "text/html", "UTF-8", null)
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
     }
 }

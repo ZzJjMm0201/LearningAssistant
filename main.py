@@ -315,7 +315,7 @@ async def ai_report_stream(request: Request, body: ReportRequest):
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
-        summary = generator.get_report_summary(body.days, user_id=get_current_user(request))
+        summary = await asyncio.to_thread(generator.get_report_summary, body.days, user_id=get_current_user(request))
         
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
@@ -395,19 +395,27 @@ async def get_history(request: Request, body: dict):
     try:
         from server.database.models import SubmissionRecord
         from sqlalchemy import or_
-        from datetime import datetime
+        from datetime import datetime, time as dtime, timedelta
         import re
         
         start_date = body.get("start_date", "")
         end_date = body.get("end_date", "")
         user_id = get_current_user(request)
         
+        # 数据库存UTC时间，客户端传本地时间：过滤时本地→UTC换算，展示时UTC→本地换算
+        local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+        
         query = db.query(SubmissionRecord)
         
         if start_date:
-            query = query.filter(SubmissionRecord.timestamp >= datetime.fromisoformat(start_date))
+            start_dt = datetime.fromisoformat(start_date) - local_offset
+            query = query.filter(SubmissionRecord.timestamp >= start_dt)
         if end_date:
-            query = query.filter(SubmissionRecord.timestamp <= datetime.fromisoformat(end_date))
+            end_dt = datetime.fromisoformat(end_date)
+            # 只传日期（如"2026-08-26"）时表示包含当天全天，而非当天0点
+            if end_dt.time() == dtime(0, 0):
+                end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
+            query = query.filter(SubmissionRecord.timestamp <= end_dt - local_offset)
         
         # 多用户隔离：登录用户看自己的+公共(NULL)；未登录只能看公共(NULL)
         if user_id is not None:
@@ -457,7 +465,7 @@ async def get_history(request: Request, body: dict):
             
             result.append({
                 "id": r.id,
-                "timestamp": r.timestamp.isoformat() if r.timestamp is not None else "",
+                "timestamp": (r.timestamp + local_offset).isoformat() if r.timestamp is not None else "",
                 "ocr_text": clean_ocr,
                 "question_info_raw": json.dumps(question_info, ensure_ascii=False) if isinstance(question_info, dict) else str(question_info),
                 "grade": grade,
