@@ -9,6 +9,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 
 class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
@@ -213,6 +215,48 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 report = respJson.optString("report", ""),
                 message = respJson.optString("message", "")
             )
+        }
+    }
+
+    /**
+     * AI学情报告（SSE流式）：onChunk 回调累积文本，实现打字机效果
+     */
+    suspend fun getAiReportStream(days: Int = 7, onChunk: suspend (String) -> Unit) {
+        withContext(Dispatchers.IO) {
+            val json = JSONObject().apply { put("days", days) }
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder().url("$BASE_URL/report/ai/stream").post(body).withAuth().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                throw Exception("报告请求失败: ${response.code}")
+            }
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var dataBuffer = StringBuilder()
+            try {
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    when {
+                        line.startsWith("data:") -> dataBuffer.append(line.substring(5).trim())
+                        line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                            val data = dataBuffer.toString()
+                            dataBuffer = StringBuilder()
+                            try {
+                                val ev = JSONObject(data)
+                                when (ev.optString("stage")) {
+                                    "report_chunk" -> onChunk(ev.optString("content", ""))
+                                    "complete" -> return@withContext
+                                    "error" -> throw Exception(ev.optString("content", "生成失败"))
+                                }
+                            } catch (e: Exception) {
+                                // JSON解析失败忽略
+                            }
+                        }
+                    }
+                }
+            } finally {
+                reader.close()
+                response.close()
+            }
         }
     }
 

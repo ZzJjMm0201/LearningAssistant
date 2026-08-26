@@ -19,7 +19,7 @@ os.environ.setdefault('FLAGS_use_onednn', '0')
 os.environ.setdefault('FLAGS_enable_pir_api', '0')  # 禁用PIR新执行器，使用旧版执行器
 from typing import Tuple, Optional, List
 
-from server.config import APIConfig
+from server.config import APIConfig, FEATURE_FLAGS
 
 
 class OCRService:
@@ -88,12 +88,14 @@ class OCRService:
         # 两路并行
         futures = {}
         
-        # 通道1: API
+        # 通道1: API（默认开启）
         futures[self._executor.submit(self._recognize_via_api, image_path)] = "api"
         
-        # 通道2: 本地（如果已就绪）
-        if self._local_ready:
+        # 通道2: 本地（默认关闭，可在config中开启）
+        if self._local_ready and FEATURE_FLAGS.get("enable_local_ocr", False):
             futures[self._executor.submit(self._recognize_local, image_path)] = "local"
+        elif self._local_ready:
+            print("[OCR] 本地通道已按配置关闭（enable_local_ocr=False），仅使用API通道")
         
         # 收集结果（无论本地通道是否就绪，都要收集API通道的结果，否则会白白丢弃）
         try:

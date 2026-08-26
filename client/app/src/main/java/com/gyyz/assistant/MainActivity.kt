@@ -17,6 +17,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -69,6 +70,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.*
+import org.json.JSONArray
 import org.json.JSONObject
 
 @Suppress("OPT_IN_IS_NOT_ENABLED")
@@ -87,7 +89,9 @@ sealed class AppState {
             val solutionSteps: String = "",
             val fullSolution: String = "",
             val mindMap: String = "",
-            val suggestedQuestions: List<String> = emptyList()
+            val suggestedQuestions: List<String> = emptyList(),
+            val suggestedQA: List<QAItem> = emptyList(),
+            val qaList: List<QAItem> = emptyList(),
     ) : AppState()
 
     data class Report(val reportText: String = "", val isLoading: Boolean = true) : AppState()
@@ -103,6 +107,11 @@ sealed class AppState {
             val suggestedQuestions: List<String> = emptyList()
     ) : AppState()
 }
+
+/**
+ * 问答对：问题 + 答案（AI预判问题自带答案；用户追问后追加）
+ */
+data class QAItem(val question: String, val answer: String = "")
 
 enum class SolveStage {
     UPLOADING,
@@ -169,6 +178,8 @@ class MainViewModel : ViewModel() {
     
     // Feature 4: 掌握程度
     val showMasteryDialog = MutableStateFlow(false)
+    // 掌握程度按钮可见性（解答完成后显示在模块下方，不再自动弹窗）
+    val masteryVisible = MutableStateFlow(false)
     val currentSolvingRequestId = MutableStateFlow("")
 
     // Feature 9/10: OCR/手势确认弹窗
@@ -493,6 +504,7 @@ class MainViewModel : ViewModel() {
     fun onPhotoReady(photoFile: java.io.File) {
         Log.d("MainViewModel", "照片就绪，开始上传: ${photoFile.absolutePath}")
         cancelCurrentSSE = false  // Feature 5: 重置取消标志
+        masteryVisible.value = false  // 新一次解题开始时隐藏掌握程度按钮
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -561,9 +573,13 @@ class MainViewModel : ViewModel() {
             var fullSolution = ""
             var mindMap = ""
             var suggestedQuestions = emptyList<String>()
+            var suggestedQA = emptyList<QAItem>()
+            var qaList = emptyList<QAItem>()
             var ocrText = ""
             // 流式显示节流：每100ms最多刷新一次UI，避免AR眼镜低性能CPU卡顿
             var lastSolutionUpdate = 0L
+            var lastStepsUpdate = 0L
+            var lastMindmapUpdate = 0L
 
             while (true) {
                 // Feature 5: 检查取消标志
@@ -611,6 +627,23 @@ class MainViewModel : ViewModel() {
                                     }
                                     "search_complete" -> _statusText.value = "AI正在分析..."
                                     "question_info" -> _statusText.value = "正在生成解题思路..."
+                                    "solution_steps_chunk" -> {
+                                        // 流式增量：解题思路打字机效果
+                                        val chunk = json.optString("content", "")
+                                        if (chunk.isNotEmpty()) {
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastStepsUpdate >= 100) {
+                                                lastStepsUpdate = now
+                                                solutionSteps = chunk
+                                                _appState.value =
+                                                        AppState.Solving(
+                                                                stage = SolveStage.DISPLAY_STEPS,
+                                                                requestId = requestId,
+                                                                solutionSteps = chunk
+                                                        )
+                                            }
+                                        }
+                                    }
                                     "solution_steps" -> {
                                         solutionSteps = json.optString("content", "")
                                         _appState.value =
@@ -649,25 +682,58 @@ class MainViewModel : ViewModel() {
                                                         fullSolution = fullSolution
                                                 )
                                     }
+                                    "mindmap_chunk" -> {
+                                        // 流式增量：思维导图打字机效果
+                                        val chunk = json.optString("content", "")
+                                        if (chunk.isNotEmpty()) {
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastMindmapUpdate >= 100) {
+                                                lastMindmapUpdate = now
+                                                mindMap = formatMindMap(chunk)
+                                                _appState.value =
+                                                        AppState.Solving(
+                                                                stage = SolveStage.DISPLAY_MINDMAP,
+                                                                requestId = requestId,
+                                                                solutionSteps = solutionSteps,
+                                                                fullSolution = fullSolution,
+                                                                mindMap = mindMap
+                                                        )
+                                            }
+                                        }
+                                    }
                                     "mindmap" -> {
-                                        mindMap = json.optString("content", "")
-                                        mindMap = "```\n" + mindMap + "\n"
-                                        val formattedMindMap = mindMap
+                                        mindMap = formatMindMap(json.optString("content", ""))
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_MINDMAP,
                                                         requestId = requestId,
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
-                                                        mindMap = formattedMindMap
+                                                        mindMap = mindMap
                                                 )
                                     }
                                     "suggested_questions" -> {
-                                        val arr = json.optJSONArray("content")
-                                        if (arr != null) {
-                                            suggestedQuestions =
-                                                    (0 until arr.length()).map { arr.getString(it) }
+                                        // 兼容两种格式：字符串数组 或 {question,answer} 对象数组
+                                        val content = json.opt("content")
+                                        val qaItems = mutableListOf<QAItem>()
+                                        val qStrings = mutableListOf<String>()
+                                        if (content is JSONArray) {
+                                            for (i in 0 until content.length()) {
+                                                val obj = content.optJSONObject(i)
+                                                if (obj != null) {
+                                                    val q = obj.optString("question", "")
+                                                    val a = obj.optString("answer", "")
+                                                    if (q.isNotEmpty()) {
+                                                        qaItems.add(QAItem(q, a))
+                                                        qStrings.add(q)
+                                                    }
+                                                } else {
+                                                    content.optString(i, "").takeIf { it.isNotEmpty() }?.let { qStrings.add(it) }
+                                                }
+                                            }
                                         }
+                                        suggestedQA = qaItems
+                                        if (qStrings.isNotEmpty()) suggestedQuestions = qStrings
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.INTERACTIVE,
@@ -675,7 +741,9 @@ class MainViewModel : ViewModel() {
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
                                                         mindMap = mindMap,
-                                                        suggestedQuestions = suggestedQuestions
+                                                        suggestedQuestions = suggestedQuestions,
+                                                        suggestedQA = suggestedQA,
+                                                        qaList = qaList
                                                 )
                                     }
                                     "complete" -> {
@@ -686,11 +754,13 @@ class MainViewModel : ViewModel() {
                                                         solutionSteps = solutionSteps,
                                                         fullSolution = fullSolution,
                                                         mindMap = mindMap,
-                                                        suggestedQuestions = suggestedQuestions
+                                                        suggestedQuestions = suggestedQuestions,
+                                                        suggestedQA = suggestedQA,
+                                                        qaList = qaList
                                                 )
                                         _statusText.value = "解答完成"
-                                        // Feature 4: 显示掌握程度弹窗
-                                        showMasteryDialog.value = true
+                                        // 掌握程度改为模块下方按钮（不再弹窗）
+                                        masteryVisible.value = true
                                     }
                                     "error" ->
                                             _statusText.value = "错误: ${json.optString("content")}"
@@ -730,7 +800,9 @@ class MainViewModel : ViewModel() {
                     _appState.value =
                             currentState.copy(
                                     fullSolution = updatedSolution,
-                                    suggestedQuestions = emptyList()
+                                    suggestedQuestions = emptyList(),
+                                    suggestedQA = emptyList(),
+                                    qaList = currentState.qaList + QAItem(question, answer)
                             )
                     _statusText.value = "已回答"
                     isAskingQuestion.value = false
@@ -781,21 +853,21 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) {
-                    _appState.value = AppState.Report(isLoading = true)  // Feature 6: loading状态
+                    _appState.value = AppState.Report(reportText = "", isLoading = true)  // Feature 6: loading状态
                     _statusText.value = "正在生成AI学情报告..."
                 }
 
-                val response = apiService.getAiReport(reportDaysVal)
+                // SSE流式接收，打字机效果
+                val sb = StringBuilder()
+                apiService.getAiReportStream(reportDaysVal) { chunk ->
+                    sb.append(chunk)
+                    withContext(Dispatchers.Main) {
+                        _appState.value = AppState.Report(reportText = sb.toString(), isLoading = false)
+                    }
+                }
 
                 withContext(Dispatchers.Main) {
-                    if (response.status == "ok") {
-                        _appState.value =
-                                AppState.Report(reportText = response.report, isLoading = false)
-                        _statusText.value = "AI报告已生成"
-                    } else {
-                        _statusText.value = "报告生成失败: ${response.message}"
-                        _appState.value = AppState.Tracking
-                    }
+                    _statusText.value = "AI报告已生成"
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -891,6 +963,8 @@ class MainViewModel : ViewModel() {
             var mistakes = ""
             var extension = ""
             var questions = emptyList<String>()
+            var lastMistakesUpdate = 0L
+            var lastExtensionUpdate = 0L
 
             while (true) {
                 val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
@@ -914,6 +988,23 @@ class MainViewModel : ViewModel() {
                                     _appState.value = AppState.Knowledge()
                                     _statusText.value = "正在总结知识点..."
                                 }
+                                "mistakes_chunk" -> {
+                                    // 流式增量：易错点详解打字机效果
+                                    val chunk = json.optString("content", "")
+                                    if (chunk.isNotEmpty()) {
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastMistakesUpdate >= 100) {
+                                            lastMistakesUpdate = now
+                                            mistakes = chunk
+                                            _appState.value =
+                                                    AppState.Knowledge(
+                                                            summary = summary,
+                                                            mistakes = chunk
+                                                    )
+                                            _statusText.value = "正在生成易错点详解..."
+                                        }
+                                    }
+                                }
                                 "mistakes" -> {
                                     mistakes = json.optString("content", "")
                                     _appState.value =
@@ -922,6 +1013,24 @@ class MainViewModel : ViewModel() {
                                                     mistakes = mistakes
                                             )
                                     _statusText.value = "易错点已生成"
+                                }
+                                "extension_chunk" -> {
+                                    // 流式增量：知识拓展打字机效果
+                                    val chunk = json.optString("content", "")
+                                    if (chunk.isNotEmpty()) {
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastExtensionUpdate >= 100) {
+                                            lastExtensionUpdate = now
+                                            extension = chunk
+                                            _appState.value =
+                                                    AppState.Knowledge(
+                                                            summary = summary,
+                                                            mistakes = mistakes,
+                                                            extension = chunk
+                                                    )
+                                            _statusText.value = "正在生成知识拓展..."
+                                        }
+                                    }
                                 }
                                 "extension" -> {
                                     extension = json.optString("content", "")
@@ -2108,7 +2217,7 @@ fun SolvingScreen(
                 )
             }
 
-            if (solveState.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
+            if ((solveState.suggestedQA.isNotEmpty() || solveState.suggestedQuestions.isNotEmpty()) && showModules.getOrDefault("suggested_questions", true)) {
                 Text(
                         text = "💬 您可能还想问：",
                         color = Color.White,
@@ -2117,13 +2226,97 @@ fun SolvingScreen(
                         modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
 
-                solveState.suggestedQuestions.forEach { question ->
-                    Button(
-                            onClick = { onAskQuestion(question) },
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
-                            enabled = !isAskingQuestion
-                    ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                if (solveState.suggestedQA.isNotEmpty()) {
+                    // 新版：AI预测问题自带答案，点击展开/收起
+                    solveState.suggestedQA.forEach { item ->
+                        var expanded by remember(item.question) { mutableStateOf(false) }
+                        Card(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF2D2D44))
+                        ) {
+                            Column(
+                                    modifier =
+                                            Modifier.fillMaxWidth()
+                                                    .clickable { expanded = !expanded }
+                                                    .padding(12.dp)
+                            ) {
+                                Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                            item.question,
+                                            color = Color.White,
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                            if (expanded) "▲" else "▼",
+                                            color = Color(0xFF00D2FF),
+                                            fontSize = 12.sp
+                                    )
+                                }
+                                if (expanded && item.answer.isNotEmpty()) {
+                                    Text(
+                                            text = "📝 ${item.answer}",
+                                            color = Color(0xFFB0BEC5),
+                                            fontSize = 14.sp,
+                                            modifier = Modifier.padding(top = 8.dp)
+                                    )
+                                    TextButton(
+                                            onClick = { onAskQuestion(item.question) },
+                                            enabled = !isAskingQuestion
+                                    ) {
+                                        Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    solveState.suggestedQuestions.forEach { question ->
+                        Button(
+                                onClick = { onAskQuestion(question) },
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44)),
+                                enabled = !isAskingQuestion
+                        ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                    }
+                }
+
+                // 追问记录（用户追问过的问答对）
+                if (solveState.qaList.isNotEmpty()) {
+                    Text(
+                            text = "📌 追问记录：",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                    )
+                    solveState.qaList.forEach { item ->
+                        Card(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3A4B))
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                        text = "Q: ${item.question}",
+                                        color = Color.White,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold
+                                )
+                                if (item.answer.isNotEmpty()) {
+                                    Text(
+                                            text = "A: ${item.answer}",
+                                            color = Color(0xFFB0BEC5),
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(top = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Feature 2: 两个固定按钮指令
@@ -2155,6 +2348,16 @@ fun SolvingScreen(
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
                         enabled = !isAskingQuestion
                 ) { Text("📐 查看GeoGebra图形", color = Color.White, fontSize = 14.sp) }
+            }
+
+            // 掌握程度按钮：解答完成后显示在模块下方，点击弹出掌握程度选择（不再自动弹窗）
+            val showMasteryBtn by (viewModel?.masteryVisible ?: MutableStateFlow(false)).collectAsState()
+            if (showMasteryBtn && solveState.stage == SolveStage.COMPLETED) {
+                Button(
+                        onClick = { viewModel?.showMasteryDialog?.value = true },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C))
+                ) { Text("📊 掌握程度", color = Color.White, fontSize = 15.sp) }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -2370,22 +2573,58 @@ fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
             }
         }
 
-        AndroidView(
-                factory = { ctx ->
-                    android.webkit.WebView(ctx).apply {
-                        settings.javaScriptEnabled = true
-                        settings.allowFileAccess = true
-                        settings.domStorageEnabled = true
-                        settings.useWideViewPort = true
-                        settings.loadWithOverviewMode = true
-                        settings.builtInZoomControls = false
-                        settings.displayZoomControls = false
-                        settings.setSupportZoom(false)
-                        loadUrl(animationUrl)
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-        )
+        // WebView引用，供缩放按钮控制
+        var webViewRef by remember { mutableStateOf<android.webkit.WebView?>(null) }
+
+        Box(modifier = Modifier.weight(1f)) {
+            AndroidView(
+                    factory = { ctx ->
+                        android.webkit.WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.allowFileAccess = true
+                            settings.domStorageEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
+                            // 启用缩放（双击/手势 + 下方按钮）
+                            settings.builtInZoomControls = true
+                            settings.displayZoomControls = false
+                            settings.setSupportZoom(true)
+                            loadUrl(animationUrl)
+                            webViewRef = this
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        // 缩放控制条（页面过大看不到边缘时使用）
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = Color(0xFF16213E),
+            shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                        onClick = { webViewRef?.zoomOut() },
+                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("−", color = Color.White, fontSize = 20.sp) }
+                Text("缩放", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp))
+                Button(
+                        onClick = { webViewRef?.zoomIn() },
+                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("+", color = Color.White, fontSize = 20.sp) }
+                Spacer(modifier = Modifier.width(12.dp))
+                TextButton(onClick = { webViewRef?.reload() }) {
+                    Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
+                }
+            }
+        }
     }
 }
 
@@ -2501,6 +2740,8 @@ fun MarkdownView(
                     setLineSpacing(8f, 1.3f)
                     setTextIsSelectable(true)
                     setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
+                    // 允许长内容在固定高度容器内滚动（弹窗/详情页）
+                    movementMethod = android.text.method.ScrollingMovementMethod()
                 }
             },
             update = { textView ->
@@ -2520,6 +2761,16 @@ fun MarkdownView(
     )
 }
 
+/**
+ * 思维导图围栏规范化：AI输出已含```代码块则原样使用，否则包裹（避免双重围栏格式错乱）。
+ * 与服务端 _normalize_mindmap 逻辑一致，幂等。
+ */
+private fun formatMindMap(text: String): String {
+    if (text.isBlank()) return text
+    val fenced = text.trimStart().startsWith("```") || (text.split("```").size - 1) >= 2
+    return if (fenced) text else "```\n$text\n```"
+}
+
 private fun prepareMarkdownContent(content: String): String {
     if (content.isEmpty()) return ""
     var processed = content
@@ -2532,7 +2783,14 @@ private fun prepareMarkdownContent(content: String): String {
     processed = processed.replace(Regex("""\\\[(.*?)\\\]""", RegexOption.DOT_MATCHES_ALL)) { match ->
         "\n\$\$\n${match.groupValues[1].trim()}\n\$\$\n"
     }
-    // 4. Fix orphan newlines before headers/lists (ensure blank line before block elements)
+    // 4. 行内公式：单个$包裹的转换为$$（JLatexMathPlugin需要$$分隔符）
+    //    避免误伤已有的$$和换行内的内容
+    processed = processed.replace(
+        Regex("(?<!\\$)\\$(?!\\$)([^$\\n]+?)(?<!\\$)\\$(?!\\$)")
+    ) { match ->
+        "\$\$${match.groupValues[1].trim()}\$\$"
+    }
+    // 5. Fix orphan newlines before headers/lists (ensure blank line before block elements)
     processed = processed.replace(Regex("([^\n])\n(#{1,6}\\s|>\\s|\\*\\s|\\d+\\.\\s)"), "$1\n\n$2")
 
     return processed
@@ -3115,7 +3373,8 @@ fun HistoryViewScreen(
     if (selectedRecord != null) {
         HistoryDetailScreen(
             record = selectedRecord!!,
-            onBack = { selectedRecord = null }
+            onBack = { selectedRecord = null },
+            viewModel = viewModel
         )
         return
     }
@@ -3494,7 +3753,8 @@ fun HistoryRecordCard(
 @Composable
 fun HistoryDetailScreen(
     record: ApiService.HistoryRecord,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    viewModel: MainViewModel? = null,
 ) {
     val displayTime = try {
         if (record.timestamp.isNotEmpty()) {
@@ -3621,8 +3881,33 @@ fun HistoryDetailScreen(
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("📥 原图", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text("📥 原题图片", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(6.dp))
+                        // 显示原始题目图片（如可用）
+                        if (record.imageUrl.isNotEmpty()) {
+                            val fullImageUrl = "http://${viewModel?.serverAddress?.value ?: "10.100.55.231:8000"}${record.imageUrl}"
+                            AndroidView(
+                                factory = { ctx ->
+                                    android.widget.ImageView(ctx).apply {
+                                        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                                        setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
+                                        com.bumptech.glide.Glide.with(ctx)
+                                            .load(fullImageUrl)
+                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor("#2D2D44")))
+                                            .into(this)
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                        // 保留OCR文本（供核对）
+                        Text(
+                            "📝 识别文本：",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
                         Text(cleanHtmlText(record.ocrText), color = Color.White, fontSize = 13.sp)
                     }
                 }
@@ -4181,7 +4466,7 @@ fun CountdownConfirmDialog(
     onConfirm: () -> Unit,
     onCancel: () -> Unit
 ) {
-    var countdown by remember { mutableStateOf(3) }
+    var countdown by remember { mutableStateOf(8) }
     var isCounting by remember { mutableStateOf(true) }
     
     LaunchedEffect(Unit) {
@@ -4206,14 +4491,16 @@ fun CountdownConfirmDialog(
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(
-                            content,
-                            color = Color.White.copy(alpha = 0.9f),
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(12.dp),
-                            maxLines = 6,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        // Markdown渲染（公式/加粗等可正常显示），高度受限可滚动
+                        Box(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp)
+                        ) {
+                            MarkdownView(
+                                content = content,
+                                fontSize = 13f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                 }

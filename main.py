@@ -290,7 +290,7 @@ async def data_report(request: Request, body: ReportRequest):
 
 @app.post("/report/ai")
 async def ai_report(request: Request, body: ReportRequest):
-    """生成AI版学情报告（按用户隔离）"""
+    """生成AI版学情报告（非流式，兼容旧客户端）"""
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
@@ -306,6 +306,38 @@ async def ai_report(request: Request, body: ReportRequest):
             "report": ai_report_text,
             "summary": summary
         }
+    finally:
+        db.close()
+
+@app.post("/report/ai/stream")
+async def ai_report_stream(request: Request, body: ReportRequest):
+    """生成AI版学情报告（SSE流式）"""
+    db = SessionLocal()
+    try:
+        generator = ReportGenerator(db)
+        summary = generator.get_report_summary(body.days, user_id=get_current_user(request))
+        
+        if summary == "暂无学习记录":
+            return {"status": "error", "message": "暂无学习记录"}
+        
+        async def event_stream():
+            # 先发摘要供客户端展示
+            yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
+            # 流式生成报告正文
+            for chunk in ai_service.generate_ai_report_stream(summary):
+                yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.01)
+            yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
+        
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
     finally:
         db.close()
 

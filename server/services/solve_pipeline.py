@@ -26,6 +26,15 @@ _event_threads: Dict[str, threading.Thread] = {}
 # 用户确认等待标志
 _pending_confirm: Dict[str, threading.Event] = {}
 
+def _normalize_mindmap(text: str) -> str:
+    """思维导图围栏规范化：AI输出已含```代码块则原样使用，否则包裹（避免双层围栏格式错乱）"""
+    if not text:
+        return text
+    if text.count("```") >= 2 or text.strip().startswith("```"):
+        return text
+    return "```\n" + text + "\n```"
+
+
 class SolvePipeline:
     """解题流水线"""
     
@@ -150,6 +159,7 @@ class SolvePipeline:
             self._emit_event(request_id, "info", "AI正在分析题目...")
             solution_content = ""
             solution_chunks = []  # 存储每个流式chunk
+            latex_extras_content = ""  # 补充的LaTeX图形代码
             
             # 使用流式处理AI对话的各个阶段
             for event in ai_service.solve_problem_stream(ocr_text, search_result):
@@ -158,6 +168,9 @@ class SolvePipeline:
                 
                 if stage == "info":
                     self._emit_event(request_id, "question_info", content)
+                elif stage == "steps_chunk":
+                    # 流式chunk: content 是累积到当前的完整文本
+                    self._emit_event(request_id, "solution_steps_chunk", content)
                 elif stage == "steps":
                     self._emit_event(request_id, "solution_steps", content)
                 elif stage == "solution_chunk":
@@ -168,8 +181,15 @@ class SolvePipeline:
                 elif stage == "solution":
                     solution_content = content
                     self._emit_event(request_id, "solution", content)
+                elif stage == "latex_extras":
+                    # 补充的LaTeX图形代码（可多个），随后统一渲染
+                    latex_extras_content = content
+                    self._emit_event(request_id, "info", "正在生成图解...")
+                elif stage == "mindmap_chunk":
+                    # 流式chunk: content 是累积到当前的完整文本（已规范化围栏）
+                    self._emit_event(request_id, "mindmap_chunk", _normalize_mindmap(content))
                 elif stage == "mindmap":
-                    self._emit_event(request_id, "mindmap", content)
+                    self._emit_event(request_id, "mindmap", _normalize_mindmap(content))
                 elif stage == "questions":
                     self._emit_event(request_id, "suggested_questions", content)
                 elif stage == "complete":
@@ -186,7 +206,6 @@ class SolvePipeline:
                         svg_dir.mkdir(exist_ok=True)
                         
                         self._emit_event(request_id, "info", "正在渲染图形...")
-                        processed_solution = process_latex_blocks(str(solution_content), svg_dir)
                         
                         import re
                         # 动态构造图片URL：优先使用请求的Host头，回退到server_ip.txt
@@ -199,13 +218,31 @@ class SolvePipeline:
                                 host = "127.0.0.1:8000"
                         host = host.removeprefix("http://").removeprefix("https://").rstrip("/")
                         base_url = f"http://{host}/static/svgs_{request_id}"
-                        processed_solution = re.sub(
-                            r'!\[([^\]]*)\]\((diagram_[^)]+\.(?:svg|png))\)',  # ← 改为 (?:svg|png)
-                            rf'![\1]({base_url}/\2)',
-                            processed_solution
-                        )
                         
-                        self._emit_event(request_id, "solution_rendered", processed_solution)
+                        def _rewrite_img_urls(text: str) -> str:
+                            return re.sub(
+                                r'!\[([^\]]*)\]\((diagram_[^)]+\.(?:svg|png))\)',
+                                rf'![\1]({base_url}/\2)',
+                                text
+                            )
+                        
+                        # 1) 渲染完整解析中可能出现的LaTeX块
+                        processed_solution = process_latex_blocks(str(solution_content), svg_dir)
+                        processed_solution = _rewrite_img_urls(processed_solution)
+                        
+                        # 2) 渲染补充图解（AI单独一轮生成，可能多个）
+                        if latex_extras_content:
+                            processed_extras = process_latex_blocks(str(latex_extras_content), svg_dir)
+                            processed_extras = _rewrite_img_urls(processed_extras)
+                            final_solution = (
+                                processed_solution
+                                + "\n\n---\n\n## 📐 图解辅助\n\n"
+                                + processed_extras
+                            )
+                        else:
+                            final_solution = processed_solution
+                        
+                        self._emit_event(request_id, "solution_rendered", final_solution)
                         
                         # 提取题目结构化信息
                         question_info = extract_question_info_from_solution(str(solution_content))
@@ -282,8 +319,14 @@ class SolvePipeline:
                 
                 if stage == "info":
                     self._emit_event(request_id, "question_info", content)
+                elif stage == "mistakes_chunk":
+                    # 流式chunk: content 是累积到当前的完整文本
+                    self._emit_event(request_id, "mistakes_chunk", content)
                 elif stage == "mistakes":
                     self._emit_event(request_id, "mistakes", content)
+                elif stage == "extension_chunk":
+                    # 流式chunk: content 是累积到当前的完整文本
+                    self._emit_event(request_id, "extension_chunk", content)
                 elif stage == "extension":
                     self._emit_event(request_id, "extension", content)
                 elif stage == "questions":

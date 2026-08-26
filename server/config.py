@@ -52,6 +52,7 @@ class APIConfig:
 FEATURE_FLAGS = {
     "enable_question_search": True,  # 题库搜索开关 (节约费用)
     "enable_ai_animation": True,      # AI动画功能
+    "enable_local_ocr": False,        # 本地PaddleOCR默认关闭（慢/占资源）；API OCR默认开启
 }
 
 # AI模型配置

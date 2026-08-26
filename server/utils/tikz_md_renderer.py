@@ -106,6 +106,8 @@ def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelat
         png_file = tmpdir / "diagram.png"
         png_ok = _pdf_to_png(pdf_file, png_file)
         if png_ok and png_file.exists():
+            # 限制PNG宽度不超过1000px，避免超出手机屏幕宽度
+            _limit_png_width(png_file, max_width=1000)
             shutil.copy(png_file, output_path)
             print(f"  图形渲染成功(PNG): {output_path}")
             return True
@@ -118,6 +120,20 @@ def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelat
         return False
 
 
+def _limit_png_width(path: Path, max_width: int = 1000) -> None:
+    """限制PNG宽度（PIL缩放），避免LaTeX图形超出手机屏幕"""
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        if img.width > max_width:
+            h = int(img.height * max_width / img.width)
+            img = img.resize((max_width, h), Image.LANCZOS)
+            img.save(path)
+            print(f"  图片已缩放到 {max_width}px 宽 (原{img.width}px)")
+    except Exception as e:
+        print(f"  图片缩放失败(忽略): {e}")
+
+
 def _pdf_to_png(pdf_path: Path, png_path: Path) -> bool:
     """PDF转换为PNG（供Glide直接显示）"""
     # 方法1: pdftocairo（MiKTeX自带，最可靠）
@@ -125,7 +141,7 @@ def _pdf_to_png(pdf_path: Path, png_path: Path) -> bool:
         try:
             output_prefix = str(png_path.with_suffix(""))
             result = subprocess.run(
-                ["pdftocairo", "-png", "-singlefile", "-r", "150", str(pdf_path), output_prefix],
+                ["pdftocairo", "-png", "-singlefile", "-r", "250", str(pdf_path), output_prefix],
                 capture_output=True, text=True, timeout=30,
                 encoding='utf-8', errors='replace'
             )

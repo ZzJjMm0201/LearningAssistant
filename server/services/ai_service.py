@@ -61,18 +61,22 @@ class AIService:
         
         messages.append({"role": "assistant", "content": info_response})
         messages.append({"role": "user", "content": steps_prompt})
-        steps_response = self._call_api(messages)
+        # 流式输出解题思路
+        accumulated_steps = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+            accumulated_steps = chunk
+            yield {"stage": "steps_chunk", "content": accumulated_steps}
+        steps_response = accumulated_steps
         
         yield {"stage": "steps", "content": steps_response}
         
-        # === 第三阶段：完整解析与LaTeX图形（流式输出） ===
+        # === 第三阶段：完整解析（流式输出；暂不生成LaTeX图形，由后续单独环节补充） ===
         solution_prompt = """请给出完整的解题过程和答案。
     要求：
     1. 步骤完整，逻辑清晰
     2. 使用LaTeX语法编写数学公式
-    3. 如果需要绘制图形辅助理解，请使用LaTeX的tikz/pgfplots包编写图形代码，嵌入Markdown代码块中（```latex ... ```）
-    4. 图形要标注关键点、线、面的名称
-    5. 最后附上：
+    3. 暂不要生成LaTeX/TikZ图形代码，稍后会有专门环节为本题补充图形
+    4. 最后附上：
     **学科：**[学科]
     **知识点：**[用顿号隔开]
     **题目难度：**[难度]"""
@@ -90,6 +94,21 @@ class AIService:
         
         yield {"stage": "solution", "content": solution_response}
         
+        # === 第三点五阶段：生成LaTeX辅助图形（多图，单独一轮对话） ===
+        latex_prompt = """请为这道题生成有助于学生理解的LaTeX/TikZ图形代码。
+要求：
+1. 生成1-4个图形，每个图形单独一个```latex ... ```代码块
+2. 图形按解题步骤顺序排列，覆盖：题目情景图、关键几何关系、函数图像、过程示意图等
+3. 每个代码块前用一行文字说明该图的作用（如：**图1：题目情景示意**）
+4. 只使用tikz/pgfplots，代码要能在xelatex直接编译（不要documentclass等完整文档结构）
+5. 图形要标注关键点、线、面的名称，越直观越好"""
+        
+        messages.append({"role": "assistant", "content": solution_response})
+        messages.append({"role": "user", "content": latex_prompt})
+        latex_response = self._call_api(messages, max_tokens=4000)
+        
+        yield {"stage": "latex_extras", "content": latex_response}
+        
         # === 第四阶段：思维导图 ===
         mindmap_prompt = """请用纯文本缩进格式，为这道题生成一个解题思维导图。
     格式示例：
@@ -102,14 +121,24 @@ class AIService:
         
         messages.append({"role": "assistant", "content": solution_response})
         messages.append({"role": "user", "content": mindmap_prompt})
-        mindmap_response = self._call_api(messages)
+        # 流式输出思维导图
+        accumulated_mindmap = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+            accumulated_mindmap = chunk
+            yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
+        mindmap_response = accumulated_mindmap
         
         yield {"stage": "mindmap", "content": mindmap_response}
         
-        # === 第五阶段：预判问题 ===
-        questions_prompt = """请生成3个学生可能会问的后续问题，以JSON数组格式输出：
-    ["问题1", "问题2", "问题3"]
-    只输出JSON数组。"""
+        # === 第五阶段：预判问题（同时提供答案，便于客户端折叠展示） ===
+        questions_prompt = """请生成3个学生可能会问的后续问题，并同时给出每个问题的简要答案。
+以JSON数组格式输出，每项包含 question 和 answer 两个字段：
+[
+  {"question": "问题1", "answer": "简要答案1"},
+  {"question": "问题2", "answer": "简要答案2"},
+  {"question": "问题3", "answer": "简要答案3"}
+]
+答案要准确、简洁（50字以内）。只输出JSON数组。"""
         
         messages.append({"role": "assistant", "content": mindmap_response})
         messages.append({"role": "user", "content": questions_prompt})
@@ -123,7 +152,11 @@ class AIService:
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
     def generate_ai_report(self, stats_summary: str) -> str:
-        """生成AI版学情报告"""
+        """生成AI版学情报告（非流式，兼容旧调用）"""
+        return "".join(self.generate_ai_report_stream(stats_summary))
+
+    def generate_ai_report_stream(self, stats_summary: str):
+        """生成AI版学情报告（流式，逐步yield累积文本）"""
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
     {stats_summary}
@@ -140,9 +173,10 @@ class AIService:
             {"role": "user", "content": prompt}
         ]
         
-        response = self._call_api(messages)
-        
-        return response
+        accumulated = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+            accumulated = chunk
+            yield accumulated
     
     def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None) -> Generator[Dict, None, None]:
         """
@@ -181,7 +215,13 @@ class AIService:
         
         messages.append({"role": "assistant", "content": info_response})
         messages.append({"role": "user", "content": mistakes_prompt})
-        mistakes_detail = self._call_api(messages)
+        # 流式输出易错点详解
+        accumulated_mistakes = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+            accumulated_mistakes = chunk
+            yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
+        mistakes_detail = accumulated_mistakes
+        
         yield {"stage": "mistakes", "content": mistakes_detail}
         
         # ===== 第三阶段：知识拓展 =====
@@ -200,7 +240,13 @@ class AIService:
         
         messages.append({"role": "assistant", "content": mistakes_detail})
         messages.append({"role": "user", "content": extension_prompt})
-        extension_content = self._call_api(messages)
+        # 流式输出知识拓展
+        accumulated_extension = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+            accumulated_extension = chunk
+            yield {"stage": "extension_chunk", "content": accumulated_extension}
+        extension_content = accumulated_extension
+        
         yield {"stage": "extension", "content": extension_content}
         
         # ===== 第四阶段：延伸问题 =====

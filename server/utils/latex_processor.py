@@ -60,9 +60,9 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
         if success:
             # 优先使用真正的PNG（客户端Glide可直接解码）
             if is_real_png(png_path):
-                replacement = f"![图解]({png_path.name})"
+                replacement = f"\n\n![图解]({png_path.name})\n\n"
             elif svg_path.exists():
-                replacement = f"![图解]({svg_path.name})"
+                replacement = f"\n\n![图解]({svg_path.name})\n\n"
             else:
                 replacement = f"```latex\n{code}\n```\n*(图形渲染失败)*"
         else:
