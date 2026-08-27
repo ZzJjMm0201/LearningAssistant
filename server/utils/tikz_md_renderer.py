@@ -21,7 +21,7 @@ def is_real_png(path: Path) -> bool:
         return False
 
 
-def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelatex") -> bool:
+def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelatex", error_out: list = None) -> bool:
     """
     将LaTeX/TikZ代码渲染为图片。
 
@@ -92,6 +92,8 @@ def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelat
                 error_lines = [l for l in stdout.split('\n') if l.startswith('!')]
                 for line in error_lines[:5]:  # 最多5行
                     print(f"  {line}")
+                if error_out is not None:
+                    error_out.append("\n".join(error_lines[:5]) or (stdout[-300:] if stdout else "编译失败"))
         
         pdf_file = tmpdir / "diagram.pdf"
         if not pdf_file.exists():

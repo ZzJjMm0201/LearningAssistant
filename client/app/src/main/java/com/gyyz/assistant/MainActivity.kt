@@ -94,6 +94,9 @@ sealed class AppState {
             val suggestedQuestions: List<String> = emptyList(),
             val suggestedQA: List<QAItem> = emptyList(),
             val qaList: List<QAItem> = emptyList(),
+            val ocrText: String = "",
+            val pendingAnswer: String = "",
+            val isAnswering: Boolean = false,
             val stepsStreaming: Boolean = false,
             val solutionStreaming: Boolean = false,
             val mindmapStreaming: Boolean = false,
@@ -640,6 +643,12 @@ class MainViewModel : ViewModel() {
                                         showOcrConfirmDialog.value = true
                                         ocrConfirmText.value = ocrText
                                         ocrConfirmTitle.value = "确认识别结果"
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.ANALYZING,
+                                                        requestId = requestId,
+                                                        ocrText = ocrText
+                                                )
                                     }
                                     "search_complete" -> _statusText.value = "AI正在分析..."
                                     "question_info" -> {
@@ -781,7 +790,8 @@ class MainViewModel : ViewModel() {
                                                         suggestedQuestions = suggestedQuestions,
                                                         suggestedQA = suggestedQA,
                                                         qaList = qaList,
-                                                        subject = subject
+                                                        subject = subject,
+                                                        ocrText = ocrText
                                                 )
                                         _statusText.value = "解答完成"
                                         // 掌握程度改为模块下方按钮（不再弹窗）
@@ -812,17 +822,29 @@ class MainViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val answer =
-                        apiService.askQuestion(
-                                sessionId = currentState.requestId,
-                                question = question
-                        )
+                // 流式回答：与AI解题相同的SSE方式，回答逐字显示在气泡中
+                val sb = StringBuilder()
+                var lastAskUpdate = 0L
+                apiService.askQuestionStream(currentState.requestId, question) { chunk ->
+                    sb.append(chunk)
+                    val now = System.currentTimeMillis()
+                    if (now - lastAskUpdate >= 100) {
+                        lastAskUpdate = now
+                        val partial = sb.toString()
+                        withContext(Dispatchers.Main) {
+                            _appState.value =
+                                    currentState.copy(pendingAnswer = partial, isAnswering = true)
+                        }
+                    }
+                }
 
                 withContext(Dispatchers.Main) {
                     // 问答追加到对话记录（气泡展示），不再混入完整解析
                     _appState.value =
                             currentState.copy(
-                                    qaList = currentState.qaList + QAItem(question, answer)
+                                    qaList = currentState.qaList + QAItem(question, sb.toString()),
+                                    pendingAnswer = "",
+                                    isAnswering = false
                             )
                     _statusText.value = "已回答"
                     isAskingQuestion.value = false
@@ -831,6 +853,7 @@ class MainViewModel : ViewModel() {
                 withContext(Dispatchers.Main) {
                     _statusText.value = "提问失败: ${e.message}"
                     isAskingQuestion.value = false
+                    _appState.value = currentState.copy(pendingAnswer = "", isAnswering = false)
                 }
             }
         }
@@ -855,17 +878,18 @@ class MainViewModel : ViewModel() {
     }
 
     fun generateGeoGebra() {
-        val photo = lastPhotoFile
-        if (photo == null) {
-            _statusText.value = "没有可用的题目图片"
+        val state = _appState.value as? AppState.Solving
+        val ocrText = state?.ocrText
+        if (ocrText.isNullOrBlank()) {
+            _statusText.value = "没有可用的题目内容"
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) { _statusText.value = "正在生成数学图形..." }
-                val resp = apiService.requestAnimation(photo.readBytes())
+                val resp = apiService.generateGeoGebra(ocrText)
                 withContext(Dispatchers.Main) {
-                    if (resp.status == "ok") {
+                    if (resp.status == "ok" && resp.url.isNotEmpty()) {
                         geoGebraUrl.value = "${apiService.getBaseUrl()}${resp.url}"
                         showGeoGebraScreen.value = true
                     } else {
@@ -876,6 +900,11 @@ class MainViewModel : ViewModel() {
                 withContext(Dispatchers.Main) { _statusText.value = "图形生成失败: ${e.message}" }
             }
         }
+    }
+
+    fun setAiEngine(v: String) {
+        aiEngine.value = v
+        apiService.engine = v
     }
 
     fun requestAnimation(photoFile: java.io.File) {
@@ -2395,6 +2424,24 @@ fun SolvingScreen(
                     }
                 }
 
+                // AI正在回答的气泡（流式打字机）
+                if (solveState.isAnswering) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Surface(
+                                color = Color(0xFF2D2D44),
+                                shape = RoundedCornerShape(12.dp, 12.dp, 12.dp, 4.dp),
+                                modifier = Modifier.fillMaxWidth(0.92f).padding(vertical = 4.dp)
+                        ) {
+                            Text(
+                                    if (solveState.pendingAnswer.isNotEmpty()) solveState.pendingAnswer else "正在思考...",
+                                    color = Color(0xFFE0E0E0),
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                }
+
                 // 输入框：与AI基于本题继续对话（替代原来的固定快捷按钮）
                 Spacer(modifier = Modifier.height(12.dp))
                 Row(
@@ -2443,9 +2490,9 @@ fun SolvingScreen(
                 }
             }
 
-            // 掌握程度：解答完成后显示标题 + 三个选项横向排布（不再弹窗）
+            // 掌握程度：解答完成后显示标题 + 三个选项横向排布（点击记录后整个区块消失，防止重复点击）
             val showMasteryBtn by (viewModel?.masteryVisible ?: MutableStateFlow(false)).collectAsState()
-            if (showMasteryBtn && solveState.stage == SolveStage.COMPLETED) {
+            if (showMasteryBtn && !(viewModel?.masterySaved?.value == true) && solveState.stage == SolveStage.COMPLETED) {
                 Text(
                         text = "📊 掌握程度",
                         color = Color.White,
@@ -2453,33 +2500,25 @@ fun SolvingScreen(
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
-                if (viewModel?.masterySaved?.value == true) {
-                    Text(
-                            text = "✅ 已记录：${viewModel?.masteryLevel?.value ?: ""}",
-                            color = Color(0xFF4CAF50),
-                            fontSize = 14.sp
-                    )
-                } else {
-                    Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                                onClick = { viewModel?.saveMastery("completely_mastered") },
-                                modifier = Modifier.weight(1f).height(44.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
-                        ) { Text("✅ 完全掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
-                        Button(
-                                onClick = { viewModel?.saveMastery("partially_mastered") },
-                                modifier = Modifier.weight(1f).height(44.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
-                        ) { Text("⚠️ 部分掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
-                        Button(
-                                onClick = { viewModel?.saveMastery("not_mastered") },
-                                modifier = Modifier.weight(1f).height(44.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
-                        ) { Text("❌ 完全没掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
-                    }
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                            onClick = { viewModel?.saveMastery("completely_mastered") },
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                    ) { Text("✅ 完全掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                    Button(
+                            onClick = { viewModel?.saveMastery("partially_mastered") },
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
+                    ) { Text("⚠️ 部分掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                    Button(
+                            onClick = { viewModel?.saveMastery("not_mastered") },
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                    ) { Text("❌ 完全没掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
                 }
             }
 
@@ -4355,7 +4394,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
                                 selected = aiEngine == "deepseek",
-                                onClick = { viewModel.aiEngine.value = "deepseek" },
+                                onClick = { viewModel.setAiEngine("deepseek") },
                                 label = { Text("DeepSeek", fontSize = 12.sp) },
                                 colors =
                                         FilterChipDefaults.filterChipColors(
@@ -4364,7 +4403,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         )
                         FilterChip(
                                 selected = aiEngine == "hunyuan",
-                                onClick = { viewModel.aiEngine.value = "hunyuan" },
+                                onClick = { viewModel.setAiEngine("hunyuan") },
                                 label = { Text("混元", fontSize = 12.sp) },
                                 colors =
                                         FilterChipDefaults.filterChipColors(

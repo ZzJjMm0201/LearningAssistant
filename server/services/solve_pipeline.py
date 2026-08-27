@@ -16,7 +16,7 @@ from server.database.models import SessionLocal, SubmissionRecord, ConversationH
 from server.services.ocr_service import ocr_service
 from server.services.search_service import search_service
 from server.services.ai_service import ai_service
-from server.utils.latex_processor import process_latex_blocks, extract_question_info_from_solution
+from server.utils.latex_processor import process_latex_blocks, process_latex_blocks_with_retry, extract_question_info_from_solution
 
 from typing import Dict, Generator, Optional, Union
 
@@ -41,7 +41,7 @@ class SolvePipeline:
     def __init__(self):
         self.db = SessionLocal()
     
-    def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None) -> str:
+    def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -49,7 +49,7 @@ class SolvePipeline:
         
         thread = threading.Thread(
             target=self._solve_worker,
-            args=(request_id, image_path, session_id, base_host, user_id)
+            args=(request_id, image_path, session_id, base_host, user_id, engine)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -100,7 +100,7 @@ class SolvePipeline:
             event.set()  # 让worker线程继续执行并退出
         self._cleanup(request_id)
     
-    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None):
+    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None):
         """后台解题工作线程"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
@@ -162,7 +162,7 @@ class SolvePipeline:
             latex_extras_content = ""  # 补充的LaTeX图形代码
             
             # 使用流式处理AI对话的各个阶段
-            for event in ai_service.solve_problem_stream(ocr_text, search_result):
+            for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine):
                 stage = event["stage"]
                 content = event["content"]
                 
@@ -227,12 +227,12 @@ class SolvePipeline:
                             )
                         
                         # 1) 渲染完整解析中可能出现的LaTeX块
-                        processed_solution = process_latex_blocks(str(solution_content), svg_dir)
+                        processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine)
                         processed_solution = _rewrite_img_urls(processed_solution)
                         
                         # 2) 渲染补充图解（AI单独一轮生成，可能多个）
                         if latex_extras_content:
-                            processed_extras = process_latex_blocks(str(latex_extras_content), svg_dir)
+                            processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine)
                             processed_extras = _rewrite_img_urls(processed_extras)
                             final_solution = (
                                 processed_solution
@@ -276,23 +276,23 @@ class SolvePipeline:
         finally:
             self._cleanup(request_id)
     
-    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None) -> str:
+    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None) -> str:
         """启动知识延伸流程"""
         request_id = session_id or str(uuid.uuid4())
         _event_queues[request_id] = deque()
         
         thread = threading.Thread(
             target=self._extension_worker,
-            args=(request_id, image_path, session_id, user_id)
+            args=(request_id, image_path, session_id, user_id, engine)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
         thread.start()
         return request_id
 
-    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None):
+    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None):
         """知识延伸工作线程"""
-        print(f"[{request_id}] ========== 知识延伸流程启动 ==========")
+        print(f"[{request_id}] ========== 知识延伸流程启动 ==========\n")
         
         try:
             # OCR
@@ -313,7 +313,7 @@ class SolvePipeline:
             # AI 知识延伸
             self._emit_event(request_id, "info", "正在分析内容...")
             
-            for event in ai_service.generate_knowledge_extension(ocr_text):
+            for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine):
                 stage = event["stage"]
                 content = event["content"]
                 

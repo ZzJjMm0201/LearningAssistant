@@ -73,6 +73,64 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
     
     return result
 
+def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=None, engine: str = None, max_retries: int = 3) -> str:
+    """
+    处理Markdown中的LaTeX代码块（带AI修复重试）：
+    1. 编译失败 → 把关键报错发给AI修复，最多重试 max_retries 次
+    2. 重试仍失败 → 移除该图形块（客户端不显示代码）
+    """
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    blocks = extract_latex_blocks(md_text)
+    if not blocks:
+        return md_text
+    
+    result = md_text
+    for block_id, code, start, end in reversed(blocks):
+        final_code = code
+        cur_block_id = block_id
+        success = False
+        error_text = "编译失败"
+        
+        for attempt in range(max_retries + 1):
+            png_path = output_dir / f"diagram_{cur_block_id}.png"
+            svg_path = output_dir / f"diagram_{cur_block_id}.svg"
+            err_out = []
+            ok = render_latex_blocks(final_code, png_path, engine="xelatex", error_out=err_out)
+            if ok:
+                success = True
+                break
+            error_text = err_out[0] if err_out else "编译失败"
+            if ai_service is not None and attempt < max_retries:
+                print(f"[LaTeX] 第{attempt + 1}次编译失败，交给AI修复... 错误: {error_text[:160]}")
+                fixed = ai_service.fix_latex(final_code, error_text, engine=engine)
+                if fixed and fixed.strip() and fixed != final_code:
+                    final_code = fixed
+                    cur_block_id = hashlib.md5(final_code.encode()).hexdigest()[:8]
+                else:
+                    print(f"[LaTeX] AI未给出有效修复，停止重试")
+                    break
+        
+        if success:
+            png_path = output_dir / f"diagram_{cur_block_id}.png"
+            svg_path = output_dir / f"diagram_{cur_block_id}.svg"
+            if is_real_png(png_path):
+                replacement = f"\n\n![图解]({png_path.name})\n\n"
+            elif svg_path.exists():
+                replacement = f"\n\n![图解]({svg_path.name})\n\n"
+            else:
+                replacement = ""
+        else:
+            # 重试仍失败：直接移除该块，不显示LaTeX代码
+            print(f"[LaTeX] 重试{max_retries}次仍失败，移除该图形块: {error_text[:150]}")
+            replacement = ""
+        
+        result = result[:start] + replacement + result[end:]
+    
+    return result
+
+
 def extract_question_info_from_solution(solution_text: str) -> dict:
     """
     从AI生成的完整解析末尾提取题目信息

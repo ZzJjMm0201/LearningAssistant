@@ -10,7 +10,7 @@ from server.config import HISTORY_DIR
 from server.services.ai_service import ai_service
 
 
-def generate_animation(ocr_text: str, solution: str = "") -> str | None:
+def generate_animation(ocr_text: str, solution: str = "", engine: str = None) -> str | None:
     """
     根据题目内容生成动画 HTML 文件
     
@@ -42,7 +42,7 @@ def generate_animation(ocr_text: str, solution: str = "") -> str | None:
     code_response = ai_service._call_api([
         {"role": "system", "content": "你是一个擅长用 Plotly 制作教学动画的编程专家。"},
         {"role": "user", "content": prompt}
-    ], max_tokens=4000)
+    ], max_tokens=4000, engine=engine)
     
     if not code_response:
         return None

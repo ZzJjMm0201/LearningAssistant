@@ -78,10 +78,16 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     }
 
     /**
+     * AI引擎（deepseek / hunyuan），随请求头 X-Engine 发送给服务端
+     */
+    var engine: String = "deepseek"
+
+    /**
      * 为任意请求追加认证头（统一入口）
      */
     private fun Request.Builder.withAuth(): Request.Builder {
         authToken?.let { addHeader("Authorization", "Bearer $it") }
+        addHeader("X-Engine", engine)
         return this
     }
 
@@ -158,9 +164,83 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     }
 
     /**
+     * 追问（SSE流式）：与AI解题相同的流式方式，回答逐chunk回调
+     */
+    suspend fun askQuestionStream(sessionId: String, question: String, onChunk: suspend (String) -> Unit) {
+        withContext(Dispatchers.IO) {
+            val json = JSONObject().apply {
+                put("session_id", sessionId)
+                put("question", question)
+            }
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                    .url("$BASE_URL/ask/stream")
+                    .post(body)
+                    .withAuth()
+                    .build()
+            val streamClient = OkHttpClient.Builder()
+                    .connectTimeout(30, TimeUnit.SECONDS)
+                    .readTimeout(0, TimeUnit.MILLISECONDS)
+                    .writeTimeout(60, TimeUnit.SECONDS)
+                    .build()
+            val response = streamClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                throw Exception("追问请求失败: ${response.code}")
+            }
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var dataBuffer = StringBuilder()
+            try {
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    when {
+                        line.startsWith("data:") -> dataBuffer.append(line.substring(5).trim())
+                        line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                            val data = dataBuffer.toString()
+                            dataBuffer = StringBuilder()
+                            try {
+                                val ev = JSONObject(data)
+                                when (ev.optString("stage")) {
+                                    "answer_chunk" -> onChunk(ev.optString("content", ""))
+                                    "complete" -> return@withContext
+                                    "error" -> throw Exception(ev.optString("content", "生成失败"))
+                                }
+                            } catch (e: Exception) {
+                                // JSON解析失败忽略
+                            }
+                        }
+                    }
+                }
+            } finally {
+                reader.close()
+                response.close()
+            }
+        }
+    }
+
+    /**
      * 获取AI动画
      */
     data class AnimationResponse(val status: String, val url: String = "", val message: String = "")
+    data class GeoGebraResponse(val status: String, val url: String = "", val message: String = "")
+
+    suspend fun generateGeoGebra(ocrText: String): GeoGebraResponse {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().apply { put("ocr_text", ocrText) }
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                    .url("$BASE_URL/geogebra")
+                    .post(body)
+                    .withAuth()
+                    .build()
+            val response = client.newCall(request).execute()
+            val result = JSONObject(response.body?.string() ?: "{}")
+            GeoGebraResponse(
+                    status = result.optString("status", "error"),
+                    url = result.optString("url", ""),
+                    message = result.optString("message", "")
+            )
+        }
+    }
     suspend fun requestAnimation(imageBytes: ByteArray): AnimationResponse {
         return withContext(Dispatchers.IO) {
             val requestBody = MultipartBody.Builder()
@@ -226,7 +306,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val json = JSONObject().apply { put("days", days) }
             val body = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url("$BASE_URL/report/ai/stream").post(body).withAuth().build()
-            val response = client.newCall(request).execute()
+            // 长流式连接：用不限读超时的独立客户端（与AI解题一致），避免生成慢时被掐断
+            val streamClient = OkHttpClient.Builder()
+                    .connectTimeout(30, TimeUnit.SECONDS)
+                    .readTimeout(0, TimeUnit.MILLISECONDS)
+                    .writeTimeout(60, TimeUnit.SECONDS)
+                    .build()
+            val response = streamClient.newCall(request).execute()
             if (!response.isSuccessful) {
                 throw Exception("报告请求失败: ${response.code}")
             }

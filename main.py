@@ -123,6 +123,10 @@ async def favicon():
     from fastapi.responses import Response
     return Response(status_code=204)
 
+def get_engine(request: Request) -> str:
+    """读取客户端选择的AI引擎（X-Engine请求头），默认deepseek"""
+    return (request.headers.get("X-Engine") or "deepseek").lower()
+
 @app.post("/solve")
 async def solve_problem(request: Request, file: UploadFile = File(...)):
     request_id = str(uuid.uuid4())
@@ -138,6 +142,7 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         session_id=request_id,  # ← 传入相同ID
         base_host=request.headers.get("host") or None,
         user_id=get_current_user(request),
+        engine=get_engine(request),
     )
     
     return {
@@ -222,7 +227,7 @@ async def ask_question(request: AskRequest):
             # 无历史时用空上下文，避免AI无背景作答
             messages = []
 
-        response = ai_service.continue_conversation(messages, request.question)
+        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request))
 
         # 保存本次问答到数据库，保证后续追问上下文连续
         for role, content in (("user", request.question), ("assistant", response)):
@@ -231,6 +236,53 @@ async def ask_question(request: AskRequest):
         db.commit()
 
         return {"answer": response, "session_id": request.session_id}
+    finally:
+        db.close()
+
+@app.post("/ask/stream")
+async def ask_question_stream(request: Request, body: AskRequest):
+    """多轮对话 - 继续提问（SSE流式，回答与AI解题同样式）"""
+    db = SessionLocal()
+    try:
+        from server.database.models import ConversationHistory as CH
+        history = (
+            db.query(CH)
+            .filter(CH.session_id == body.session_id)
+            .order_by(CH.id.asc())
+            .all()
+        )
+        messages: list = [{"role": h.role, "content": h.content} for h in history]
+        engine = get_engine(request)
+
+        async def event_stream():
+            accumulated = ""
+            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine):
+                accumulated = chunk
+                yield f"data: {json.dumps({'stage': 'answer_chunk', 'content': accumulated}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.01)
+            # 保存本次问答到数据库（流结束、response返回后执行，需新开会话）
+            try:
+                db2 = SessionLocal()
+                try:
+                    for role, content in (("user", body.question), ("assistant", accumulated)):
+                        conv = CH(session_id=body.session_id, role=role, content=content)
+                        db2.add(conv)
+                    db2.commit()
+                finally:
+                    db2.close()
+            except Exception as e:
+                print(f"[ask/stream] 保存对话失败: {e}")
+            yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
     finally:
         db.close()
 
@@ -249,7 +301,7 @@ async def create_animation(file: UploadFile = File(...)):
         return {"status": "error", "message": "OCR识别失败"}
     
     # 生成动画
-    html_path = generate_animation(ocr_text)
+    html_path = generate_animation(ocr_text, engine=get_engine(request))
     if html_path:
         # 返回动画文件的 URL
         filename = Path(html_path).name
@@ -299,7 +351,7 @@ async def ai_report(request: Request, body: ReportRequest):
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
         
-        ai_report_text = ai_service.generate_ai_report(summary)
+        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request))
         
         return {
             "status": "ok",
@@ -324,7 +376,7 @@ async def ai_report_stream(request: Request, body: ReportRequest):
             # 先发摘要供客户端展示
             yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
             # 流式生成报告正文
-            for chunk in ai_service.generate_ai_report_stream(summary):
+            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request)):
                 yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
             yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
@@ -366,7 +418,7 @@ async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     with open(image_path, "wb") as f:
         f.write(await file.read())
     
-    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request))
+    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request))
     
     return {"request_id": request_id, "status": "processing"}
 
@@ -671,12 +723,12 @@ class GeoGebraRequest(BaseModel):
     subject: str = ""
 
 @app.post("/geogebra")
-async def generate_geogebra(request: GeoGebraRequest):
-    """Feature 20: 生成GeoGebra图形命令"""
+async def generate_geogebra(request: Request, body: GeoGebraRequest):
+    """Feature 20: 生成GeoGebra图形（AI生成命令 + 官方GeoGebra Applet页面）"""
     try:
         prompt = f"""请根据以下数学题目内容，生成可以在GeoGebra中输入的命令。
-        
-题目内容: {request.ocr_text if request.ocr_text else '绘制基本数学图形'}
+
+题目内容: {body.ocr_text if body.ocr_text else '绘制基本数学图形'}
 
 要求:
 1. 每行一个GeoGebra命令
@@ -684,35 +736,104 @@ async def generate_geogebra(request: GeoGebraRequest):
 3. 先定义基础对象(如函数、点、滑块)，再定义依赖对象
 4. 如果题目涉及函数，请定义函数并绘制图像
 5. 如果涉及几何，请绘制对应的几何图形并标注关键点
-6. 不要输出任何解释文字，只输出命令
-
-请直接输出GeoGebra命令，每行一个:"""
+6. 不要输出任何解释文字，只输出命令"""
         
-        response = ai_service.generate_response(prompt)
+        response = ai_service.generate_response(prompt, engine=get_engine(request))
         
         # 清理响应，提取纯命令
+        import re as _re
         commands_text = response.strip()
-        # 移除可能的markdown代码块标记
-        import re
-        commands_text = re.sub(r'```[\w]*\n?', '', commands_text)
-        commands_text = re.sub(r'```', '', commands_text)
+        commands_text = _re.sub(r'```[\w]*\n?', '', commands_text)
+        commands_text = _re.sub(r'```', '', commands_text)
         
-        # 按行分割命令
         commands = [line.strip() for line in commands_text.split('\n') 
                    if line.strip() and not line.strip().startswith('//') and not line.strip().startswith('#')]
         
-        return {"status": "ok", "commands": commands, "raw": commands_text}
+        if not commands:
+            return {"status": "error", "message": "AI未生成有效命令"}
+        
+        # 生成嵌入官方GeoGebra Applet的HTML页面（参考WPS云盘生成器方案）
+        import json as _json
+        commands_array = _json.dumps(commands)
+        ggb_dir = HISTORY_DIR / "geogebra"
+        ggb_dir.mkdir(parents=True, exist_ok=True)
+        html_name = f"ggb_{uuid.uuid4().hex[:8]}.html"
+        html_path = ggb_dir / html_name
+        
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>数学图形</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        html, body {{ width: 100%; height: 100%; background: #1A1A2E; overflow: hidden; }}
+        #ggb-container {{ width: 100%; height: 100%; }}
+    </style>
+</head>
+<body>
+    <div id="ggb-container"></div>
+    <script src="https://www.geogebra.org/apps/deployggb.js"></script>
+    <script>
+        const commands = {commands_array};
+        const params = {{
+            "appName": "classic",
+            "width": window.innerWidth,
+            "height": window.innerHeight,
+            "showToolBar": false,
+            "showAlgebraInput": true,
+            "showMenuBar": false,
+            "showResetIcon": true,
+            "enableShiftDragZoom": true,
+            "language": "zh",
+            "borderColor": "#1A1A2E",
+            "bgColor": "#1A1A2E",
+            "perspective": "G",
+            "useBrowserStorage": false
+        }};
+        const applet = new GGBApplet(params, true);
+        applet.inject('ggb-container', 'preferHTML5');
+        // 等待Applet加载完成后逐条执行命令
+        let attempts = 0;
+        function runCommands() {{
+            try {{
+                const api = applet.getAppletObject();
+                if (api) {{
+                    commands.forEach(cmd => {{
+                        try {{ api.evalCommand(cmd); }} catch (e2) {{ console.warn('命令执行失败:', cmd, e2); }}
+                    }});
+                }} else {{
+                    throw new Error('not ready');
+                }}
+            }} catch (e3) {{
+                attempts++;
+                if (attempts < 60) setTimeout(runCommands, 500);
+            }}
+        }}
+        window.addEventListener('load', function() {{ setTimeout(runCommands, 1500); }});
+    </script>
+</body>
+</html>"""
+        html_path.write_text(html_content, encoding='utf-8')
+        
+        return {
+            "status": "ok",
+            "url": f"/static/geogebra/{html_name}",
+            "commands": commands,
+            "raw": commands_text,
+        }
     except Exception as e:
-        # 返回默认示例命令
-        default_commands = [
-            "f(x) = sin(x)",
-            "g(x) = x^2",
-            "A = (0, 0)",
-            "B = (1, 1)",
-            "a = 1",
-            "b = 2",
-        ]
-        return {"status": "ok", "commands": default_commands, "message": f"使用默认图形(生成失败: {str(e)})"}
+        print(f"[GeoGebra] 生成失败: {e}")
+        return {"status": "error", "message": f"图形生成失败: {e}"}
+
+@app.get("/static/geogebra/{filename}")
+async def get_geogebra_file(filename: str):
+    """获取生成的GeoGebra页面"""
+    file_path = HISTORY_DIR / "geogebra" / filename
+    if file_path.exists():
+        return FileResponse(file_path, media_type="text/html")
+    return {"detail": "Not Found"}
 
 # ==================== 工具函数 ====================
 

@@ -14,11 +14,22 @@ class AIService:
             api_key=APIConfig.DEEPSEEK_API_KEY,
             base_url=APIConfig.DEEPSEEK_BASE_URL
         )
+        self.hunyuan_client = OpenAI(
+            api_key=APIConfig.HUNYUAN_API_KEY,
+            base_url=APIConfig.HUNYUAN_BASE_URL
+        )
+        self.hunyuan_model = "hy3-preview"
         self.model = "deepseek-chat"
         self.temperature = AI_MODEL["temperature"]
         self.max_tokens = AI_MODEL["max_tokens"]
     
-    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None) -> Generator[Dict, None, None]:
+    def _get_client(self, engine: Optional[str] = None):
+        """按引擎选择客户端与模型（deepseek / hunyuan），默认deepseek"""
+        if engine == "hunyuan":
+            return self.hunyuan_client, self.hunyuan_model
+        return self.client, self.model
+    
+    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
@@ -47,7 +58,7 @@ class AIService:
     只输出JSON，不要其他内容。"""
         
         messages.append({"role": "user", "content": info_prompt})
-        info_response = self._call_api(messages)
+        info_response = self._call_api(messages, engine=engine)
         question_info = self._parse_json_response(info_response)
         
         yield {"stage": "info", "content": question_info}
@@ -64,7 +75,7 @@ class AIService:
         messages.append({"role": "user", "content": steps_prompt})
         # 流式输出解题思路
         accumulated_steps = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
             accumulated_steps = chunk
             yield {"stage": "steps_chunk", "content": accumulated_steps}
         steps_response = accumulated_steps
@@ -106,7 +117,7 @@ class AIService:
         
         messages.append({"role": "assistant", "content": solution_response})
         messages.append({"role": "user", "content": latex_prompt})
-        latex_response = self._call_api(messages, max_tokens=4000)
+        latex_response = self._call_api(messages, max_tokens=4000, engine=engine)
         
         yield {"stage": "latex_extras", "content": latex_response}
         
@@ -124,7 +135,7 @@ class AIService:
         messages.append({"role": "user", "content": mindmap_prompt})
         # 流式输出思维导图
         accumulated_mindmap = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
             accumulated_mindmap = chunk
             yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
         mindmap_response = accumulated_mindmap
@@ -143,7 +154,7 @@ class AIService:
         
         messages.append({"role": "assistant", "content": mindmap_response})
         messages.append({"role": "user", "content": questions_prompt})
-        questions_response = self._call_api(messages)
+        questions_response = self._call_api(messages, engine=engine)
         suggested_questions = self._parse_json_response(questions_response)
         
         yield {"stage": "questions", "content": suggested_questions}
@@ -152,11 +163,11 @@ class AIService:
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def generate_ai_report(self, stats_summary: str) -> str:
+    def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None) -> str:
         """生成AI版学情报告（非流式，兼容旧调用）"""
-        return "".join(self.generate_ai_report_stream(stats_summary))
+        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine))
 
-    def generate_ai_report_stream(self, stats_summary: str):
+    def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None):
         """生成AI版学情报告（流式，逐步yield累积文本）"""
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
@@ -175,11 +186,11 @@ class AIService:
         ]
         
         accumulated = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
             accumulated = chunk
             yield accumulated
     
-    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None) -> Generator[Dict, None, None]:
+    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
         """
         知识延伸多轮对话
         重点：总结归纳 + 易错点 + 知识拓展 + 延伸问题
@@ -201,7 +212,7 @@ class AIService:
     只输出JSON。"""
         
         messages.append({"role": "user", "content": summary_prompt})
-        info_response = self._call_api(messages)
+        info_response = self._call_api(messages, engine=engine)
         info = self._parse_json_response(info_response)
         yield {"stage": "info", "content": info}
         
@@ -218,7 +229,7 @@ class AIService:
         messages.append({"role": "user", "content": mistakes_prompt})
         # 流式输出易错点详解
         accumulated_mistakes = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
             accumulated_mistakes = chunk
             yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
         mistakes_detail = accumulated_mistakes
@@ -243,7 +254,7 @@ class AIService:
         messages.append({"role": "user", "content": extension_prompt})
         # 流式输出知识拓展
         accumulated_extension = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
             accumulated_extension = chunk
             yield {"stage": "extension_chunk", "content": accumulated_extension}
         extension_content = accumulated_extension
@@ -261,26 +272,76 @@ class AIService:
         
         messages.append({"role": "assistant", "content": extension_content})
         messages.append({"role": "user", "content": questions_prompt})
-        questions_response = self._call_api(messages)
+        questions_response = self._call_api(messages, engine=engine)
         questions = self._parse_json_response(questions_response)
         yield {"stage": "questions", "content": questions}
         
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str) -> str:
-        """多轮对话 - 继续提问"""
+    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> str:
+        """多轮对话 - 继续提问（非流式）"""
+        messages.append({"role": "system", "content": "直接回答用户的最新问题本身，输出自然语言。禁止输出JSON格式，禁止生成新的问题列表。"})
         messages.append({"role": "user", "content": user_question})
-        return self._call_api(messages)
+        return self._call_api(messages, engine=engine)
+
+    def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> Generator[str, None, None]:
+        """多轮对话 - 继续提问（流式，逐chunk累积文本）"""
+        messages.append({"role": "system", "content": "直接回答用户的最新问题本身，输出自然语言。禁止输出JSON格式，禁止生成新的问题列表。"})
+        messages.append({"role": "user", "content": user_question})
+        accumulated = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+            accumulated = chunk
+            yield accumulated
+
+    def generate_response(self, prompt: str, engine: Optional[str] = None) -> str:
+        """通用单轮生成（GeoGebra命令等）"""
+        messages = [
+            {"role": "system", "content": "你是一个GeoGebra命令生成专家，直接输出可以在GeoGebra输入栏中执行的命令，每行一个命令，不要任何解释文字。"},
+            {"role": "user", "content": prompt},
+        ]
+        return self._call_api(messages, max_tokens=2000, engine=engine)
+
+    def fix_latex(self, latex_code: str, error_text: str, engine: Optional[str] = None) -> str:
+        """LaTeX编译失败时，把关键报错发给AI修复代码"""
+        prompt = f"""以下LaTeX/TikZ代码编译失败，请修复它。
+
+代码：
+```latex
+{latex_code}
+```
+
+编译报错（关键信息）：
+```
+{error_text[:500]}
+```
+
+要求：
+1. 只输出修复后的完整LaTeX代码（放在```latex代码块中），不要任何解释文字
+2. 保持图形的意图不变
+3. 如果错误是缺少宏包，请添加需要的\\usepackage"""
+        messages = [
+            {"role": "system", "content": "你是LaTeX/TikZ绘图代码修复专家。"},
+            {"role": "user", "content": prompt},
+        ]
+        response = self._call_api(messages, max_tokens=3000, engine=engine) or ""
+        m = re.search(r'```latex\s*\n(.*?)\n```', response, re.DOTALL)
+        if m:
+            response = m.group(1)
+        else:
+            response = re.sub(r'```[\w]*\n?', '', response)
+            response = re.sub(r'```', '', response)
+        return response.strip()
     
-    def _call_api(self, messages, max_tokens=None):
+    def _call_api(self, messages, max_tokens=None, engine=None):
         """调用AI API (非流式)"""
-        print(f"[AI] 调用API，模型={self.model}，消息数={len(messages)}")
+        client, model = self._get_client(engine)
+        print(f"[AI] 调用API，引擎={engine or 'deepseek'}，模型={model}，消息数={len(messages)}")
         for attempt in range(3):
             try:
                 print(f"[AI] 尝试 {attempt + 1}/3...")
-                response = self.client.chat.completions.create(
-                    model=self.model,
+                response = client.chat.completions.create(
+                    model=model,
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
@@ -296,7 +357,7 @@ class AIService:
                 time.sleep(1)
         return ""
     
-    def _call_api_streaming(self, messages, max_tokens=None):
+    def _call_api_streaming(self, messages, max_tokens=None, engine=None):
         """
         调用AI API (流式) - 逐chunk生成
         用于实现实时流式输出体验
@@ -304,12 +365,13 @@ class AIService:
         Yields:
             str: 每个chunk的文本内容
         """
-        print(f"[AI-Stream] 开始流式调用，模型={self.model}，消息数={len(messages)}")
+        client, model = self._get_client(engine)
+        print(f"[AI-Stream] 开始流式调用，引擎={engine or 'deepseek'}，模型={model}，消息数={len(messages)}")
         for attempt in range(3):
             try:
                 print(f"[AI-Stream] 尝试 {attempt + 1}/3...")
-                response = self.client.chat.completions.create(
-                    model=self.model,
+                response = client.chat.completions.create(
+                    model=model,
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
