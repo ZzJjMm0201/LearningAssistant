@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -193,6 +194,10 @@ class MainViewModel : ViewModel() {
     val masteryVisible = MutableStateFlow(false)
     val masterySaved = MutableStateFlow(false)
     val masteryLevel = MutableStateFlow("")
+    // 解题阶段进度（右上角显示，如“阶段 3/6 · 完整解析”）
+    val solveProgress = MutableStateFlow("")
+    // GeoGebra生成中（需要锁屏等待AI回复）
+    val isGeneratingGeoGebra = MutableStateFlow(false)
     // GeoGebra：生成该题的交互式数学图形
     val geoGebraUrl = MutableStateFlow("")
     private var lastPhotoFile: java.io.File? = null
@@ -242,6 +247,7 @@ class MainViewModel : ViewModel() {
 
     fun initApiService(context: android.content.Context) {
         apiService.init(context)
+        showWelcomeDialog.value = !apiService.isWelcomeDismissed()
         if (apiService.isLoggedIn()) {
             _isLoggedIn.value = true
             _loggedInUsername.value = apiService.getUsername() ?: ""
@@ -463,7 +469,6 @@ class MainViewModel : ViewModel() {
     fun handleVoiceCommand(text: String) {
         when {
             text.contains("不会") || text.contains("拍照") || text.contains("解题") -> {
-                // Feature 10: 语音识别确认弹窗
                 showOcrConfirmDialog.value = true
                 ocrConfirmText.value = "识别到语音指令：$text"
                 ocrConfirmTitle.value = "语音识别确认"
@@ -634,8 +639,14 @@ class MainViewModel : ViewModel() {
                                 val stage = json.optString("stage", "")
 
                                 when (stage) {
-                                    "info" ->
-                                            _statusText.value = json.optString("content", "处理中...")
+                                    "info" -> {
+                                        _statusText.value = json.optString("content", "处理中...")
+                                        val infoText = json.optString("content", "")
+                                        // LaTeX图解阶段提示（右上角进度）
+                                        if (infoText.contains("图解") || infoText.contains("渲染")) {
+                                            solveProgress.value = "阶段 4/6 · LaTeX图解"
+                                        }
+                                    }
                                     "ocr_complete" -> {
                                         // 服务端content为{"text":...}对象，需取text字段，避免把JSON显示给用户
                                         val ocrObj = json.optJSONObject("content")
@@ -653,9 +664,13 @@ class MainViewModel : ViewModel() {
                                                         ocrText = ocrText
                                                 )
                                     }
-                                    "search_complete" -> _statusText.value = "AI正在分析..."
+                                    "search_complete" -> {
+                                        solveProgress.value = "阶段 1/6 · 搜索题库"
+                                        _statusText.value = "AI正在分析..."
+                                    }
                                     "question_info" -> {
                                         _statusText.value = "正在生成解题思路..."
+                                        solveProgress.value = "阶段 1/6 · AI分析题目"
                                         // 记录学科，用于GeoGebra入口（仅数学题可用）
                                         subject = json.optJSONObject("content")?.optString("subject", "") ?: ""
                                     }
@@ -679,6 +694,7 @@ class MainViewModel : ViewModel() {
                                     }
                                     "solution_steps" -> {
                                         solutionSteps = extractStepsText(json.optString("content", ""))
+                                        solveProgress.value = "阶段 2/6 · 解题思路"
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_STEPS,
@@ -708,6 +724,7 @@ class MainViewModel : ViewModel() {
                                     }
                                     "solution", "solution_rendered" -> {
                                         fullSolution = json.optString("content", "")
+                                        solveProgress.value = if (stage == "solution_rendered") "阶段 4/6 · 渲染完成" else "阶段 3/6 · 完整解析"
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_FULL,
@@ -738,6 +755,7 @@ class MainViewModel : ViewModel() {
                                     }
                                     "mindmap" -> {
                                         mindMap = formatMindMap(json.optString("content", ""))
+                                        solveProgress.value = "阶段 5/6 · 思维导图"
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.DISPLAY_MINDMAP,
@@ -769,6 +787,7 @@ class MainViewModel : ViewModel() {
                                         }
                                         suggestedQA = qaItems
                                         if (qStrings.isNotEmpty()) suggestedQuestions = qStrings
+                                        solveProgress.value = "阶段 6/6 · 预判问题"
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.INTERACTIVE,
@@ -783,6 +802,7 @@ class MainViewModel : ViewModel() {
                                                 )
                                     }
                                     "complete" -> {
+                                        solveProgress.value = ""
                                         _appState.value =
                                                 AppState.Solving(
                                                         stage = SolveStage.COMPLETED,
@@ -890,9 +910,13 @@ class MainViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                withContext(Dispatchers.Main) { _statusText.value = "正在生成数学图形..." }
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "正在生成数学图形..."
+                    isGeneratingGeoGebra.value = true
+                }
                 val resp = apiService.generateGeoGebra(ocrText)
                 withContext(Dispatchers.Main) {
+                    isGeneratingGeoGebra.value = false
                     if (resp.status == "ok" && resp.url.isNotEmpty()) {
                         geoGebraUrl.value = "${apiService.getBaseUrl()}${resp.url}"
                         showGeoGebraScreen.value = true
@@ -901,7 +925,10 @@ class MainViewModel : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { _statusText.value = "图形生成失败: ${e.message}" }
+                withContext(Dispatchers.Main) {
+                    isGeneratingGeoGebra.value = false
+                    _statusText.value = "图形生成失败: ${e.message}"
+                }
             }
         }
     }
@@ -1752,7 +1779,10 @@ fun MainScreen(
         }
 
         if (showWelcome) {
-            WelcomeDialog(onDismiss = { viewModel.showWelcomeDialog.value = false })
+            WelcomeDialog(
+                    onDismiss = { viewModel.showWelcomeDialog.value = false },
+                    viewModel = viewModel
+            )
         }
 
         if (showSettings) {
@@ -2234,6 +2264,7 @@ fun SolvingScreen(
 ) {
     Box(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
         val solvingFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
+        val solveProgress by (viewModel?.solveProgress ?: MutableStateFlow("")).collectAsState()
         var questionInput by remember { mutableStateOf("") }
         Column(
                 modifier =
@@ -2262,6 +2293,15 @@ fun SolvingScreen(
                         color = Color.White,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f),
+                        textAlign = TextAlign.Center
+                )
+                // ① 右上角阶段进度提示（LaTeX生成/渲染时用户能看到AI正在做什么）
+                Text(
+                        text = solveProgress,
+                        color = Color(0xFF00D2FF),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
                 )
             }
 
@@ -2457,7 +2497,7 @@ fun SolvingScreen(
                     OutlinedTextField(
                             value = questionInput,
                             onValueChange = { questionInput = it },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).height(46.dp),
                             placeholder = { Text("输入你的问题，与AI继续对话...", color = Color.Gray, fontSize = 13.sp) },
                             textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
                             colors = OutlinedTextFieldDefaults.colors(
@@ -2547,9 +2587,10 @@ fun SolvingScreen(
             Spacer(modifier = Modifier.height(32.dp))
         }
 
-        // Feature 3: 提问时的loading遮罩
-        if (isAskingQuestion) {
-            LoadingOverlay("正在获取回答...")
+        // ③ GeoGebra生成时锁屏等待AI回复（② 追问已流式输出，不再锁屏）
+        val isGeneratingGeoGebra by (viewModel?.isGeneratingGeoGebra ?: MutableStateFlow(false)).collectAsState()
+        if (isGeneratingGeoGebra) {
+            LoadingOverlay("正在生成数学图形...")
         }
     }
 }
@@ -3564,30 +3605,61 @@ fun LoadingOverlay(message: String = "处理中...") {
 }
 
 @Composable
-fun WelcomeDialog(onDismiss: () -> Unit) {
+fun WelcomeDialog(onDismiss: () -> Unit, viewModel: MainViewModel) {
+    var dontShowAgain by remember { mutableStateOf(false) }
     AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text("👢 欢迎使用学习助手 2.1", color = Color.White) },
+            title = { Text("👋 欢迎使用学习助手 2.1", color = Color.White) },
             text = {
-                Text(
-                        """📗 使用说明：
-                
-🖐️ 手势操作（在主页伸出对应手指并保持1秒）：
-  · 5指 → AI解题
-  · 4指 → AI动画
-  · 3指 → 数据报告
-  · 2指 → AI报告
+                Column {
+                    Text(
+                            """📗 使用说明：
+
+📷 拍题解题流程：
+  1. 将题目放入取景框（手离开摄像头）拍照
+  2. 自动OCR识别 → 确认/修改识别结果
+  3. AI 分步解题（思路/解析/图解/导图）
+  4. 可追问、查看GeoGebra图形、记录掌握程度
+
+🖐️ 手势操作（主页伸出对应手指保持1秒）：
+  · 5指 → AI解题    · 4指 → AI动画
+  · 3指 → 数据报告  · 2指 → AI报告
   · 1指 → 知识延伸
 
 📋 也可直接点击按钮触发功能
 
-⚠️ 拍照前请将手移开摄像头
-⚙️ 更多设置在右上角""",
-                        color = Color.White.copy(alpha = 0.9f),
-                        fontSize = 14.sp
-                )
+📚 历史记录：查看原题图片/完整解析（含LaTeX图）、
+  按学科筛选、删除（服务端移入回收站）
+
+⚙️ 更多设置（服务器地址/字体/模块显示）在右上角
+⚠️ 拍照前请将手移开摄像头""",
+                            color = Color.White.copy(alpha = 0.9f),
+                            fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                            modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { dontShowAgain = !dontShowAgain },
+                            verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                                checked = dontShowAgain,
+                                onCheckedChange = { dontShowAgain = it },
+                                colors = CheckboxDefaults.colors(checkedColor = Color(0xFF00D2FF))
+                        )
+                        Text("不再提醒", color = Color.White, fontSize = 14.sp)
+                    }
+                }
             },
-            confirmButton = { Button(onClick = onDismiss) { Text("开始使用") } },
+            confirmButton = {
+                Button(onClick = {
+                    if (dontShowAgain) {
+                        viewModel.apiService.setWelcomeDismissed(true)
+                    }
+                    onDismiss()
+                }) { Text("开始使用") }
+            },
             containerColor = Color(0xFF16213E)
     )
 }
@@ -3614,6 +3686,8 @@ fun HistoryViewScreen(
     var selectedIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var isDeleting by remember { mutableStateOf(false) }
     var dateError by remember { mutableStateOf("") }
+    // 清除全部确认框
+    var showClearConfirm by remember { mutableStateOf(false) }
     // 学科筛选器（空=全部）
     var subjectFilter by remember { mutableStateOf("") }
     
@@ -3753,7 +3827,7 @@ fun HistoryViewScreen(
             OutlinedTextField(
                 value = historyStartDate,
                 onValueChange = { viewModel.historyStartDate.value = it; dateError = "" },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).height(44.dp),
                 placeholder = { Text("开始日期 (2026-01-01)", color = Color.Gray, fontSize = 12.sp) },
                 singleLine = true,
                 isError = dateError.isNotEmpty(),
@@ -3764,7 +3838,7 @@ fun HistoryViewScreen(
             OutlinedTextField(
                 value = historyEndDate,
                 onValueChange = { viewModel.historyEndDate.value = it; dateError = "" },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).height(44.dp),
                 placeholder = { Text("截止日期 (2026-12-31)", color = Color.Gray, fontSize = 12.sp) },
                 singleLine = true,
                 isError = dateError.isNotEmpty(),
@@ -3894,10 +3968,11 @@ fun HistoryViewScreen(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    items(filteredRecords, key = { it.id }) { record ->
+                    itemsIndexed(filteredRecords, key = { _, it -> it.id }) { index, record ->
                         HistoryRecordCard(
                             record = record,
                             serverAddress = serverAddress,
+                            displayIndex = index + 1,
                             isSelectMode = isSelectMode,
                             isSelected = selectedIds.contains(record.id),
                             onClick = {
@@ -3927,7 +4002,17 @@ fun HistoryViewScreen(
                         .padding(12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // 使用服务端返回的真实总数/学科数（列表仅展示前50条，但统计全量）
+                    // 选择模式下左侧只显示已选数量，避免长文本压缩右侧按钮（⑧）
+                    if (isSelectMode) {
+                        Text(
+                                "已选 ${selectedIds.size} 项",
+                                color = Color(0xFF00D2FF),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                    } else {
+                    // 使用服务端返回的真实总数/学科数
                     val displayTotal = if (totalCount > 0) totalCount else records.size
                     val displaySubjects = if (subjectCount > 0) subjectCount
                     else records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size
@@ -3939,6 +4024,7 @@ fun HistoryViewScreen(
                         fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.CenterVertically)
                     )
+                    }
                     
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
@@ -3958,13 +4044,7 @@ fun HistoryViewScreen(
                         }
                         
                         Button(
-                            onClick = {
-                                android.widget.Toast.makeText(context, "正在清除...", android.widget.Toast.LENGTH_SHORT).show()
-                                viewModel.clearHistory()
-                                Handler(Looper.getMainLooper()).postDelayed({
-                                    loadHistory()
-                                }, 500)
-                            },
+                            onClick = { showClearConfirm = true },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
                         ) {
                             Text("🗑️ 清除全部", color = Color.White, fontSize = 12.sp)
@@ -3974,6 +4054,38 @@ fun HistoryViewScreen(
                 }
             }
         }
+        
+        // ⑧ 清除全部确认框
+        if (showClearConfirm) {
+            AlertDialog(
+                    onDismissRequest = { showClearConfirm = false },
+                    title = { Text("确认清除全部？", color = Color.White) },
+                    text = {
+                        Text(
+                                "将删除当前日期范围内的所有历史记录，\n服务端文件会移入回收站，此操作不可恢复。",
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 14.sp
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                                onClick = {
+                                    showClearConfirm = false
+                                    android.widget.Toast.makeText(context, "正在清除...", android.widget.Toast.LENGTH_SHORT).show()
+                                    viewModel.clearHistory()
+                                    Handler(Looper.getMainLooper()).postDelayed({
+                                        loadHistory()
+                                    }, 500)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                        ) { Text("确认清除", color = Color.White) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showClearConfirm = false }) { Text("取消", color = Color.Gray) }
+                    },
+                    containerColor = Color(0xFF16213E)
+            )
+        }
     }
 }
 
@@ -3981,6 +4093,7 @@ fun HistoryViewScreen(
 fun HistoryRecordCard(
     record: ApiService.HistoryRecord,
     serverAddress: String = "10.100.55.231:8000",
+    displayIndex: Int = 0,
     isSelectMode: Boolean = false,
     isSelected: Boolean = false,
     onClick: () -> Unit,
@@ -4070,7 +4183,7 @@ fun HistoryRecordCard(
                             }
                         }
                     }
-                    Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 11.sp)
+                    Text("#$displayIndex", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 11.sp)
                 }
                 
                 Spacer(modifier = Modifier.height(6.dp))
@@ -4167,6 +4280,85 @@ fun HistoryDetailScreen(
     // Feature 17: 展开/收起状态
     var showSolutionSteps by remember { mutableStateOf(true) }
     var showFullSolution by remember { mutableStateOf(false) }
+    // ⑦ 识别文本折叠
+    var showOcrText by remember { mutableStateOf(false) }
+    // ⑥ 完整解析（首次打开时按需把LaTeX代码块渲染成图片）
+    var detailFullSolution by remember { mutableStateOf(record.fullSolution) }
+    var renderingLatex by remember { mutableStateOf(false) }
+    // ⑥ 掌握程度（读取当时AI解答记录的选项，可修改）
+    var detailMastery by remember { mutableStateOf(record.masteryLevel) }
+    var savingMastery by remember { mutableStateOf(false) }
+    // ⑥ 历史详情追问（流式）
+    var historyQa by remember { mutableStateOf<List<QAItem>>(emptyList()) }
+    var askInput by remember { mutableStateOf("") }
+    var pendingAsk by remember { mutableStateOf("") }
+    var isAsking by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    
+    // 打开详情时：若完整解析含LaTeX代码块，请求服务端渲染为图片（本地编译并缓存）
+    LaunchedEffect(record.id) {
+        if (record.fullSolution.contains("```")) {
+            renderingLatex = true
+            val rendered = viewModel?.apiService?.renderHistoryRecord(record.id) ?: ""
+            if (rendered.isNotEmpty()) detailFullSolution = rendered
+            renderingLatex = false
+        }
+    }
+    
+    // ⑥ 详情页追问：流式回答直接显示在气泡中
+    fun sendHistoryAsk() {
+        val q = askInput.trim()
+        val vm = viewModel
+        if (q.isEmpty() || isAsking || vm == null || record.sessionId.isEmpty()) return
+        askInput = ""
+        isAsking = true
+        pendingAsk = ""
+        val sb = StringBuilder()
+        vm.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                vm.apiService.askQuestionStream(record.sessionId, q) { chunk ->
+                    appendStreamDelta(sb, chunk)
+                    pendingAsk = sb.toString()
+                }
+                withContext(Dispatchers.Main) {
+                    historyQa = historyQa + QAItem(q, sb.toString())
+                    pendingAsk = ""
+                    isAsking = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    pendingAsk = ""
+                    isAsking = false
+                    Toast.makeText(context, "提问失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+    
+    // ⑥ 详情页修改掌握程度
+    fun saveDetailMastery(level: String) {
+        val vm = viewModel
+        if (savingMastery || vm == null || record.sessionId.isEmpty()) return
+        savingMastery = true
+        vm.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                vm.apiService.saveMastery(record.sessionId, level)
+                withContext(Dispatchers.Main) {
+                    detailMastery = when (level) {
+                        "completely_mastered" -> "完全掌握"
+                        "partially_mastered" -> "部分掌握"
+                        else -> "完全没掌握"
+                    }
+                    savingMastery = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    savingMastery = false
+                    Toast.makeText(context, "保存失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
     
     Column(
         modifier = Modifier
@@ -4230,7 +4422,7 @@ fun HistoryDetailScreen(
                                 Text(record.grade, color = Color(0xFF7B2FBE), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             }
                             if (record.subject.isNotEmpty()) {
-                                Text("📉 学科:", color = Color.Gray, fontSize = 13.sp)
+                                Text("\n📉 学科:", color = Color.Gray, fontSize = 13.sp)
                                 Text(record.subject, color = Color(0xFF2196F3), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             }
                         }
@@ -4255,20 +4447,22 @@ fun HistoryDetailScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("🔖 知识点", color = Color.Gray, fontSize = 13.sp)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        // ⑦ 每个知识点单独一行，避免挤在一行导致最后一个变成竖条
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             record.knowledgePoints.forEach { kp ->
                                 Surface(
                                     color = Color(0xFF00D2FF).copy(alpha = 0.15f),
-                                    shape = RoundedCornerShape(4.dp)
+                                    shape = RoundedCornerShape(4.dp),
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text(
                                         kp,
                                         color = Color(0xFF00D2FF),
-                                        fontSize = 11.sp,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                                     )
                                 }
                             }
@@ -4304,14 +4498,25 @@ fun HistoryDetailScreen(
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                         }
-                        // 保留OCR文本（供核对）
-                        Text(
-                            "📝 识别文本：",
-                            color = Color.Gray,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(bottom = 4.dp)
-                        )
-                        Text(cleanHtmlText(record.ocrText), color = Color.White, fontSize = 13.sp)
+                        // ⑦ 识别文本可折叠（与“解题思路/完整解析”一致）
+                        Row(
+                                modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { showOcrText = !showOcrText },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("📝 识别文本", color = Color.Gray, fontSize = 13.sp)
+                            Text(
+                                    if (showOcrText) "▲ 收起" else "▼ 展开",
+                                    color = Color(0xFF00D2FF),
+                                    fontSize = 12.sp
+                            )
+                        }
+                        if (showOcrText) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(cleanHtmlText(record.ocrText), color = Color.White, fontSize = 13.sp)
+                        }
                     }
                 }
             }
@@ -4355,9 +4560,21 @@ fun HistoryDetailScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         
                         if (showFullSolution) {
-                            MarkdownView(content = record.fullSolution, fontSize = 14f)
+                            if (renderingLatex) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(
+                                            color = Color(0xFF7B2FBE),
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("正在渲染LaTeX图片...", color = Color.Gray, fontSize = 13.sp)
+                                }
+                            } else {
+                                MarkdownView(content = detailFullSolution, fontSize = 14f)
+                            }
                         } else {
-                            Text(plainPreview(record.fullSolution, 30), color = Color.White, fontSize = 13.sp)
+                            Text(plainPreview(detailFullSolution, 30), color = Color.White, fontSize = 13.sp)
                         }
                         
                         TextButton(
@@ -4369,6 +4586,148 @@ fun HistoryDetailScreen(
                                 color = Color(0xFF7B2FBE),
                                 fontSize = 13.sp
                             )
+                        }
+                    }
+                }
+            }
+            
+            // ⑥ 掌握程度（读取当时AI解答时的选项，可点击修改）
+            if (record.sessionId.isNotEmpty()) {
+                Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                        shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("📊 掌握程度", color = Color(0xFF4CAF50), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        if (detailMastery.isNotEmpty()) {
+                            Text(
+                                    "✅ 已记录：$detailMastery（点击可修改）",
+                                    color = Color(0xFF4CAF50),
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                        }
+                        Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                    onClick = { saveDetailMastery("completely_mastered") },
+                                    enabled = !savingMastery,
+                                    modifier = Modifier.weight(1f).height(40.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (detailMastery == "完全掌握") Color(0xFF2E7D32) else Color(0xFF4CAF50)
+                                    )
+                            ) { Text("✅ 完全掌握", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                            Button(
+                                    onClick = { saveDetailMastery("partially_mastered") },
+                                    enabled = !savingMastery,
+                                    modifier = Modifier.weight(1f).height(40.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (detailMastery == "部分掌握") Color(0xFFE65100) else Color(0xFFFF9800)
+                                    )
+                            ) { Text("⚠️ 部分掌握", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                            Button(
+                                    onClick = { saveDetailMastery("not_mastered") },
+                                    enabled = !savingMastery,
+                                    modifier = Modifier.weight(1f).height(40.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (detailMastery == "完全没掌握") Color(0xFFC62828) else Color(0xFFF44336)
+                                    )
+                            ) { Text("❌ 没掌握", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                        }
+                    }
+                }
+            }
+            
+            // ⑥ 历史详情追问（与AI解答同款流式气泡）
+            if (record.sessionId.isNotEmpty()) {
+                Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                        shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("💬 追问本题", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        
+                        historyQa.forEach { item ->
+                            Spacer(modifier = Modifier.height(8.dp))
+                            // 用户问题（右对齐）
+                            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+                                Surface(
+                                        color = Color(0xFF1E3A5F),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.widthIn(max = 280.dp)
+                                ) {
+                                    Text(
+                                            item.question,
+                                            color = Color.White,
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            // AI回答（左对齐）
+                            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+                                Surface(
+                                        color = Color(0xFF2D2D44),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.widthIn(max = 320.dp)
+                                ) {
+                                    Text(
+                                            item.answer,
+                                            color = Color(0xFFE0E0E0),
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                        
+                        if (pendingAsk.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+                                Surface(
+                                        color = Color(0xFF2D2D44),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.widthIn(max = 320.dp)
+                                ) {
+                                    Text(
+                                            pendingAsk,
+                                            color = Color(0xFFE0E0E0),
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                        }
+                        
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                    value = askInput,
+                                    onValueChange = { askInput = it },
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    placeholder = { Text("输入你的问题...", color = Color.Gray, fontSize = 13.sp) },
+                                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                            focusedBorderColor = Color(0xFF00D2FF),
+                                            unfocusedBorderColor = Color(0xFF2D2D44),
+                                            cursorColor = Color(0xFF00D2FF)
+                                    ),
+                                    singleLine = true,
+                                    enabled = !isAsking
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                    onClick = { sendHistoryAsk() },
+                                    enabled = askInput.isNotBlank() && !isAsking,
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                            ) { Text("发送", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                         }
                     }
                 }

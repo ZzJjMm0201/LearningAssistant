@@ -29,7 +29,17 @@ class DiscoveryService:
     
     @staticmethod
     def _get_local_ip() -> str:
-        """自动获取本机局域网 IP"""
+        """获取本机局域网IP（优先读取项目根目录 server_ip.txt，用户可手动指定）"""
+        try:
+            from pathlib import Path
+            ip_file = Path(__file__).resolve().parent.parent.parent / "server_ip.txt"
+            if ip_file.exists():
+                content = ip_file.read_text(encoding="utf-8").strip()
+                ip = content.split(":")[0].strip()
+                if ip:
+                    return ip
+        except Exception:
+            pass
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))

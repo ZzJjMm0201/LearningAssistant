@@ -17,6 +17,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
     companion object {
         private const val PREFS_NAME = "learning_assistant_prefs"
+        private const val KEY_SERVER_ADDRESS = "server_address"
+        private const val KEY_WELCOME_DISMISSED = "welcome_dismissed"
         private const val KEY_TOKEN = "auth_token"
         private const val KEY_USERNAME = "auth_username"
     }
@@ -30,6 +32,20 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     fun init(context: Context) {
         sharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         authToken = sharedPreferences?.getString(KEY_TOKEN, null)
+        // 服务端地址：优先用户已保存的地址，其次 assets/server_ip.txt（随项目 server_ip.txt 打包），最后默认值
+        val saved = sharedPreferences?.getString(KEY_SERVER_ADDRESS, null)
+        if (!saved.isNullOrEmpty()) {
+            BASE_URL = saved
+        } else {
+            val assetIp = try {
+                context.assets.open("server_ip.txt").bufferedReader().use { it.readText() }.trim()
+            } catch (e: Exception) {
+                ""
+            }
+            if (assetIp.isNotEmpty()) {
+                BASE_URL = if (assetIp.startsWith("http")) assetIp else "http://$assetIp"
+            }
+        }
     }
 
     /**
@@ -42,6 +58,16 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
      */
     fun updateServerAddress(address: String) {
         BASE_URL = address
+        sharedPreferences?.edit()?.putString(KEY_SERVER_ADDRESS, address)?.apply()
+    }
+
+    /**
+     * 是否已勾选“欢迎提示不再提醒”
+     */
+    fun isWelcomeDismissed(): Boolean = sharedPreferences?.getBoolean(KEY_WELCOME_DISMISSED, false) ?: false
+
+    fun setWelcomeDismissed(v: Boolean) {
+        sharedPreferences?.edit()?.putBoolean(KEY_WELCOME_DISMISSED, v)?.apply()
     }
 
     /**
@@ -406,6 +432,24 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         }
     }
 
+    suspend fun renderHistoryRecord(recordId: Int): String {
+        return withContext(Dispatchers.IO) {
+            try {
+                val body = "{}".toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("$BASE_URL/history/render/$recordId")
+                    .post(body)
+                    .withAuth()
+                    .build()
+                val response = client.newCall(request).execute()
+                val respJson = JSONObject(response.body?.string() ?: "{}")
+                respJson.optString("full_solution", "")
+            } catch (e: Exception) {
+                ""
+            }
+        }
+    }
+
     data class HistoryResult(
         val records: List<HistoryRecord>,
         val totalCount: Int,
@@ -433,6 +477,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
                 HistoryRecord(
                     id = obj.optInt("id"),
+                    sessionId = obj.optString("session_id", ""),
                     timestamp = obj.optString("timestamp"),
                     ocrText = obj.optString("ocr_text"),
                     questionInfoRaw = obj.optString("question_info_raw"),
@@ -443,6 +488,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                     solutionSteps = obj.optString("solution_steps"),
                     fullSolution = obj.optString("full_solution"),
                     imageUrl = obj.optString("image_url", ""),
+                    masteryLevel = obj.optString("mastery_level", ""),
                 )
             }
             HistoryResult(
@@ -455,6 +501,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
     data class HistoryRecord(
         val id: Int,
+        val sessionId: String = "",
         val timestamp: String,
         val ocrText: String = "",
         val questionInfoRaw: String = "",
@@ -465,6 +512,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         val solutionSteps: String = "",
         val fullSolution: String = "",
         val imageUrl: String = "",
+        val masteryLevel: String = "",
     )
 
     data class AuthResult(val token: String, val user: AuthUser)

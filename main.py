@@ -484,14 +484,13 @@ async def get_history(request: Request, body: dict):
         else:
             query = query.filter(SubmissionRecord.user_id.is_(None))
         
-        # 先用全量查询统计真实总数/学科数，再截断返回前50条（总数统计不随截断失真）
-        total_count = query.count()
+        # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”）
         all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
-        records = all_records[:50]
+        total_count = len(all_records)
         
         result = []
         all_subjects = set()
-        # 学科统计基于全量记录，而非截断后的50条
+        # 学科统计基于全量记录
         for r in all_records:
             subj = ""
             qi = r.question_info
@@ -504,11 +503,15 @@ async def get_history(request: Request, body: dict):
             if subj:
                 all_subjects.add(subj)
         
-        for r in records:
-            # 清理OCR文本中的图片链接
+        # 图片URL统一重写到当前请求Host（LaTeX图/原图均指向当前服务地址）
+        host = get_request_host(request)
+        
+        for r in all_records:
+            # 清理OCR文本中的图片链接（仅OCR文本清理）
             clean_ocr = cleanup_markdown_images(r.ocr_text) if r.ocr_text else ""
             clean_steps = cleanup_markdown_images(r.solution_steps) if r.solution_steps else ""
-            clean_solution = cleanup_markdown_images(r.full_solution) if r.full_solution else ""
+            # 完整解析保留LaTeX图片标记，仅把图片URL重写到当前服务地址
+            clean_solution = rewrite_static_urls(r.full_solution, host) if r.full_solution else ""
             
             # 提取年级学科信息
             grade = ""
@@ -531,16 +534,31 @@ async def get_history(request: Request, body: dict):
             if subject:
                 all_subjects.add(subject)
             
-            # 生成原图URL
+            # 原图URL；显示时间优先使用原图文件的修改时间（即文件“属性”里的日期，本地时区）
             image_url = ""
+            display_ts = ""
             if r.original_image_path:
                 image_path = Path(r.original_image_path)
                 if image_path.exists():
                     image_url = f"/static/{image_path.name}"
+                    display_ts = datetime.fromtimestamp(image_path.stat().st_mtime).isoformat()
+            if not display_ts and r.timestamp is not None:
+                display_ts = (r.timestamp + local_offset).isoformat()
+            
+            # 掌握程度（读取 mastery_records 下按 session_id 保存的选项）
+            mastery_label = ""
+            mf = HISTORY_DIR / "mastery_records" / f"{r.session_id}.json"
+            if mf.exists():
+                try:
+                    mj = json.loads(mf.read_text(encoding="utf-8"))
+                    mastery_label = _MASTERY_LABELS.get(mj.get("mastery_level", ""), "")
+                except Exception:
+                    pass
             
             result.append({
                 "id": r.id,
-                "timestamp": (r.timestamp + local_offset).isoformat() if r.timestamp is not None else "",
+                "session_id": r.session_id or "",
+                "timestamp": display_ts,
                 "ocr_text": clean_ocr,
                 "question_info_raw": json.dumps(question_info, ensure_ascii=False) if isinstance(question_info, dict) else str(question_info),
                 "grade": grade,
@@ -550,6 +568,7 @@ async def get_history(request: Request, body: dict):
                 "solution_steps": clean_steps,
                 "full_solution": clean_solution,
                 "image_url": image_url,
+                "mastery_level": mastery_label,
             })
         
         return {
@@ -563,26 +582,29 @@ async def get_history(request: Request, body: dict):
 
 @app.delete("/history")
 async def clear_history(request: Request):
-    """清除历史记录（仅本人记录；未登录时仅清空无主数据）"""
+    """清除历史记录（仅本人记录；未登录时仅清空无主数据）；文件移入回收站而非硬删"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
         from sqlalchemy import or_
         user_id = get_current_user(request)
         if user_id is not None:
-            db.query(SubmissionRecord).filter(
+            records = db.query(SubmissionRecord).filter(
                 or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
-            ).delete(synchronize_session=False)
+            ).all()
         else:
-            db.query(SubmissionRecord).filter(SubmissionRecord.user_id.is_(None)).delete(synchronize_session=False)
+            records = db.query(SubmissionRecord).filter(SubmissionRecord.user_id.is_(None)).all()
+        for rec in records:
+            _move_record_files_to_recycle_bin(rec)
+            db.delete(rec)
         db.commit()
-        return {"status": "ok", "message": "历史记录已清除"}
+        return {"status": "ok", "message": f"历史记录已清除（{len(records)} 条，文件已移入回收站）"}
     finally:
         db.close()
 
 @app.delete("/history/{record_id}")
 async def delete_history_record(record_id: int, request: Request):
-    """删除单条历史记录（校验归属）"""
+    """删除单条历史记录（校验归属）；文件移入回收站"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
@@ -593,15 +615,16 @@ async def delete_history_record(record_id: int, request: Request):
         # 未登录只能删公共(NULL)记录；登录用户只能删自己的记录
         if record.user_id is not None and (user_id is None or record.user_id != user_id):
             raise HTTPException(status_code=403, detail="无权删除他人的记录")
+        _move_record_files_to_recycle_bin(record)
         db.delete(record)
         db.commit()
-        return {"status": "ok", "message": f"记录 {record_id} 已删除"}
+        return {"status": "ok", "message": f"记录 {record_id} 已删除（文件已移入回收站）"}
     finally:
         db.close()
 
 @app.post("/history/batch-delete")
 async def batch_delete_history(request: Request, body: dict):
-    """批量删除历史记录（校验归属）"""
+    """批量删除历史记录（校验归属）；文件移入回收站"""
     db = SessionLocal()
     try:
         from server.database.models import SubmissionRecord
@@ -617,9 +640,43 @@ async def batch_delete_history(request: Request, body: dict):
             )
         else:
             query = query.filter(SubmissionRecord.user_id.is_(None))
-        deleted = query.delete(synchronize_session=False)
+        records = query.all()
+        for rec in records:
+            _move_record_files_to_recycle_bin(rec)
+            db.delete(rec)
         db.commit()
-        return {"status": "ok", "message": f"已删除 {deleted} 条记录", "deleted_count": deleted}
+        return {"status": "ok", "message": f"已删除 {len(records)} 条记录（文件已移入回收站）", "deleted_count": len(records)}
+    finally:
+        db.close()
+
+@app.post("/history/render/{record_id}")
+async def render_history_record(record_id: int, request: Request):
+    """把历史记录的完整解析中的LaTeX代码块渲染为图片（本地编译，不调AI），并缓存回数据库"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        from server.utils.latex_processor import process_latex_blocks
+        record = db.query(SubmissionRecord).filter(SubmissionRecord.id == record_id).first()
+        if not record or not record.full_solution:
+            return {"status": "error", "message": "记录不存在或无解析内容"}
+        if "```" not in record.full_solution:
+            return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
+        svg_dir = Path(record.rendered_svg_dir) if record.rendered_svg_dir else None
+        if not svg_dir or not svg_dir.exists():
+            svg_dir = HISTORY_DIR / f"svgs_{record.session_id}"
+            svg_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rendered = process_latex_blocks(record.full_solution, svg_dir)
+        except Exception as e:
+            print(f"[history/render] 渲染失败 id={record_id}: {e}")
+            return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
+        host = get_request_host(request)
+        rendered = rewrite_static_urls(rendered, host)
+        if rendered != record.full_solution:
+            record.full_solution = rendered
+            record.rendered_svg_dir = str(svg_dir)
+            db.commit()
+        return {"status": "ok", "full_solution": rendered, "rendered": True}
     finally:
         db.close()
 
@@ -860,6 +917,64 @@ async def get_geogebra_file(filename: str):
 
 # ==================== 工具函数 ====================
 
+# 掌握程度英文键 → 中文显示
+_MASTERY_LABELS = {
+    "completely_mastered": "完全掌握",
+    "partially_mastered": "部分掌握",
+    "not_mastered": "完全没掌握",
+}
+
+
+def get_request_host(request: Request) -> str:
+    """获取客户端访问本服务的地址（优先请求Host头，回退server_ip.txt）"""
+    host = (request.headers.get("host") or "").strip()
+    if not host:
+        try:
+            ip_file = Path(__file__).resolve().parent / "server_ip.txt"
+            host = ip_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            host = "127.0.0.1:8000"
+    return host.removeprefix("http://").removeprefix("https://").rstrip("/")
+
+
+def rewrite_static_urls(text: str, host: str) -> str:
+    """把Markdown中的 /static/ 图片地址重写到当前服务地址（防旧IP失效导致图片不显示）"""
+    if not text:
+        return text
+    import re as _re
+    base = f"http://{host}/static/"
+    # 已有绝对地址（http(s)://旧host/static/...）→ 换成当前host
+    text = _re.sub(r'https?://[^/]+/static/', base, text)
+    return text
+
+
+def _move_record_files_to_recycle_bin(record) -> str:
+    """删除记录时把相关文件（原图/svg目录/solution.md/掌握程度）移入回收站目录"""
+    import shutil
+    from datetime import datetime as _dt
+    bin_root = HISTORY_DIR / "recycle_bin"
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    dest = bin_root / f"{ts}_{record.session_id or record.id}"
+    dest.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    if record.original_image_path and Path(record.original_image_path).exists():
+        candidates.append(Path(record.original_image_path))
+    if record.rendered_svg_dir and Path(record.rendered_svg_dir).exists():
+        candidates.append(Path(record.rendered_svg_dir))
+    md_path = HISTORY_DIR / f"{record.session_id}_solution.md"
+    if md_path.exists():
+        candidates.append(md_path)
+    mastery_path = HISTORY_DIR / "mastery_records" / f"{record.session_id}.json"
+    if mastery_path.exists():
+        candidates.append(mastery_path)
+    for p in candidates:
+        try:
+            shutil.move(str(p), str(dest / p.name))
+        except Exception as e:
+            print(f"[recycle] 移动失败 {p}: {e}")
+    return str(dest)
+
+
 # 解题流水线内部使用的提示词前缀（追问时应从上下文剔除，防止AI模仿之前的JSON输出格式）
 _INTERNAL_PROMPT_PREFIXES = (
     "请分析这道题目，以JSON格式",     # 题目信息JSON提取
@@ -957,6 +1072,17 @@ if __name__ == "__main__":
     
     import socket
     def get_local_ip():
+        # 优先读取 server_ip.txt（用户可手动指定固定IP）
+        try:
+            ip_file = Path(__file__).resolve().parent / "server_ip.txt"
+            if ip_file.exists():
+                content = ip_file.read_text(encoding="utf-8").strip()
+                ip = content.split(":")[0].strip()
+                if ip:
+                    print(f"[启动] 从 server_ip.txt 读取IP: {ip}")
+                    return ip
+        except Exception:
+            pass
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -969,11 +1095,13 @@ if __name__ == "__main__":
     local_ip = get_local_ip()
     print(f"本机IP地址: {local_ip}")
     
-    # Feature 19: 保存服务器IP到文件
+    # Feature 19: 保存服务器IP到文件（仅当文件不存在时写入，保留手动指定）
     ip_file = Path(__file__).parent / "server_ip.txt"
-    with open(ip_file, "w") as f:
-        f.write(f"{local_ip}:8000")
-    print(f"[启动] 服务器IP已保存到: {ip_file}")
+    if not ip_file.exists():
+        with open(ip_file, "w") as f:
+            f.write(f"{local_ip}:8000")
+    else:
+        print(f"[启动] server_ip.txt 已存在，保留内容: {ip_file.read_text(encoding='utf-8').strip()}")
     
     discovery = DiscoveryService(server_host=local_ip, api_port=8000)
     discovery.start()

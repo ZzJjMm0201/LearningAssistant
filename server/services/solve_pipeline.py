@@ -258,6 +258,7 @@ class SolvePipeline:
                         search_time=search_time,
                         messages=messages,
                         user_id=user_id,
+                        full_solution_rendered=final_solution if solution_content else "",
                     )
                     
                     self._emit_event(request_id, "complete", {
@@ -350,8 +351,9 @@ class SolvePipeline:
     
     def _save_record(self, request_id: str, session_id: Optional[str], ocr_text: str, 
                 ocr_time: float, search_result: Optional[str], search_time: float,
-                messages: list, user_id: Optional[int] = None):
-        """保存解题记录到数据库（每次调用使用独立会话，避免多线程共享Session导致保存失败）"""
+                messages: list, user_id: Optional[int] = None, full_solution_rendered: str = ""):
+        """保存解题记录到数据库（每次调用使用独立会话，避免多线程共享Session导致保存失败）
+        full_solution_rendered: 已渲染LaTeX图片的完整解析（带图片URL），优先存储它"""
         db = SessionLocal()
         try:
             question_info = {}
@@ -391,6 +393,10 @@ class SolvePipeline:
                         mind_map = content
             
             print(f"[{request_id}] 内容分类: steps={len(solution_steps)}chars, solution={len(full_solution)}chars, mindmap={len(mind_map)}chars")
+            
+            # 若已渲染（含LaTeX图片），用渲染结果作为完整解析
+            if full_solution_rendered:
+                full_solution = full_solution_rendered
             
             # 保存到数据库
             record = SubmissionRecord(
