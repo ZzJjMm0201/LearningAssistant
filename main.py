@@ -124,8 +124,9 @@ async def favicon():
     return Response(status_code=204)
 
 def get_engine(request: Request) -> str:
-    """读取客户端选择的AI引擎（X-Engine请求头），默认deepseek"""
-    return (request.headers.get("X-Engine") or "deepseek").lower()
+    """AI引擎（当前仅DeepSeek，混元已下线移除；保留读取逻辑以防旧客户端带引擎头）"""
+    engine = (request.headers.get("X-Engine") or "deepseek").lower()
+    return engine if engine == "deepseek" else "deepseek"
 
 @app.post("/solve")
 async def solve_problem(request: Request, file: UploadFile = File(...)):
@@ -222,10 +223,9 @@ async def ask_question(request: AskRequest):
             .order_by(CH.id.asc())
             .all()
         )
-        messages: list = [{"role": h.role, "content": h.content} for h in history]
-        if not messages:
-            # 无历史时用空上下文，避免AI无背景作答
-            messages = []
+        messages: list = clean_conversation_history(
+            [{"role": h.role, "content": h.content} for h in history]
+        )
 
         response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request))
 
@@ -251,15 +251,22 @@ async def ask_question_stream(request: Request, body: AskRequest):
             .order_by(CH.id.asc())
             .all()
         )
-        messages: list = [{"role": h.role, "content": h.content} for h in history]
+        messages: list = clean_conversation_history(
+            [{"role": h.role, "content": h.content} for h in history]
+        )
         engine = get_engine(request)
 
         async def event_stream():
             accumulated = ""
+            prev_sent = ""
             for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine):
                 accumulated = chunk
-                yield f"data: {json.dumps({'stage': 'answer_chunk', 'content': accumulated}, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.01)
+                # AI流式回调返回“累积到当前”的全文：只下发新增部分，客户端累加后不会重复
+                delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
+                prev_sent = chunk
+                if delta:
+                    yield f"data: {json.dumps({'stage': 'answer_chunk', 'content': delta}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
             # 保存本次问答到数据库（流结束、response返回后执行，需新开会话）
             try:
                 db2 = SessionLocal()
@@ -477,10 +484,26 @@ async def get_history(request: Request, body: dict):
         else:
             query = query.filter(SubmissionRecord.user_id.is_(None))
         
-        records = query.order_by(SubmissionRecord.timestamp.desc()).limit(50).all()
+        # 先用全量查询统计真实总数/学科数，再截断返回前50条（总数统计不随截断失真）
+        total_count = query.count()
+        all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
+        records = all_records[:50]
         
         result = []
         all_subjects = set()
+        # 学科统计基于全量记录，而非截断后的50条
+        for r in all_records:
+            subj = ""
+            qi = r.question_info
+            if isinstance(qi, dict):
+                subj = qi.get("subject", "")
+            if not subj and r.ocr_text:
+                extracted = extract_subjects(cleanup_markdown_images(r.ocr_text))
+                if extracted and extracted[0] != "其他":
+                    subj = extracted[0]
+            if subj:
+                all_subjects.add(subj)
+        
         for r in records:
             # 清理OCR文本中的图片链接
             clean_ocr = cleanup_markdown_images(r.ocr_text) if r.ocr_text else ""
@@ -532,7 +555,7 @@ async def get_history(request: Request, body: dict):
         return {
             "status": "ok",
             "records": result,
-            "total_count": len(result),
+            "total_count": total_count,
             "subject_count": len(all_subjects)  # Feature 18: 学科数
         }
     finally:
@@ -836,6 +859,64 @@ async def get_geogebra_file(filename: str):
     return {"detail": "Not Found"}
 
 # ==================== 工具函数 ====================
+
+# 解题流水线内部使用的提示词前缀（追问时应从上下文剔除，防止AI模仿之前的JSON输出格式）
+_INTERNAL_PROMPT_PREFIXES = (
+    "请分析这道题目，以JSON格式",     # 题目信息JSON提取
+    "基于以上题目分析，请给出清晰的解题思路",  # 解题思路
+    "请给出完整的解题过程和答案",     # 完整解析（其回复会保留作为题解上下文）
+    "请为这道题生成有助于学生理解",   # LaTeX图解
+    "请用纯文本缩进格式，为这道题生成",  # 思维导图
+    "请生成3个学生可能会问",          # 预判问题JSON
+)
+
+
+def clean_conversation_history(history: list) -> list:
+    """从解题会话历史中提取干净的追问上下文。
+
+    保留：system题面、完整解析、真实的追问问答对；
+    剔除：内部流水线提示词及其直接回复（如JSON题目信息、JSON预判问题等）。
+    否则AI会把上一个“输出JSON数组”的指令延续到追问中，导致回答是JSON格式。
+    """
+    cleaned: list = []
+    solution_text = ""
+    skip_next_assistant = False
+    capture_next = False
+    for h in history:
+        content = (h.get("content") or "").strip()
+        role = h.get("role")
+        if role == "system":
+            cleaned.append({"role": "system", "content": content})
+            continue
+        if role == "user":
+            if content.startswith("请给出完整的解题过程和答案"):
+                capture_next = True
+                continue
+            if content.startswith(_INTERNAL_PROMPT_PREFIXES):
+                # 内部提示词：连同紧随其后的assistant回复一起剔除
+                skip_next_assistant = True
+                continue
+            capture_next = False
+            skip_next_assistant = False
+            cleaned.append({"role": "user", "content": content})
+        else:  # assistant
+            if capture_next:
+                capture_next = False
+                solution_text = content
+                continue
+            if skip_next_assistant:
+                skip_next_assistant = False
+                continue
+            cleaned.append({"role": "assistant", "content": content})
+    # 题面之后插入完整解析作为上下文
+    if solution_text:
+        if cleaned and cleaned[0].get("role") == "system":
+            cleaned.insert(1, {"role": "assistant", "content": solution_text})
+        else:
+            cleaned.insert(0, {"role": "system", "content": "以下是这道题的完整解析，供你参考。"})
+            cleaned.insert(1, {"role": "assistant", "content": solution_text})
+    return cleaned
+
 
 def cleanup_markdown_images(text: str) -> str:
     """清理Markdown中的图片标记，保留alt文本"""

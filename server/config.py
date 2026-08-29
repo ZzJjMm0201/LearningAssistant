@@ -36,10 +36,6 @@ class APIConfig:
     DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY", "sk-3178b37524bf4a36a74fa8873d1ebdb5")
     DEEPSEEK_BASE_URL = "https://api.deepseek.com"
     
-    # 混元API (备用) — 2026-06 起旧版混元模型下线，迁移至 TokenHub 平台（hy3-preview）
-    HUNYUAN_API_KEY = _env("HUNYUAN_API_KEY", "sk-Ca38LhzybBx5TlfZpgULLWIHdGU1OO2XDrzLgs31zPiPFocJ")
-    HUNYUAN_BASE_URL = "https://tokenhub.tencentmaas.com/v1"
-    
     # 好未来题库API
     SEARCH_ACCESS_KEY_ID = "1481449208266358784"
     SEARCH_ACCESS_KEY_SECRET = _env("SEARCH_ACCESS_KEY_SECRET", "8c329c183c8f470f9b52d006cb7282c5")
@@ -57,7 +53,7 @@ FEATURE_FLAGS = {
 
 # AI模型配置
 AI_MODEL = {
-    "primary": "deepseek",           # deepseek / hunyuan
+    "primary": "deepseek",
     "temperature": 0.2,
     "max_tokens": 8000,
 }

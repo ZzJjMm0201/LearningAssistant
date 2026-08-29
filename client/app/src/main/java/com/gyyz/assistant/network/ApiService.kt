@@ -78,16 +78,10 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     }
 
     /**
-     * AI引擎（deepseek / hunyuan），随请求头 X-Engine 发送给服务端
-     */
-    var engine: String = "deepseek"
-
-    /**
      * 为任意请求追加认证头（统一入口）
      */
     private fun Request.Builder.withAuth(): Request.Builder {
         authToken?.let { addHeader("Authorization", "Bearer $it") }
-        addHeader("X-Engine", engine)
         return this
     }
 
@@ -412,7 +406,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         }
     }
 
-    suspend fun getHistory(startDate: String, endDate: String): List<HistoryRecord> {
+    data class HistoryResult(
+        val records: List<HistoryRecord>,
+        val totalCount: Int,
+        val subjectCount: Int,
+    )
+
+    suspend fun getHistory(startDate: String, endDate: String): HistoryResult {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply {
                 put("start_date", startDate)
@@ -422,8 +422,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val request = Request.Builder().url("$BASE_URL/history").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
-            val arr = respJson.optJSONArray("records") ?: return@withContext emptyList()
-            (0 until arr.length()).map { i ->
+            val arr = respJson.optJSONArray("records") ?: return@withContext HistoryResult(emptyList(), 0, 0)
+            val records = (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
                 // 解析知识点的 JSON 数组
                 val kpArr = obj.optJSONArray("knowledge_points")
@@ -445,6 +445,11 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                     imageUrl = obj.optString("image_url", ""),
                 )
             }
+            HistoryResult(
+                records = records,
+                totalCount = respJson.optInt("total_count", records.size),
+                subjectCount = respJson.optInt("subject_count", 0),
+            )
         }
     }
 

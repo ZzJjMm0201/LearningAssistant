@@ -14,19 +14,12 @@ class AIService:
             api_key=APIConfig.DEEPSEEK_API_KEY,
             base_url=APIConfig.DEEPSEEK_BASE_URL
         )
-        self.hunyuan_client = OpenAI(
-            api_key=APIConfig.HUNYUAN_API_KEY,
-            base_url=APIConfig.HUNYUAN_BASE_URL
-        )
-        self.hunyuan_model = "hy3-preview"
         self.model = "deepseek-chat"
         self.temperature = AI_MODEL["temperature"]
         self.max_tokens = AI_MODEL["max_tokens"]
     
     def _get_client(self, engine: Optional[str] = None):
-        """按引擎选择客户端与模型（deepseek / hunyuan），默认deepseek"""
-        if engine == "hunyuan":
-            return self.hunyuan_client, self.hunyuan_model
+        """获取AI客户端与模型（当前仅支持DeepSeek；engine参数保留兼容调用链）"""
         return self.client, self.model
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
@@ -168,7 +161,7 @@ class AIService:
         return "".join(self.generate_ai_report_stream(stats_summary, engine=engine))
 
     def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None):
-        """生成AI版学情报告（流式，逐步yield累积文本）"""
+        """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）"""
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
     {stats_summary}
@@ -185,10 +178,13 @@ class AIService:
             {"role": "user", "content": prompt}
         ]
         
-        accumulated = ""
+        prev_sent = ""
         for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
-            accumulated = chunk
-            yield accumulated
+            # 回调返回累积全文，只yield新增部分，客户端累加后不会重复
+            delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
+            prev_sent = chunk
+            if delta:
+                yield delta
     
     def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
         """
@@ -281,13 +277,13 @@ class AIService:
     
     def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> str:
         """多轮对话 - 继续提问（非流式）"""
-        messages.append({"role": "system", "content": "直接回答用户的最新问题本身，输出自然语言。禁止输出JSON格式，禁止生成新的问题列表。"})
+        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。"})
         messages.append({"role": "user", "content": user_question})
         return self._call_api(messages, engine=engine)
 
     def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> Generator[str, None, None]:
         """多轮对话 - 继续提问（流式，逐chunk累积文本）"""
-        messages.append({"role": "system", "content": "直接回答用户的最新问题本身，输出自然语言。禁止输出JSON格式，禁止生成新的问题列表。"})
+        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。"})
         messages.append({"role": "user", "content": user_question})
         accumulated = ""
         for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):

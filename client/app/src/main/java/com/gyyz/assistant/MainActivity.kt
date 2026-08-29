@@ -18,6 +18,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -175,7 +176,7 @@ class MainViewModel : ViewModel() {
     private val _animationUrl = MutableStateFlow("")
     val animationUrl: StateFlow<String> = _animationUrl.asStateFlow()
 
-    private val apiService = ApiService()
+    val apiService = ApiService()
 
     private val _isLoggedIn = MutableStateFlow(false)
     val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
@@ -636,7 +637,9 @@ class MainViewModel : ViewModel() {
                                     "info" ->
                                             _statusText.value = json.optString("content", "处理中...")
                                     "ocr_complete" -> {
-                                        ocrText = json.optString("content", "")
+                                        // 服务端content为{"text":...}对象，需取text字段，避免把JSON显示给用户
+                                        val ocrObj = json.optJSONObject("content")
+                                        ocrText = if (ocrObj != null) ocrObj.optString("text", "") else json.optString("content", "")
                                         _statusText.value = "正在搜索题库..."
                                         // Feature 9: OCR确认弹窗（确认后将回传服务端继续流程）
                                         _pendingOcrRequestId.value = requestId
@@ -826,7 +829,8 @@ class MainViewModel : ViewModel() {
                 val sb = StringBuilder()
                 var lastAskUpdate = 0L
                 apiService.askQuestionStream(currentState.requestId, question) { chunk ->
-                    sb.append(chunk)
+                    // 服务端可能下发增量或累积全文：仅追加新增部分，避免“重复多一个字”
+                    appendStreamDelta(sb, chunk)
                     val now = System.currentTimeMillis()
                     if (now - lastAskUpdate >= 100) {
                         lastAskUpdate = now
@@ -902,11 +906,6 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    fun setAiEngine(v: String) {
-        aiEngine.value = v
-        apiService.engine = v
-    }
-
     fun requestAnimation(photoFile: java.io.File) {
         Log.d("MainViewModel", "请求AI动画，上传图片: ${photoFile.absolutePath}")
         cancelCurrentSSE = false
@@ -952,7 +951,8 @@ class MainViewModel : ViewModel() {
                 val sb = StringBuilder()
                 var lastReportUpdate = 0L
                 apiService.getAiReportStream(reportDaysVal) { chunk ->
-                    sb.append(chunk)
+                    // 服务端可能下发增量或累积全文：仅追加新增部分，避免重复
+                    appendStreamDelta(sb, chunk)
                     val now = System.currentTimeMillis()
                     if (now - lastReportUpdate >= 150) {
                         lastReportUpdate = now
@@ -1227,7 +1227,6 @@ class MainViewModel : ViewModel() {
                     )
             )
 
-    val aiEngine = MutableStateFlow("deepseek")
     val historyStartDate = MutableStateFlow("")
     val historyEndDate = MutableStateFlow("")
 
@@ -1404,21 +1403,26 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val hasCameraPerm by hasCameraPermission.collectAsState()
+                val gestureRecognizer by gestureRecognizerState.collectAsState()
+                val cameraRebind by cameraRebindTrigger.collectAsState()
+                val cameraReady by isCameraReady.collectAsState()
+
                 MainScreen(
-                    hasCameraPermission = hasCameraPermission.collectAsState().value,
-                    gestureRecognizer = gestureRecognizerState.collectAsState().value,
+                    hasCameraPermission = hasCameraPerm,
+                    gestureRecognizer = gestureRecognizer,
                     viewModel = viewModel,
                     onImageCaptureReady = { capture ->
                         imageCapture = capture
                         isCameraReady.value = true
                         Log.d(TAG, "ImageCapture 已就绪")
                     },
-                    cameraRebindTrigger = cameraRebindTrigger.collectAsState().value,
+                    cameraRebindTrigger = cameraRebind,
                     onPickImage = { action ->
                         pendingGalleryAction = action
                         galleryLauncher.launch("image/*")
                     },
-                    isCameraReady = isCameraReady.collectAsState().value
+                    isCameraReady = cameraReady
                 )
             }
         }
@@ -1654,6 +1658,8 @@ fun MainScreen(
     val ocrConfirmTitle by viewModel.ocrConfirmTitle.collectAsState()
     val ocrConfirmText by viewModel.ocrConfirmText.collectAsState()
     val showGeoGebra by viewModel.showGeoGebraScreen.collectAsState()
+    val geogebraUrl by viewModel.geoGebraUrl.collectAsState()
+    val reportDays by viewModel.reportDays.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A1A))) {
         // Feature 11: 番茄钟休息全屏界面
@@ -1709,7 +1715,7 @@ fun MainScreen(
                             onBack = { viewModel.backToTracking() },
                             reportUrl = if (isDataReport) state.reportText else "",
                             reportText = if (!isDataReport) state.reportText else "",
-                            reportDays = viewModel.reportDays.collectAsState().value,
+                            reportDays = reportDays,
                             onSelectDays = { days ->
                                 viewModel.reportDays.value = days
                                 if (isDataReport) {
@@ -1791,7 +1797,7 @@ fun MainScreen(
         // Feature 20: GeoGebra图形页面（生成该题的交互式数学图形）
         if (showGeoGebra) {
             GeoGebraScreen(
-                url = viewModel.geoGebraUrl.value,
+                url = geogebraUrl,
                 onBack = { viewModel.showGeoGebraScreen.value = false }
             )
         }
@@ -2490,9 +2496,11 @@ fun SolvingScreen(
                 }
             }
 
-            // 掌握程度：解答完成后显示标题 + 三个选项横向排布（点击记录后整个区块消失，防止重复点击）
+            // 掌握程度：解答完成后显示标题 + 三个选项横向排布；点击后保留区块并高亮所选，可重新选择
             val showMasteryBtn by (viewModel?.masteryVisible ?: MutableStateFlow(false)).collectAsState()
-            if (showMasteryBtn && !(viewModel?.masterySaved?.value == true) && solveState.stage == SolveStage.COMPLETED) {
+            val masterySaved by (viewModel?.masterySaved ?: MutableStateFlow(false)).collectAsState()
+            val masteryLevel by (viewModel?.masteryLevel ?: MutableStateFlow("")).collectAsState()
+            if (showMasteryBtn && solveState.stage == SolveStage.COMPLETED) {
                 Text(
                         text = "📊 掌握程度",
                         color = Color.White,
@@ -2500,6 +2508,14 @@ fun SolvingScreen(
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
+                if (masterySaved && masteryLevel.isNotEmpty()) {
+                    Text(
+                            text = "✅ 已记录：$masteryLevel（点击可重新选择）",
+                            color = Color(0xFF4CAF50),
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                    )
+                }
                 Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2507,17 +2523,23 @@ fun SolvingScreen(
                     Button(
                             onClick = { viewModel?.saveMastery("completely_mastered") },
                             modifier = Modifier.weight(1f).height(44.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                            colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (masteryLevel == "完全掌握") Color(0xFF2E7D32) else Color(0xFF4CAF50)
+                            )
                     ) { Text("✅ 完全掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
                     Button(
                             onClick = { viewModel?.saveMastery("partially_mastered") },
                             modifier = Modifier.weight(1f).height(44.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
+                            colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (masteryLevel == "部分掌握") Color(0xFFE65100) else Color(0xFFFF9800)
+                            )
                     ) { Text("⚠️ 部分掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
                     Button(
                             onClick = { viewModel?.saveMastery("not_mastered") },
                             modifier = Modifier.weight(1f).height(44.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                            colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (masteryLevel == "完全没掌握") Color(0xFFC62828) else Color(0xFFF44336)
+                            )
                     ) { Text("❌ 完全没掌握", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
                 }
             }
@@ -2919,6 +2941,25 @@ private fun plainPreview(text: String, max: Int = 30): String {
     t = t.replace(Regex("\\$\\$?" ), "")
     t = t.replace(Regex("\\s+"), " ").trim()
     return if (t.length > max) t.take(max) + "…" else t
+}
+
+/**
+ * 追加流式chunk到StringBuilder（兼容累积与增量两种下发方式）。
+ * 服务端旧版本会下发累积全文（每个chunk都是从开头到当前的完整文本），
+ * 直接append会产生“重复一遍多一个字”的错乱；这里按前缀比对只追加新增部分。
+ */
+private fun appendStreamDelta(sb: StringBuilder, chunk: String) {
+    if (chunk.isEmpty()) return
+    val existing = sb.toString()
+    when {
+        existing.isEmpty() -> sb.append(chunk)
+        chunk.startsWith(existing) -> {
+            if (chunk.length > existing.length) {
+                sb.append(chunk.substring(existing.length))
+            }
+        }
+        else -> sb.append(chunk)
+    }
 }
 
 @Composable
@@ -3565,11 +3606,16 @@ fun HistoryViewScreen(
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf("") }
     var selectedRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
+    // 服务端返回的真实总数/学科数（不受50条截断影响）
+    var totalCount by remember { mutableStateOf(0) }
+    var subjectCount by remember { mutableStateOf(0) }
     
     var isSelectMode by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var isDeleting by remember { mutableStateOf(false) }
     var dateError by remember { mutableStateOf("") }
+    // 学科筛选器（空=全部）
+    var subjectFilter by remember { mutableStateOf("") }
     
     fun loadHistory() {
         // Feature 16: 日期格式验证
@@ -3588,13 +3634,15 @@ fun HistoryViewScreen(
         errorMessage = ""
         viewModel.viewModelScope.launch(Dispatchers.IO) {
             try {
-                val apiService = ApiService()
-                val result = apiService.getHistory(
+                // 使用ViewModel的ApiService（带token与服务器地址），否则登录用户看不到自己的记录
+                val result = viewModel.apiService.getHistory(
                     startDate = historyStartDate,
                     endDate = historyEndDate
                 )
                 withContext(Dispatchers.Main) {
-                    records = result
+                    records = result.records
+                    totalCount = result.totalCount
+                    subjectCount = result.subjectCount
                     isLoading = false
                 }
             } catch (e: Exception) {
@@ -3609,16 +3657,16 @@ fun HistoryViewScreen(
     fun batchDelete() {
         if (selectedIds.isEmpty()) return
         isDeleting = true
+        val deletingCount = selectedIds.size
         viewModel.viewModelScope.launch(Dispatchers.IO) {
             try {
-                val apiService = ApiService()
-                apiService.batchDeleteHistory(selectedIds.toList())
+                viewModel.apiService.batchDeleteHistory(selectedIds.toList())
                 withContext(Dispatchers.Main) {
                     isDeleting = false
                     isSelectMode = false
                     selectedIds = emptySet()
                     loadHistory()
-                    Toast.makeText(context, "已删除 ${selectedIds.size} 条记录", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "已删除 $deletingCount 条记录", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -3641,7 +3689,8 @@ fun HistoryViewScreen(
         HistoryDetailScreen(
             record = selectedRecord!!,
             onBack = { selectedRecord = null },
-            viewModel = viewModel
+            viewModel = viewModel,
+            serverAddress = serverAddress
         )
         return
     }
@@ -3735,6 +3784,47 @@ fun HistoryViewScreen(
         }
         
         Spacer(modifier = Modifier.height(8.dp))
+
+        // 学科筛选器：基于当前加载记录生成学科列表
+        val allSubjects = remember(records) {
+            records.map { it.subject }.filter { it.isNotEmpty() }.distinct().sorted()
+        }
+        if (allSubjects.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FilterChip(
+                        selected = subjectFilter.isEmpty(),
+                        onClick = { subjectFilter = "" },
+                        label = { Text("全部", fontSize = 12.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFF00D2FF),
+                                selectedLabelColor = Color.White,
+                                labelColor = Color.White,
+                                containerColor = Color(0xFF2D2D44)
+                        )
+                )
+                allSubjects.forEach { subj ->
+                    FilterChip(
+                            selected = subjectFilter == subj,
+                            onClick = { subjectFilter = if (subjectFilter == subj) "" else subj },
+                            label = { Text(subj, fontSize = 12.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF00D2FF),
+                                    selectedLabelColor = Color.White,
+                                    labelColor = Color.White,
+                                    containerColor = Color(0xFF2D2D44)
+                            )
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
         
         when {
             isLoading -> {
@@ -3779,6 +3869,24 @@ fun HistoryViewScreen(
                 }
             }
             else -> {
+                val filteredRecords =
+                        if (subjectFilter.isEmpty()) records else records.filter { it.subject == subjectFilter }
+                if (filteredRecords.isEmpty()) {
+                    Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("🔍", fontSize = 48.sp)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text("该学科暂无记录", color = Color.Gray, fontSize = 16.sp)
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Button(onClick = { subjectFilter = "" }) {
+                                Text("查看全部")
+                            }
+                        }
+                    }
+                } else {
                 val listState = rememberLazyListState()
                 LazyColumn(
                     state = listState,
@@ -3786,7 +3894,7 @@ fun HistoryViewScreen(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    items(records, key = { it.id }) { record ->
+                    items(filteredRecords, key = { it.id }) { record ->
                         HistoryRecordCard(
                             record = record,
                             serverAddress = serverAddress,
@@ -3819,8 +3927,14 @@ fun HistoryViewScreen(
                         .padding(12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
+                    // 使用服务端返回的真实总数/学科数（列表仅展示前50条，但统计全量）
+                    val displayTotal = if (totalCount > 0) totalCount else records.size
+                    val displaySubjects = if (subjectCount > 0) subjectCount
+                    else records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size
+                    val filterNote =
+                            if (subjectFilter.isNotEmpty()) " | 当前筛选：$subjectFilter ${filteredRecords.size} 条" else ""
                     Text(
-                        "共${records.size} 条记录 | ${records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size} 门学科",
+                        "共${displayTotal} 条记录 | ${displaySubjects} 门学科$filterNote",
                         color = Color.Gray,
                         fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.CenterVertically)
@@ -3856,6 +3970,7 @@ fun HistoryViewScreen(
                             Text("🗑️ 清除全部", color = Color.White, fontSize = 12.sp)
                         }
                     }
+                }
                 }
             }
         }
@@ -4001,7 +4116,8 @@ fun HistoryRecordCard(
                                             .into(this)
                                 }
                             },
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)
+                            // 固定高度：保证图片加载前/后都有可见区域，避免高度为0导致图片不显示
+                            modifier = Modifier.fillMaxWidth().height(180.dp)
                     )
                 } else if (record.ocrText.isNotEmpty()) {
                     Text(
@@ -4040,6 +4156,7 @@ fun HistoryDetailScreen(
     record: ApiService.HistoryRecord,
     onBack: () -> Unit,
     viewModel: MainViewModel? = null,
+    serverAddress: String = "10.100.55.231:8000",
 ) {
     val displayTime = try {
         if (record.timestamp.isNotEmpty()) {
@@ -4170,7 +4287,7 @@ fun HistoryDetailScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         // 显示原始题目图片（如可用）
                         if (record.imageUrl.isNotEmpty()) {
-                            val fullImageUrl = "http://${viewModel?.serverAddress?.value ?: "10.100.55.231:8000"}${record.imageUrl}"
+                            val fullImageUrl = "http://$serverAddress${record.imageUrl}"
                             AndroidView(
                                 factory = { ctx ->
                                     android.widget.ImageView(ctx).apply {
@@ -4182,7 +4299,8 @@ fun HistoryDetailScreen(
                                             .into(this)
                                     }
                                 },
-                                modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp)
+                                // 固定高度：保证图片加载前/后都有可见区域
+                                modifier = Modifier.fillMaxWidth().height(280.dp)
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                         }
@@ -4268,9 +4386,9 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val serverAddress by viewModel.serverAddress.collectAsState()
     val fontSize by viewModel.fontSize.collectAsState()
     val showModules by viewModel.showModules.collectAsState()
-    val aiEngine by viewModel.aiEngine.collectAsState()
     val historyStartDate by viewModel.historyStartDate.collectAsState()
     val historyEndDate by viewModel.historyEndDate.collectAsState()
+    val loggedInUsername by viewModel.loggedInUsername.collectAsState()
 
     AlertDialog(
             onDismissRequest = onDismiss,
@@ -4386,35 +4504,6 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     Divider(color = Color.White.copy(alpha = 0.2f))
 
                     Text(
-                            "🤖 AI 引擎",
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                                selected = aiEngine == "deepseek",
-                                onClick = { viewModel.setAiEngine("deepseek") },
-                                label = { Text("DeepSeek", fontSize = 12.sp) },
-                                colors =
-                                        FilterChipDefaults.filterChipColors(
-                                                selectedContainerColor = Color(0xFF2196F3)
-                                        )
-                        )
-                        FilterChip(
-                                selected = aiEngine == "hunyuan",
-                                onClick = { viewModel.setAiEngine("hunyuan") },
-                                label = { Text("混元", fontSize = 12.sp) },
-                                colors =
-                                        FilterChipDefaults.filterChipColors(
-                                                selectedContainerColor = Color(0xFFFF9800)
-                                        )
-                        )
-                    }
-
-                    Divider(color = Color.White.copy(alpha = 0.2f))
-
-                    Text(
                             "📅 历史记录范围",
                             color = Color.White,
                             fontSize = 14.sp,
@@ -4453,7 +4542,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                             onClick = { viewModel.logout(); onDismiss() },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
-                    ) { Text("🚪 退出登录 (${viewModel.loggedInUsername.collectAsState().value})") }
+                    ) { Text("🚪 退出登录 (${loggedInUsername})") }
                 }
             },
             confirmButton = {},

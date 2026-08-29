@@ -39,7 +39,7 @@ class SolvePipeline:
     """解题流水线"""
     
     def __init__(self):
-        self.db = SessionLocal()
+        pass
     
     def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
@@ -351,7 +351,8 @@ class SolvePipeline:
     def _save_record(self, request_id: str, session_id: Optional[str], ocr_text: str, 
                 ocr_time: float, search_result: Optional[str], search_time: float,
                 messages: list, user_id: Optional[int] = None):
-        """保存解题记录到数据库"""
+        """保存解题记录到数据库（每次调用使用独立会话，避免多线程共享Session导致保存失败）"""
+        db = SessionLocal()
         try:
             question_info = {}
             solution_steps = ""
@@ -425,16 +426,18 @@ class SolvePipeline:
                     role=msg["role"],
                     content=msg["content"],
                 )
-                self.db.add(conv)
+                db.add(conv)
             
-            self.db.commit()
+            db.commit()
             print(f"[{request_id}] 记录已保存，Markdown文件: {md_path}")
             
         except Exception as e:
             print(f"[{request_id}] 保存记录失败: {e}")
             import traceback
             traceback.print_exc()
-            self.db.rollback()
+            db.rollback()
+        finally:
+            db.close()
     
     def _cleanup(self, request_id: str):
         """清理资源"""
