@@ -123,7 +123,12 @@ class AIService:
         
         messages.append({"role": "assistant", "content": solution_response})
         messages.append({"role": "user", "content": latex_prompt})
-        latex_response = self._call_api(messages, max_tokens=4000, engine=engine, model=model)
+        # ② LaTeX图形生成改为流式（客户端显示“图形正在生成”占位）
+        latex_accumulated = ""
+        for chunk in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model):
+            latex_accumulated = chunk
+            yield {"stage": "latex_chunk", "content": latex_accumulated}
+        latex_response = latex_accumulated
         
         yield {"stage": "latex_extras", "content": latex_response}
         

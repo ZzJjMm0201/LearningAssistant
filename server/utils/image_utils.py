@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 MAX_SIDE_PIXELS = 1000  # 最长边限制（像素）
-JPEG_QUALITY = 90  # JPEG 保存质量
+JPEG_QUALITY = 50  # JPEG 保存质量
 
 
 def save_uploaded_image(image_bytes: bytes, dest_path: Path, max_side: int = MAX_SIDE_PIXELS) -> None:

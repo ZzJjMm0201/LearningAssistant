@@ -20,9 +20,32 @@ def ensure_plotly_local() -> str:
         if not target.exists() or target.stat().st_size < 100_000:
             import urllib.request
             print("[Plotly] 下载 plotly.min.js 到本地...")
-            urllib.request.urlretrieve(
-                "https://cdn.plot.ly/plotly-2.32.0.min.js", str(target), timeout=120)
-            print(f"[Plotly] 本地缓存完成: {target.stat().st_size} bytes")
+            tmp = target.with_suffix(".js.tmp")
+            _urls = [
+                "https://cdn.plot.ly/plotly-2.32.0.min.js",
+                "https://cdn.staticfile.org/plotly.js/2.32.0/plotly.min.js",
+                "https://cdn.bootcdn.net/ajax/libs/plotly.js/2.32.0/plotly.min.js",
+                "https://fastly.jsdelivr.net/npm/plotly.js-dist-min@2.32.0/plotly.min.js",
+                "https://unpkg.com/plotly.js-dist-min@2.32.0/plotly.min.js",
+            ]
+            _ok = False
+            for _u in _urls:
+                try:
+                    _req = urllib.request.Request(_u, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(_req, timeout=120) as resp, open(tmp, "wb") as f:
+                        f.write(resp.read())
+                    if tmp.exists() and tmp.stat().st_size > 100_000:
+                        tmp.replace(target)
+                        print(f"[Plotly] 本地缓存完成: {target.stat().st_size} bytes ({_u})")
+                        _ok = True
+                        break
+                except Exception as _e:
+                    print(f"[Plotly] 镜像下载失败 {_u}: {_e}")
+            if not _ok:
+                print("[Plotly] 所有镜像下载失败，回退CDN")
+                if tmp.exists():
+                    tmp.unlink()
+                return "https://cdn.plot.ly/plotly-2.32.0.min.js"
         return "plotly.min.js"
     except Exception as e:
         print(f"[Plotly] 本地缓存失败，回退CDN: {e}")

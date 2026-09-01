@@ -25,6 +25,30 @@ from server.services.ai_service import ai_service
 from server.services.search_service import search_service
 from server.services.report_generator import ReportGenerator
 from server.utils.latex_processor import process_latex_blocks, clean_markdown_for_display
+
+# ==================== 日志系统（文件轮转 + 控制台） ====================
+import logging as _logging
+from logging.handlers import RotatingFileHandler
+
+def _setup_logging():
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    _fmt = _logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    _file_h = RotatingFileHandler(log_dir / "server.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    _file_h.setFormatter(_fmt)
+    _console_h = _logging.StreamHandler()
+    _console_h.setFormatter(_fmt)
+    _root = _logging.getLogger()
+    _root.setLevel(_logging.INFO)
+    _root.handlers = [_file_h, _console_h]
+    # uvicorn 自身日志也写入同一文件（access日志由中间件替代，避免重复）
+    _logging.getLogger("uvicorn").propagate = True
+    _logging.getLogger("uvicorn.error").propagate = True
+    _logging.getLogger("uvicorn.access").disabled = True
+    _logging.getLogger("app").setLevel(_logging.INFO)
+    print("[日志] 已初始化: logs/server.log (轮转5MB×5)")
+
+_setup_logging()
 from server.utils.tikz_md_renderer import get_available_latex_engines
 from server.utils.image_utils import save_uploaded_image
 from server.services.discovery_service import DiscoveryService
@@ -88,6 +112,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 请求日志中间件（⑧）
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    import time as _t
+    _start = _t.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _logging.getLogger("app").exception("%s %s 异常", request.method, request.url.path)
+        raise
+    _dur = (_t.time() - _start) * 1000
+    _logging.getLogger("app").info(
+        "%s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, _dur)
+    return response
 
 # 初始化数据库
 SessionLocal = init_database()
@@ -536,10 +575,16 @@ async def get_history(request: Request, body: dict):
         # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”），并在Python侧应用筛选
         all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
         
-        # ③ 筛选参数（客户端“筛选”面板：学科/年级/难度）
-        filter_subject = (body.get("subject") or "").strip()
-        filter_grade = (body.get("grade") or "").strip()
-        filter_difficulty = (body.get("difficulty") or "").strip()
+        # ③ 筛选参数（客户端“筛选”面板：学科/年级/难度，支持多选：数组或逗号分隔字符串）
+        def _parse_filters(val):
+            if isinstance(val, list):
+                return {str(v).strip() for v in val if str(v).strip()}
+            if isinstance(val, str) and val.strip():
+                return {v.strip() for v in val.split(",") if v.strip()}
+            return set()
+        filter_subjects = _parse_filters(body.get("subject"))
+        filter_grades = _parse_filters(body.get("grade"))
+        filter_difficulties = _parse_filters(body.get("difficulty"))
         
         result = []
         all_subjects = set()
@@ -584,12 +629,12 @@ async def get_history(request: Request, body: dict):
                 if extracted and extracted[0] != "其他":
                     subject = extracted[0]
             
-            # ③ 应用学科/年级/难度筛选
-            if filter_subject and subject != filter_subject:
+            # ③ 应用学科/年级/难度多选筛选
+            if filter_subjects and subject not in filter_subjects:
                 continue
-            if filter_grade and grade != filter_grade:
+            if filter_grades and grade not in filter_grades:
                 continue
-            if filter_difficulty and difficulty != filter_difficulty:
+            if filter_difficulties and difficulty not in filter_difficulties:
                 continue
             
             if subject:

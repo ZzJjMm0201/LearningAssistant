@@ -188,6 +188,9 @@ class SolvePipeline:
                     # 补充的LaTeX图形代码（可多个），随后统一渲染
                     latex_extras_content = content
                     self._emit_event(request_id, "info", "正在生成图解...")
+                elif stage == "latex_chunk":
+                    # ② LaTeX生成流式输出（客户端据此显示“图形正在生成”占位）
+                    self._emit_event(request_id, "latex_chunk", content)
                 elif stage == "mindmap_chunk":
                     # 流式chunk: content 是累积到当前的完整文本（已规范化围栏）
                     self._emit_event(request_id, "mindmap_chunk", _normalize_mindmap(content))
