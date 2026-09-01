@@ -15,14 +15,27 @@ class AIService:
             base_url=APIConfig.DEEPSEEK_BASE_URL
         )
         self.model = "deepseek-chat"
+        # 千问（Qwen）客户端 —— 阿里云百炼 OpenAI 兼容端点（Key 在 .env）
+        self.qwen_client = None
+        if APIConfig.QWEN_API_KEY:
+            self.qwen_client = OpenAI(
+                api_key=APIConfig.QWEN_API_KEY,
+                base_url=APIConfig.QWEN_BASE_URL
+            )
+        self.qwen_model = APIConfig.QWEN_DEFAULT_LLM
         self.temperature = AI_MODEL["temperature"]
         self.max_tokens = AI_MODEL["max_tokens"]
     
-    def _get_client(self, engine: Optional[str] = None):
-        """获取AI客户端与模型（当前仅支持DeepSeek；engine参数保留兼容调用链）"""
-        return self.client, self.model
+    def _get_client(self, engine: Optional[str] = None, model: Optional[str] = None):
+        """按提供方选择客户端与模型（deepseek / qwen），默认deepseek
+        engine: 提供方；model: 具体模型名（未指定用默认）"""
+        if engine == "qwen":
+            if self.qwen_client is None:
+                raise RuntimeError("未配置千问API Key（请检查 .env 的 QWEN_API_KEY）")
+            return self.qwen_client, model or self.qwen_model
+        return self.client, model or self.model
     
-    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
+    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
@@ -51,7 +64,7 @@ class AIService:
     只输出JSON，不要其他内容。"""
         
         messages.append({"role": "user", "content": info_prompt})
-        info_response = self._call_api(messages, engine=engine)
+        info_response = self._call_api(messages, engine=engine, model=model)
         question_info = self._parse_json_response(info_response)
         
         yield {"stage": "info", "content": question_info}
@@ -68,7 +81,7 @@ class AIService:
         messages.append({"role": "user", "content": steps_prompt})
         # 流式输出解题思路
         accumulated_steps = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             accumulated_steps = chunk
             yield {"stage": "steps_chunk", "content": accumulated_steps}
         steps_response = accumulated_steps
@@ -110,7 +123,7 @@ class AIService:
         
         messages.append({"role": "assistant", "content": solution_response})
         messages.append({"role": "user", "content": latex_prompt})
-        latex_response = self._call_api(messages, max_tokens=4000, engine=engine)
+        latex_response = self._call_api(messages, max_tokens=4000, engine=engine, model=model)
         
         yield {"stage": "latex_extras", "content": latex_response}
         
@@ -128,7 +141,7 @@ class AIService:
         messages.append({"role": "user", "content": mindmap_prompt})
         # 流式输出思维导图
         accumulated_mindmap = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             accumulated_mindmap = chunk
             yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
         mindmap_response = accumulated_mindmap
@@ -147,7 +160,7 @@ class AIService:
         
         messages.append({"role": "assistant", "content": mindmap_response})
         messages.append({"role": "user", "content": questions_prompt})
-        questions_response = self._call_api(messages, engine=engine)
+        questions_response = self._call_api(messages, engine=engine, model=model)
         suggested_questions = self._parse_json_response(questions_response)
         
         yield {"stage": "questions", "content": suggested_questions}
@@ -156,11 +169,11 @@ class AIService:
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None) -> str:
+    def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """生成AI版学情报告（非流式，兼容旧调用）"""
-        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine))
+        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine, model=model))
 
-    def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None):
+    def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None):
         """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）"""
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
@@ -179,14 +192,14 @@ class AIService:
         ]
         
         prev_sent = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             # 回调返回累积全文，只yield新增部分，客户端累加后不会重复
             delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
             prev_sent = chunk
             if delta:
                 yield delta
     
-    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None) -> Generator[Dict, None, None]:
+    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[Dict, None, None]:
         """
         知识延伸多轮对话
         重点：总结归纳 + 易错点 + 知识拓展 + 延伸问题
@@ -208,7 +221,7 @@ class AIService:
     只输出JSON。"""
         
         messages.append({"role": "user", "content": summary_prompt})
-        info_response = self._call_api(messages, engine=engine)
+        info_response = self._call_api(messages, engine=engine, model=model)
         info = self._parse_json_response(info_response)
         yield {"stage": "info", "content": info}
         
@@ -225,7 +238,7 @@ class AIService:
         messages.append({"role": "user", "content": mistakes_prompt})
         # 流式输出易错点详解
         accumulated_mistakes = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             accumulated_mistakes = chunk
             yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
         mistakes_detail = accumulated_mistakes
@@ -250,7 +263,7 @@ class AIService:
         messages.append({"role": "user", "content": extension_prompt})
         # 流式输出知识拓展
         accumulated_extension = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             accumulated_extension = chunk
             yield {"stage": "extension_chunk", "content": accumulated_extension}
         extension_content = accumulated_extension
@@ -268,37 +281,37 @@ class AIService:
         
         messages.append({"role": "assistant", "content": extension_content})
         messages.append({"role": "user", "content": questions_prompt})
-        questions_response = self._call_api(messages, engine=engine)
+        questions_response = self._call_api(messages, engine=engine, model=model)
         questions = self._parse_json_response(questions_response)
         yield {"stage": "questions", "content": questions}
         
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> str:
+    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """多轮对话 - 继续提问（非流式）"""
-        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。"})
+        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。如需绘图辅助讲解（如函数图像、几何示意图），可在回答末尾附加一个 ```latex ... ``` 代码块（TikZ/pgfplots），代码块必须能独立编译。"})
         messages.append({"role": "user", "content": user_question})
-        return self._call_api(messages, engine=engine)
+        return self._call_api(messages, engine=engine, model=model)
 
-    def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None) -> Generator[str, None, None]:
+    def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[str, None, None]:
         """多轮对话 - 继续提问（流式，逐chunk累积文本）"""
-        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。"})
+        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。如需绘图辅助讲解（如函数图像、几何示意图），可在回答末尾附加一个 ```latex ... ``` 代码块（TikZ/pgfplots），代码块必须能独立编译。"})
         messages.append({"role": "user", "content": user_question})
         accumulated = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine):
+        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
             accumulated = chunk
             yield accumulated
 
-    def generate_response(self, prompt: str, engine: Optional[str] = None) -> str:
+    def generate_response(self, prompt: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """通用单轮生成（GeoGebra命令等）"""
         messages = [
             {"role": "system", "content": "你是一个GeoGebra命令生成专家，直接输出可以在GeoGebra输入栏中执行的命令，每行一个命令，不要任何解释文字。"},
             {"role": "user", "content": prompt},
         ]
-        return self._call_api(messages, max_tokens=2000, engine=engine)
+        return self._call_api(messages, max_tokens=2000, engine=engine, model=model)
 
-    def fix_latex(self, latex_code: str, error_text: str, engine: Optional[str] = None) -> str:
+    def fix_latex(self, latex_code: str, error_text: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """LaTeX编译失败时，把关键报错发给AI修复代码"""
         prompt = f"""以下LaTeX/TikZ代码编译失败，请修复它。
 
@@ -320,7 +333,7 @@ class AIService:
             {"role": "system", "content": "你是LaTeX/TikZ绘图代码修复专家。"},
             {"role": "user", "content": prompt},
         ]
-        response = self._call_api(messages, max_tokens=3000, engine=engine) or ""
+        response = self._call_api(messages, max_tokens=3000, engine=engine, model=model) or ""
         m = re.search(r'```latex\s*\n(.*?)\n```', response, re.DOTALL)
         if m:
             response = m.group(1)
@@ -329,15 +342,15 @@ class AIService:
             response = re.sub(r'```', '', response)
         return response.strip()
     
-    def _call_api(self, messages, max_tokens=None, engine=None):
+    def _call_api(self, messages, max_tokens=None, engine=None, model=None):
         """调用AI API (非流式)"""
-        client, model = self._get_client(engine)
-        print(f"[AI] 调用API，引擎={engine or 'deepseek'}，模型={model}，消息数={len(messages)}")
+        client, m = self._get_client(engine, model)
+        print(f"[AI] 调用API，引擎={engine or 'deepseek'}，模型={m}，消息数={len(messages)}")
         for attempt in range(3):
             try:
                 print(f"[AI] 尝试 {attempt + 1}/3...")
                 response = client.chat.completions.create(
-                    model=model,
+                    model=m,
                     messages=messages,
                     temperature=self.temperature,
                     max_tokens=max_tokens or self.max_tokens,
@@ -353,7 +366,7 @@ class AIService:
                 time.sleep(1)
         return ""
     
-    def _call_api_streaming(self, messages, max_tokens=None, engine=None):
+    def _call_api_streaming(self, messages, max_tokens=None, engine=None, model=None):
         """
         调用AI API (流式) - 逐chunk生成
         用于实现实时流式输出体验
@@ -361,7 +374,7 @@ class AIService:
         Yields:
             str: 每个chunk的文本内容
         """
-        client, model = self._get_client(engine)
+        client, model = self._get_client(engine, model)
         print(f"[AI-Stream] 开始流式调用，引擎={engine or 'deepseek'}，模型={model}，消息数={len(messages)}")
         for attempt in range(3):
             try:
@@ -391,6 +404,41 @@ class AIService:
                     raise
                 time.sleep(1)
         return
+    
+    def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None) -> Tuple[str, float]:
+        """使用千问视觉模型识别图片（OCR/图表描述）
+        默认提示词：识别全部文字；流程图/统计图用自然语言描述"""
+        import base64 as _b64
+        start = time.time()
+        try:
+            if self.qwen_client is None:
+                return "OCR识别失败：未配置千问API Key", round(time.time() - start, 2)
+            with open(image_path, "rb") as f:
+                img_b64 = _b64.b64encode(f.read()).decode("ascii")
+            prompt = prompt or (
+                "请识别这张图片中的全部文字并完整输出（保持原有顺序和格式）。"
+                "如果图片中包含流程图、统计图、几何图形等非纯文字内容，请用自然语言描述其内容。"
+                "只输出识别/描述结果，不要任何额外解释。"
+            )
+            resp = self.qwen_client.chat.completions.create(
+                model=model or APIConfig.QWEN_DEFAULT_VISION,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ],
+                }],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                return "", round(time.time() - start, 2)
+            return text, round(time.time() - start, 2)
+        except Exception as e:
+            print(f"[VisionOCR] 失败: {e}")
+            return "", round(time.time() - start, 2)
     
     def _build_system_prompt(self, ocr_text: str, search_result: Optional[str] = None) -> str:
         """构建系统提示"""

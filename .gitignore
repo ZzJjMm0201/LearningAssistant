@@ -27,6 +27,7 @@ history/svgs_*/
 reports/*.html
 data/*.db
 server_ip.txt
+.env
 
 # OS
 .DS_Store

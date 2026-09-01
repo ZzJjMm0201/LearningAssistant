@@ -64,16 +64,16 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
             elif svg_path.exists():
                 replacement = f"\n\n![图解]({svg_path.name})\n\n"
             else:
-                replacement = f"```latex\n{code}\n```\n*(图形渲染失败)*"
+                replacement = f"\n\n（*图形渲染失败*）\n\n"
         else:
-            # 渲染失败时保留原始代码
-            replacement = f"```latex\n{code}\n```\n*(图形渲染失败，请检查LaTeX代码)*"
+            # 渲染失败：给出失败提示
+            replacement = f"\n\n（*图形渲染失败*）\n\n"
         
         result = result[:start] + replacement + result[end:]
     
     return result
 
-def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=None, engine: str = None, max_retries: int = 3) -> str:
+def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=None, engine: str = None, model: str = None, max_retries: int = 3) -> str:
     """
     处理Markdown中的LaTeX代码块（带AI修复重试）：
     1. 编译失败 → 把关键报错发给AI修复，最多重试 max_retries 次
@@ -104,7 +104,7 @@ def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=N
             error_text = err_out[0] if err_out else "编译失败"
             if ai_service is not None and attempt < max_retries:
                 print(f"[LaTeX] 第{attempt + 1}次编译失败，交给AI修复... 错误: {error_text[:160]}")
-                fixed = ai_service.fix_latex(final_code, error_text, engine=engine)
+                fixed = ai_service.fix_latex(final_code, error_text, engine=engine, model=model)
                 if fixed and fixed.strip() and fixed != final_code:
                     final_code = fixed
                     cur_block_id = hashlib.md5(final_code.encode()).hexdigest()[:8]
@@ -122,9 +122,9 @@ def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=N
             else:
                 replacement = ""
         else:
-            # 重试仍失败：直接移除该块，不显示LaTeX代码
+            # 重试仍失败：移除该块并给出失败提示，不显示LaTeX代码
             print(f"[LaTeX] 重试{max_retries}次仍失败，移除该图形块: {error_text[:150]}")
-            replacement = ""
+            replacement = "\n\n（*图形渲染失败*）\n\n"
         
         result = result[:start] + replacement + result[end:]
     

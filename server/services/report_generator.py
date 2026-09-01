@@ -13,6 +13,22 @@ from server.config import REPORT_DIR, HISTORY_DIR
 from server.database.models import SubmissionRecord, TrackingRecord
 
 
+def ensure_plotly_local() -> str:
+    """确保本地 plotly.min.js 存在（下载缓存一次），返回HTML里用的相对路径；失败回退CDN"""
+    try:
+        target = REPORT_DIR / "plotly.min.js"
+        if not target.exists() or target.stat().st_size < 100_000:
+            import urllib.request
+            print("[Plotly] 下载 plotly.min.js 到本地...")
+            urllib.request.urlretrieve(
+                "https://cdn.plot.ly/plotly-2.32.0.min.js", str(target), timeout=120)
+            print(f"[Plotly] 本地缓存完成: {target.stat().st_size} bytes")
+        return "plotly.min.js"
+    except Exception as e:
+        print(f"[Plotly] 本地缓存失败，回退CDN: {e}")
+        return "https://cdn.plot.ly/plotly-2.32.0.min.js"
+
+
 class ReportGenerator:
     
     def __init__(self, db_session):
@@ -408,6 +424,7 @@ class ReportGenerator:
         
         # 组装 HTML
         period = f"{cutoff_date.strftime('%Y-%m-%d')} 至 {datetime.utcnow().strftime('%Y-%m-%d')}"
+        plotly_src = ensure_plotly_local()
         
         html = f"""
 <!DOCTYPE html>
@@ -416,7 +433,7 @@ class ReportGenerator:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>学情报告</title>
-    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <script src="{plotly_src}"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ font-family: -apple-system, sans-serif; background: #1a1a2e; color: white; padding: 20px; }}

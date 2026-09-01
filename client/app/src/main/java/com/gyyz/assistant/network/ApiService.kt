@@ -19,6 +19,10 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         private const val PREFS_NAME = "learning_assistant_prefs"
         private const val KEY_SERVER_ADDRESS = "server_address"
         private const val KEY_WELCOME_DISMISSED = "welcome_dismissed"
+        private const val KEY_LLM_PROVIDER = "llm_provider"
+        private const val KEY_LLM_MODEL = "llm_model"
+        private const val KEY_OCR_MODE = "ocr_mode"
+        private const val KEY_VISION_MODEL = "vision_model"
         private const val KEY_TOKEN = "auth_token"
         private const val KEY_USERNAME = "auth_username"
     }
@@ -32,6 +36,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     fun init(context: Context) {
         sharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         authToken = sharedPreferences?.getString(KEY_TOKEN, null)
+        loadAiSettings()
         // 服务端地址：优先用户已保存的地址，其次 assets/server_ip.txt（随项目 server_ip.txt 打包），最后默认值
         val saved = sharedPreferences?.getString(KEY_SERVER_ADDRESS, null)
         if (!saved.isNullOrEmpty()) {
@@ -104,11 +109,46 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     }
 
     /**
-     * 为任意请求追加认证头（统一入口）
+     * AI模型设置（随请求头发给服务端）
+     */
+    var llmProvider: String = "deepseek"   // deepseek / qwen
+    var llmModel: String = ""              // 大语言模型名（空=提供方默认）
+    var ocrMode: String = "paddle"         // paddle / qwen（千问视觉OCR）
+    var visionModel: String = ""           // 视觉模型名（空=默认 qwen3.8-max）
+
+    /**
+     * 为任意请求追加认证头 + AI模型头（统一入口）
      */
     private fun Request.Builder.withAuth(): Request.Builder {
         authToken?.let { addHeader("Authorization", "Bearer $it") }
+        addHeader("X-Engine", llmProvider)
+        if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
+        addHeader("X-OCR-Mode", ocrMode)
+        if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
         return this
+    }
+
+    /**
+     * 持久化AI模型设置
+     */
+    fun saveAiSettings(llmProvider: String, llmModel: String, ocrMode: String, visionModel: String) {
+        sharedPreferences?.edit()
+            ?.putString(KEY_LLM_PROVIDER, llmProvider)
+            ?.putString(KEY_LLM_MODEL, llmModel)
+            ?.putString(KEY_OCR_MODE, ocrMode)
+            ?.putString(KEY_VISION_MODEL, visionModel)
+            ?.apply()
+        this.llmProvider = llmProvider
+        this.llmModel = llmModel
+        this.ocrMode = ocrMode
+        this.visionModel = visionModel
+    }
+
+    fun loadAiSettings() {
+        llmProvider = sharedPreferences?.getString(KEY_LLM_PROVIDER, "deepseek") ?: "deepseek"
+        llmModel = sharedPreferences?.getString(KEY_LLM_MODEL, "") ?: ""
+        ocrMode = sharedPreferences?.getString(KEY_OCR_MODE, "paddle") ?: "paddle"
+        visionModel = sharedPreferences?.getString(KEY_VISION_MODEL, "") ?: ""
     }
 
     private val client = OkHttpClient.Builder()
@@ -185,8 +225,14 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
     /**
      * 追问（SSE流式）：与AI解题相同的流式方式，回答逐chunk回调
+     * onRendered: 服务端把LaTeX代码块渲染成图片后回调完整渲染结果（替换气泡内容）
      */
-    suspend fun askQuestionStream(sessionId: String, question: String, onChunk: suspend (String) -> Unit) {
+    suspend fun askQuestionStream(
+        sessionId: String,
+        question: String,
+        onChunk: suspend (String) -> Unit,
+        onRendered: (suspend (String) -> Unit)? = null,
+    ) {
         withContext(Dispatchers.IO) {
             val json = JSONObject().apply {
                 put("session_id", sessionId)
@@ -221,6 +267,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                                 val ev = JSONObject(data)
                                 when (ev.optString("stage")) {
                                     "answer_chunk" -> onChunk(ev.optString("content", ""))
+                                    "answer_rendered" -> onRendered?.invoke(ev.optString("content", ""))
                                     "complete" -> return@withContext
                                     "error" -> throw Exception(ev.optString("content", "生成失败"))
                                 }
@@ -456,11 +503,20 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         val subjectCount: Int,
     )
 
-    suspend fun getHistory(startDate: String, endDate: String): HistoryResult {
+    suspend fun getHistory(
+        startDate: String,
+        endDate: String,
+        subject: String = "",
+        grade: String = "",
+        difficulty: String = "",
+    ): HistoryResult {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply {
                 put("start_date", startDate)
                 put("end_date", endDate)
+                put("subject", subject)
+                put("grade", grade)
+                put("difficulty", difficulty)
             }
             val body = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url("$BASE_URL/history").post(body).withAuth().build()

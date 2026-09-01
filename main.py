@@ -1,6 +1,13 @@
 import json
 import uuid
 import os
+import sys as _sys
+# Windows GBK 控制台无法打印 ⁻₂ 等Unicode字符会崩线程 → 强制UTF-8+替换
+for _s in (_sys.stdout, _sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -19,6 +26,7 @@ from server.services.search_service import search_service
 from server.services.report_generator import ReportGenerator
 from server.utils.latex_processor import process_latex_blocks, clean_markdown_for_display
 from server.utils.tikz_md_renderer import get_available_latex_engines
+from server.utils.image_utils import save_uploaded_image
 from server.services.discovery_service import DiscoveryService
 from server.services.solve_pipeline import solve_pipeline
 from server.services.animation_service import generate_animation
@@ -124,18 +132,36 @@ async def favicon():
     return Response(status_code=204)
 
 def get_engine(request: Request) -> str:
-    """AI引擎（当前仅DeepSeek，混元已下线移除；保留读取逻辑以防旧客户端带引擎头）"""
+    """AI提供方（X-Engine头，deepseek/qwen），默认deepseek"""
     engine = (request.headers.get("X-Engine") or "deepseek").lower()
-    return engine if engine == "deepseek" else "deepseek"
+    return engine if engine in ("deepseek", "qwen") else "deepseek"
+
+
+def get_llm_model(request: Request) -> Optional[str]:
+    """大语言模型名（X-LLM-Model头），未指定用提供方默认"""
+    m = (request.headers.get("X-LLM-Model") or "").strip()
+    return m or None
+
+
+def get_ocr_mode(request: Request) -> str:
+    """OCR模式（X-OCR-Mode头：paddle/qwen），默认paddle"""
+    mode = (request.headers.get("X-OCR-Mode") or "paddle").lower()
+    return mode if mode in ("paddle", "qwen") else "paddle"
+
+
+def get_vision_model(request: Request) -> Optional[str]:
+    """视觉/OCR模型名（X-Vision-Model头）"""
+    m = (request.headers.get("X-Vision-Model") or "").strip()
+    return m or None
 
 @app.post("/solve")
 async def solve_problem(request: Request, file: UploadFile = File(...)):
     request_id = str(uuid.uuid4())
     
     image_path = HISTORY_DIR / f"{request_id}.jpg"
-    with open(image_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    content = await file.read()
+    # 最长边压缩至1000像素以下，便于后续OCR识别
+    save_uploaded_image(content, image_path)
     
     # 用同一个 request_id 启动流程；传入请求Host用于构造LaTeX图片URL，user_id用于数据隔离
     solve_pipeline.start_solve(
@@ -144,6 +170,9 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         base_host=request.headers.get("host") or None,
         user_id=get_current_user(request),
         engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
     )
     
     return {
@@ -227,7 +256,7 @@ async def ask_question(request: AskRequest):
             [{"role": h.role, "content": h.content} for h in history]
         )
 
-        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request))
+        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request), model=get_llm_model(request))
 
         # 保存本次问答到数据库，保证后续追问上下文连续
         for role, content in (("user", request.question), ("assistant", response)):
@@ -255,11 +284,12 @@ async def ask_question_stream(request: Request, body: AskRequest):
             [{"role": h.role, "content": h.content} for h in history]
         )
         engine = get_engine(request)
+        llm_model = get_llm_model(request)
 
         async def event_stream():
             accumulated = ""
             prev_sent = ""
-            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine):
+            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine, model=llm_model):
                 accumulated = chunk
                 # AI流式回调返回“累积到当前”的全文：只下发新增部分，客户端累加后不会重复
                 delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
@@ -267,11 +297,31 @@ async def ask_question_stream(request: Request, body: AskRequest):
                 if delta:
                     yield f"data: {json.dumps({'stage': 'answer_chunk', 'content': delta}, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.01)
+            
+            # ① 追问若包含LaTeX图形代码块 → 本地渲染为图片并下发渲染结果（含“（*图形渲染失败*）”提示）
+            final_answer = accumulated
+            if "```" in final_answer:
+                try:
+                    from server.utils.latex_processor import process_latex_blocks_with_retry
+                    svg_dir = HISTORY_DIR / f"svgs_ask_{body.session_id[:16]}"
+                    svg_dir.mkdir(parents=True, exist_ok=True)
+                    rendered = process_latex_blocks_with_retry(
+                        final_answer, svg_dir, ai_service=ai_service,
+                        engine=engine, model=llm_model
+                    )
+                    rendered = rewrite_static_urls(rendered, get_request_host(request))
+                    if rendered != final_answer:
+                        final_answer = rendered
+                        yield f"data: {json.dumps({'stage': 'answer_rendered', 'content': final_answer}, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"[ask/stream] 追问LaTeX渲染失败: {e}")
+            
             # 保存本次问答到数据库（流结束、response返回后执行，需新开会话）
             try:
                 db2 = SessionLocal()
                 try:
-                    for role, content in (("user", body.question), ("assistant", accumulated)):
+                    for role, content in (("user", body.question), ("assistant", final_answer)):
                         conv = CH(session_id=body.session_id, role=role, content=content)
                         db2.add(conv)
                     db2.commit()
@@ -297,11 +347,10 @@ async def ask_question_stream(request: Request, body: AskRequest):
 async def create_animation(file: UploadFile = File(...)):
     """生成AI动画"""
     request_id = str(uuid.uuid4())
-    # 保存图片
+    # 保存图片（最长边压缩至1000像素以下，便于后续OCR）
     image_path = HISTORY_DIR / f"{request_id}.jpg"
-    with open(image_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    content = await file.read()
+    save_uploaded_image(content, image_path)
     # OCR 识别
     ocr_text, _, _ = ocr_service.recognize(str(image_path))
     if not ocr_text or ocr_text.startswith("OCR"):
@@ -358,7 +407,7 @@ async def ai_report(request: Request, body: ReportRequest):
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
         
-        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request))
+        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request), model=get_llm_model(request))
         
         return {
             "status": "ok",
@@ -383,7 +432,7 @@ async def ai_report_stream(request: Request, body: ReportRequest):
             # 先发摘要供客户端展示
             yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
             # 流式生成报告正文
-            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request)):
+            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request), model=get_llm_model(request)):
                 yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
             yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
@@ -422,10 +471,10 @@ async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     """知识延伸"""
     request_id = str(uuid.uuid4())
     image_path = HISTORY_DIR / f"{request_id}.jpg"
-    with open(image_path, "wb") as f:
-        f.write(await file.read())
+    # 最长边压缩至1000像素以下，便于后续OCR识别
+    save_uploaded_image(await file.read(), image_path)
     
-    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request))
+    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request), ocr_mode=get_ocr_mode(request), vision_model=get_vision_model(request), model=get_llm_model(request))
     
     return {"request_id": request_id, "status": "processing"}
 
@@ -484,13 +533,17 @@ async def get_history(request: Request, body: dict):
         else:
             query = query.filter(SubmissionRecord.user_id.is_(None))
         
-        # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”）
+        # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”），并在Python侧应用筛选
         all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
-        total_count = len(all_records)
+        
+        # ③ 筛选参数（客户端“筛选”面板：学科/年级/难度）
+        filter_subject = (body.get("subject") or "").strip()
+        filter_grade = (body.get("grade") or "").strip()
+        filter_difficulty = (body.get("difficulty") or "").strip()
         
         result = []
         all_subjects = set()
-        # 学科统计基于全量记录
+        # 学科统计基于筛选后的全量记录
         for r in all_records:
             subj = ""
             qi = r.question_info
@@ -530,6 +583,14 @@ async def get_history(request: Request, body: dict):
                 extracted = extract_subjects(clean_ocr)
                 if extracted and extracted[0] != "其他":
                     subject = extracted[0]
+            
+            # ③ 应用学科/年级/难度筛选
+            if filter_subject and subject != filter_subject:
+                continue
+            if filter_grade and grade != filter_grade:
+                continue
+            if filter_difficulty and difficulty != filter_difficulty:
+                continue
             
             if subject:
                 all_subjects.add(subject)
@@ -574,7 +635,7 @@ async def get_history(request: Request, body: dict):
         return {
             "status": "ok",
             "records": result,
-            "total_count": total_count,
+            "total_count": len(result),
             "subject_count": len(all_subjects)  # Feature 18: 学科数
         }
     finally:
@@ -818,7 +879,7 @@ async def generate_geogebra(request: Request, body: GeoGebraRequest):
 5. 如果涉及几何，请绘制对应的几何图形并标注关键点
 6. 不要输出任何解释文字，只输出命令"""
         
-        response = ai_service.generate_response(prompt, engine=get_engine(request))
+        response = ai_service.generate_response(prompt, engine=get_engine(request), model=get_llm_model(request))
         
         # 清理响应，提取纯命令
         import re as _re
@@ -839,6 +900,8 @@ async def generate_geogebra(request: Request, body: GeoGebraRequest):
         ggb_dir.mkdir(parents=True, exist_ok=True)
         html_name = f"ggb_{uuid.uuid4().hex[:8]}.html"
         html_path = ggb_dir / html_name
+        # ⑥ deployggb.js 优先使用本地缓存（实体机/模拟器加载更快），失败回退CDN
+        ggb_script = ensure_geogebra_assets()
         
         html_content = f"""<!DOCTYPE html>
 <html>
@@ -846,6 +909,7 @@ async def generate_geogebra(request: Request, body: GeoGebraRequest):
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
     <title>数学图形</title>
+    <script src="{ggb_script}"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         html, body {{ width: 100%; height: 100%; background: #1A1A2E; overflow: hidden; }}
@@ -854,7 +918,6 @@ async def generate_geogebra(request: Request, body: GeoGebraRequest):
 </head>
 <body>
     <div id="ggb-container"></div>
-    <script src="https://www.geogebra.org/apps/deployggb.js"></script>
     <script>
         const commands = {commands_array};
         const params = {{
@@ -973,6 +1036,50 @@ def _move_record_files_to_recycle_bin(record) -> str:
         except Exception as e:
             print(f"[recycle] 移动失败 {p}: {e}")
     return str(dest)
+
+
+_GEOGEBRA_ASSETS_DIR = HISTORY_DIR / "geogebra_assets"
+
+
+def ensure_geogebra_assets() -> str:
+    """确保本地 deployggb.js 存在（从 geogebra.org 下载缓存一次），返回本地URL；失败回退CDN"""
+    try:
+        _GEOGEBRA_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        target = _GEOGEBRA_ASSETS_DIR / "deployggb.js"
+        # 校验：文件存在且大小合理（deployggb.js 实际约 37KB，内容含 GeoGebra 标识）
+        valid = target.exists() and target.stat().st_size > 10_000
+        if valid:
+            try:
+                head = target.read_bytes()[:512].lower()
+                if b"geogebra" not in head and b"ggbapplet" not in head:
+                    valid = False
+            except Exception:
+                valid = False
+        if not valid:
+            import urllib.request
+            print("[GeoGebra] 下载 deployggb.js 到本地缓存...")
+            tmp = target.with_suffix(".js.tmp")
+            try:
+                with urllib.request.urlopen(
+                        "https://www.geogebra.org/apps/deployggb.js", timeout=60) as resp, open(tmp, "wb") as f:
+                    f.write(resp.read())
+                if tmp.exists() and tmp.stat().st_size > 10_000:
+                    tmp.replace(target)
+                    print(f"[GeoGebra] 本地缓存完成: {target.stat().st_size} bytes")
+                else:
+                    print(f"[GeoGebra] 下载结果异常({tmp.stat().st_size if tmp.exists() else 0} bytes)，回退CDN")
+                    if tmp.exists():
+                        tmp.unlink()
+                    return "https://www.geogebra.org/apps/deployggb.js"
+            except Exception as e:
+                print(f"[GeoGebra] 下载失败，回退CDN: {e}")
+                if tmp.exists():
+                    tmp.unlink()
+                return "https://www.geogebra.org/apps/deployggb.js"
+        return "/static/geogebra_assets/deployggb.js"
+    except Exception as e:
+        print(f"[GeoGebra] 本地缓存失败，回退CDN: {e}")
+        return "https://www.geogebra.org/apps/deployggb.js"
 
 
 # 解题流水线内部使用的提示词前缀（追问时应从上下文剔除，防止AI模仿之前的JSON输出格式）

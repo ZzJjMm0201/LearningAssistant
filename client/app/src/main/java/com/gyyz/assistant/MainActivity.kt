@@ -96,6 +96,7 @@ sealed class AppState {
             val suggestedQuestions: List<String> = emptyList(),
             val suggestedQA: List<QAItem> = emptyList(),
             val qaList: List<QAItem> = emptyList(),
+            val searchResults: List<Map<String, String>> = emptyList(),
             val ocrText: String = "",
             val pendingAnswer: String = "",
             val isAnswering: Boolean = false,
@@ -123,7 +124,7 @@ sealed class AppState {
 /**
  * 问答对：问题 + 答案（AI预判问题自带答案；用户追问后追加）
  */
-data class QAItem(val question: String, val answer: String = "")
+data class QAItem(val question: String, val answer: String = "", val rendered: Boolean = false)
 
 enum class SolveStage {
     UPLOADING,
@@ -248,6 +249,11 @@ class MainViewModel : ViewModel() {
     fun initApiService(context: android.content.Context) {
         apiService.init(context)
         showWelcomeDialog.value = !apiService.isWelcomeDismissed()
+        // 同步AI模型设置（从持久化读取）
+        llmProvider.value = apiService.llmProvider
+        llmModel.value = apiService.llmModel
+        ocrMode.value = apiService.ocrMode
+        visionModel.value = apiService.visionModel
         if (apiService.isLoggedIn()) {
             _isLoggedIn.value = true
             _loggedInUsername.value = apiService.getUsername() ?: ""
@@ -502,6 +508,10 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun saveAiSettings() {
+        apiService.saveAiSettings(llmProvider.value, llmModel.value, ocrMode.value, visionModel.value)
+    }
+
     fun startSolving() {
         _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
         _statusText.value = "正在拍照..."
@@ -528,6 +538,7 @@ class MainViewModel : ViewModel() {
         masteryVisible.value = false  // 新一次解题开始时隐藏掌握程度按钮
         masterySaved.value = false
         masteryLevel.value = ""
+        solveSearchResults.value = emptyList()
         lastPhotoFile = photoFile
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -667,6 +678,30 @@ class MainViewModel : ViewModel() {
                                     "search_complete" -> {
                                         solveProgress.value = "阶段 1/6 · 搜索题库"
                                         _statusText.value = "AI正在分析..."
+                                    }
+                                    "search_results" -> {
+                                        // ④ 搜题结果：客户端用按钮+Markdown展示
+                                        val arr = json.optJSONArray("content")
+                                        val items = mutableListOf<Map<String, String>>()
+                                        if (arr != null) {
+                                            for (i in 0 until arr.length()) {
+                                                val o = arr.optJSONObject(i)
+                                                if (o != null) {
+                                                    items.add(
+                                                            mapOf(
+                                                                    "question_md" to o.optString("question_md", ""),
+                                                                    "hint_md" to o.optString("hint_md", ""),
+                                                                    "answer_md" to o.optString("answer_md", ""),
+                                                                    "subject" to o.optString("subject", ""),
+                                                                    "grade" to o.optString("grade", ""),
+                                                                    "point_name" to o.optString("point_name", ""),
+                                                            )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        solveSearchResults.value = items
+                                        _statusText.value = "找到 ${items.size} 条相似题目"
                                     }
                                     "question_info" -> {
                                         _statusText.value = "正在生成解题思路..."
@@ -848,25 +883,40 @@ class MainViewModel : ViewModel() {
                 // 流式回答：与AI解题相同的SSE方式，回答逐字显示在气泡中
                 val sb = StringBuilder()
                 var lastAskUpdate = 0L
-                apiService.askQuestionStream(currentState.requestId, question) { chunk ->
-                    // 服务端可能下发增量或累积全文：仅追加新增部分，避免“重复多一个字”
-                    appendStreamDelta(sb, chunk)
-                    val now = System.currentTimeMillis()
-                    if (now - lastAskUpdate >= 100) {
-                        lastAskUpdate = now
-                        val partial = sb.toString()
-                        withContext(Dispatchers.Main) {
-                            _appState.value =
-                                    currentState.copy(pendingAnswer = partial, isAnswering = true)
+                var answerRendered = false
+                apiService.askQuestionStream(
+                        currentState.requestId,
+                        question,
+                        onChunk = { chunk ->
+                            // 服务端可能下发增量或累积全文：仅追加新增部分，避免“重复多一个字”
+                            appendStreamDelta(sb, chunk)
+                            val now = System.currentTimeMillis()
+                            if (now - lastAskUpdate >= 100) {
+                                lastAskUpdate = now
+                                val partial = sb.toString()
+                                withContext(Dispatchers.Main) {
+                                    _appState.value =
+                                            currentState.copy(pendingAnswer = partial, isAnswering = true)
+                                }
+                            }
+                        },
+                        onRendered = { rendered ->
+                            // ① 追问LaTeX已渲染为图片：用渲染后的Markdown替换气泡内容
+                            answerRendered = true
+                            sb.setLength(0)
+                            sb.append(rendered)
+                            withContext(Dispatchers.Main) {
+                                _appState.value =
+                                        currentState.copy(pendingAnswer = rendered, isAnswering = true)
+                            }
                         }
-                    }
-                }
+                )
 
                 withContext(Dispatchers.Main) {
                     // 问答追加到对话记录（气泡展示），不再混入完整解析
                     _appState.value =
                             currentState.copy(
-                                    qaList = currentState.qaList + QAItem(question, sb.toString()),
+                                    qaList = currentState.qaList + QAItem(question, sb.toString(), answerRendered),
                                     pendingAnswer = "",
                                     isAnswering = false
                             )
@@ -1256,6 +1306,13 @@ class MainViewModel : ViewModel() {
 
     val historyStartDate = MutableStateFlow("")
     val historyEndDate = MutableStateFlow("")
+    // ⑤ AI模型设置（大语言模型提供方/模型 + 视觉OCR模型）
+    val llmProvider = MutableStateFlow("deepseek")
+    val llmModel = MutableStateFlow("")
+    val ocrMode = MutableStateFlow("paddle")
+    val visionModel = MutableStateFlow("")
+    // ④ 搜题结果（SSE search_results 阶段下发，客户端按钮+Markdown展示）
+    val solveSearchResults = MutableStateFlow<List<Map<String, String>>>(emptyList())
 
     fun updateServerAddress(address: String) {
         serverAddress.value = address.removePrefix("http://")
@@ -1537,30 +1594,13 @@ class MainActivity : ComponentActivity() {
                         Log.d(TAG, "手势识别: $fingerCount 根手指")
                             runOnUiThread {
                                 when (fingerCount) {
-                                    5 -> {
-                                        mainViewModel.startSolving()
-                                        imageCapture?.let { capture ->
-                                            takePhotoAndUpload(capture, mainViewModel)
-                                        }
-                                                ?: Log.e(TAG, "imageCapture 为空，无法拍照")
-                                    }
-                                    4 -> {
-                                        imageCapture?.let { capture ->
-                                            takePhotoAndUploadAnimation(capture, mainViewModel)
-                                        }
-                                                ?: Log.e(TAG, "imageCapture 为空，无法拍照")
-                                    }
-                                    3 -> {
-                                        mainViewModel.onGestureDetected(3)
-                                    }
-                                    2 -> {
-                                        mainViewModel.onGestureDetected(2)
-                                    }
-                                    1 -> {
-                                        imageCapture?.let { capture ->
-                                            takePhotoAndUploadExtend(capture, mainViewModel)
-                                        }
-                                    }
+                                    // ⑦ 统一拍照链路：手势与按钮走同一方法（避免相机状态不一致导致 “Camera is closed”）；
+                                    // 不再手动调用 startSolving()（onPhotoReady 会负责状态切换），避免拍照前相机被解绑
+                                    5 -> mainViewModel.onButtonSolve()
+                                    4 -> mainViewModel.onButtonAnimation()
+                                    3 -> mainViewModel.onGestureDetected(3)
+                                    2 -> mainViewModel.onGestureDetected(2)
+                                    1 -> mainViewModel.onButtonExtend()
                                 }
                             }
                         },
@@ -2309,7 +2349,7 @@ fun SolvingScreen(
 
             if (solveState.stage == SolveStage.UPLOADING || solveState.stage == SolveStage.ANALYZING) {
                 Box(
-                        modifier = Modifier.fillMaxWidth().height(200.dp),
+                        modifier = Modifier.fillMaxWidth().height(100.dp),
                         contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator(color = Color(0xFF00D2FF))
@@ -2354,6 +2394,60 @@ fun SolvingScreen(
                 )
             }
 
+            // ④ 搜题结果：按钮展开 + Markdown 展示
+            val searchResults by (viewModel?.solveSearchResults ?: MutableStateFlow(emptyList())).collectAsState()
+            if (searchResults.isNotEmpty()) {
+                var showSearch by remember { mutableStateOf(false) }
+                Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3A4B))
+                ) {
+                    Column(
+                            modifier =
+                                    Modifier.fillMaxWidth()
+                                            .clickable { showSearch = !showSearch }
+                                            .padding(12.dp)
+                    ) {
+                        Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                    "🔍 搜题结果（${searchResults.size} 条）",
+                                    color = Color(0xFFFFB74D),
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                    if (showSearch) "▲ 收起" else "▼ 展开",
+                                    color = Color(0xFF00D2FF),
+                                    fontSize = 12.sp
+                            )
+                        }
+                        if (showSearch) {
+                            searchResults.forEachIndexed { idx, item ->
+                                val md = buildString {
+                                    append("### 题目 ${idx + 1}")
+                                    item["subject"]?.takeIf { it.isNotEmpty() }?.let { append("　**学科**：$it") }
+                                    item["grade"]?.takeIf { it.isNotEmpty() }?.let { append("　**学段**：$it") }
+                                    item["point_name"]?.takeIf { it.isNotEmpty() }?.let { append("　**知识点**：$it") }
+                                    item["question_md"]?.takeIf { it.isNotEmpty() }?.let { append("\n\n$it") }
+                                    item["hint_md"]?.takeIf { it.isNotEmpty() }?.let { append("\n\n**解析**：\n$it") }
+                                    item["answer_md"]?.takeIf { it.isNotEmpty() }?.let { append("\n\n**答案**：\n$it") }
+                                }
+                                MarkdownView(
+                                        content = md,
+                                        fontSize = 13f,
+                                        modifier = Modifier.padding(vertical = 6.dp)
+                                )
+                                Divider(color = Color.White.copy(alpha = 0.15f))
+                            }
+                        }
+                    }
+                }
+            }
+            
             // 互动问答区：预测问题 + 对话记录 + 输入框（解题进入互动阶段后显示）
             if ((solveState.stage == SolveStage.INTERACTIVE || solveState.stage == SolveStage.COMPLETED) && showModules.getOrDefault("suggested_questions", true)) {
                 if (solveState.suggestedQA.isNotEmpty() || solveState.suggestedQuestions.isNotEmpty()) {
@@ -2450,7 +2544,7 @@ fun SolvingScreen(
                                 )
                             }
                         }
-                        // AI回答（左对齐灰色气泡）
+                        // AI回答（左对齐灰色气泡）；含LaTeX渲染图/代码时用Markdown渲染（①）
                         if (item.answer.isNotEmpty()) {
                             Row(modifier = Modifier.fillMaxWidth()) {
                                 Surface(
@@ -2458,12 +2552,20 @@ fun SolvingScreen(
                                         shape = RoundedCornerShape(12.dp, 12.dp, 12.dp, 4.dp),
                                         modifier = Modifier.fillMaxWidth(0.92f).padding(vertical = 4.dp)
                                 ) {
-                                    Text(
-                                            item.answer,
-                                            color = Color(0xFFE0E0E0),
-                                            fontSize = 13.sp,
-                                            modifier = Modifier.padding(10.dp)
-                                    )
+                                    if (item.rendered || item.answer.contains("```") || item.answer.contains("![")) {
+                                        MarkdownView(
+                                                content = item.answer,
+                                                fontSize = 13f,
+                                                modifier = Modifier.padding(10.dp)
+                                        )
+                                    } else {
+                                        Text(
+                                                item.answer,
+                                                color = Color(0xFFE0E0E0),
+                                                fontSize = 13.sp,
+                                                modifier = Modifier.padding(10.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -3204,6 +3306,7 @@ fun VoiceFloatingActionButton(
                     SpeechRecognizer.ERROR_NO_MATCH -> "未听清，请重试"
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "未检测到语音"
                     SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "缺少录音权限"
+                    SpeechRecognizer.ERROR_CLIENT -> "语音识别服务不可用（未安装语音引擎）"
                     else -> "语音识别错误: $error"
                 }
                 Toast.makeText(context, errorMsg, Toast.LENGTH_SHORT).show()
@@ -3231,6 +3334,15 @@ fun VoiceFloatingActionButton(
         onClick = {
             if (!hasAudioPermission) {
                 audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return@FloatingActionButton
+            }
+            // ⑦ 语音识别需要系统语音服务（Google/讯飞等），无服务时给出明确提示
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                Toast.makeText(
+                        context,
+                        "设备未安装语音识别服务（无 Google/讯飞等语音引擎），无法使用语音",
+                        Toast.LENGTH_LONG
+                ).show()
                 return@FloatingActionButton
             }
             if (!isListening) {
@@ -3688,8 +3800,11 @@ fun HistoryViewScreen(
     var dateError by remember { mutableStateOf("") }
     // 清除全部确认框
     var showClearConfirm by remember { mutableStateOf(false) }
-    // 学科筛选器（空=全部）
+    // ③ 筛选器（空=全部）
     var subjectFilter by remember { mutableStateOf("") }
+    var gradeFilter by remember { mutableStateOf("") }
+    var difficultyFilter by remember { mutableStateOf("") }
+    var showFilterDialog by remember { mutableStateOf(false) }
     
     fun loadHistory() {
         // Feature 16: 日期格式验证
@@ -3711,7 +3826,10 @@ fun HistoryViewScreen(
                 // 使用ViewModel的ApiService（带token与服务器地址），否则登录用户看不到自己的记录
                 val result = viewModel.apiService.getHistory(
                     startDate = historyStartDate,
-                    endDate = historyEndDate
+                    endDate = historyEndDate,
+                    subject = subjectFilter,
+                    grade = gradeFilter,
+                    difficulty = difficultyFilter,
                 )
                 withContext(Dispatchers.Main) {
                     records = result.records
@@ -3817,34 +3935,43 @@ fun HistoryViewScreen(
             }
         }
         
+        // ③ 筛选按钮行（日期/学科/年级/难度统一在筛选面板中）
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
+                modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
         ) {
-            OutlinedTextField(
-                value = historyStartDate,
-                onValueChange = { viewModel.historyStartDate.value = it; dateError = "" },
-                modifier = Modifier.weight(1f).height(44.dp),
-                placeholder = { Text("开始日期 (2026-01-01)", color = Color.Gray, fontSize = 12.sp) },
-                singleLine = true,
-                isError = dateError.isNotEmpty(),
-                colors = darkTextFieldColors(),
-                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
-            )
-            Text("至", color = Color.Gray, fontSize = 12.sp)
-            OutlinedTextField(
-                value = historyEndDate,
-                onValueChange = { viewModel.historyEndDate.value = it; dateError = "" },
-                modifier = Modifier.weight(1f).height(44.dp),
-                placeholder = { Text("截止日期 (2026-12-31)", color = Color.Gray, fontSize = 12.sp) },
-                singleLine = true,
-                isError = dateError.isNotEmpty(),
-                colors = darkTextFieldColors(),
-                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
-            )
+            Button(
+                    onClick = { showFilterDialog = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+            ) { Text("🔍 筛选", color = Color.White, fontSize = 13.sp) }
+            val activeFilters =
+                    listOf(subjectFilter, gradeFilter, difficultyFilter).filter { it.isNotEmpty() }
+            if (activeFilters.isNotEmpty()) {
+                Text(
+                        "已选：${activeFilters.joinToString(" / ")}",
+                        color = Color(0xFF00D2FF),
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f)
+                )
+                TextButton(
+                        onClick = {
+                            subjectFilter = ""
+                            gradeFilter = ""
+                            difficultyFilter = ""
+                            loadHistory()
+                        }
+                ) { Text("重置", color = Color(0xFFF44336), fontSize = 12.sp) }
+            } else {
+                Text(
+                        "可按日期/学科/年级/难度筛选",
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f)
+                )
+            }
         }
         
         // Feature 16: 日期格式错误提示
@@ -3858,47 +3985,6 @@ fun HistoryViewScreen(
         }
         
         Spacer(modifier = Modifier.height(8.dp))
-
-        // 学科筛选器：基于当前加载记录生成学科列表
-        val allSubjects = remember(records) {
-            records.map { it.subject }.filter { it.isNotEmpty() }.distinct().sorted()
-        }
-        if (allSubjects.isNotEmpty()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                FilterChip(
-                        selected = subjectFilter.isEmpty(),
-                        onClick = { subjectFilter = "" },
-                        label = { Text("全部", fontSize = 12.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = Color(0xFF00D2FF),
-                                selectedLabelColor = Color.White,
-                                labelColor = Color.White,
-                                containerColor = Color(0xFF2D2D44)
-                        )
-                )
-                allSubjects.forEach { subj ->
-                    FilterChip(
-                            selected = subjectFilter == subj,
-                            onClick = { subjectFilter = if (subjectFilter == subj) "" else subj },
-                            label = { Text(subj, fontSize = 12.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = Color(0xFF00D2FF),
-                                    selectedLabelColor = Color.White,
-                                    labelColor = Color.White,
-                                    containerColor = Color(0xFF2D2D44)
-                            )
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-        }
         
         when {
             isLoading -> {
@@ -4017,9 +4103,9 @@ fun HistoryViewScreen(
                     val displaySubjects = if (subjectCount > 0) subjectCount
                     else records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size
                     val filterNote =
-                            if (subjectFilter.isNotEmpty()) " | 当前筛选：$subjectFilter ${filteredRecords.size} 条" else ""
+                            if (subjectFilter.isNotEmpty()) " \n 当前筛选：$subjectFilter ${filteredRecords.size} 条" else ""
                     Text(
-                        "共${displayTotal} 条记录 | ${displaySubjects} 门学科$filterNote",
+                        "共${displayTotal} 条记录 \n ${displaySubjects} 门学科$filterNote",
                         color = Color.Gray,
                         fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.CenterVertically)
@@ -4082,6 +4168,159 @@ fun HistoryViewScreen(
                     },
                     dismissButton = {
                         TextButton(onClick = { showClearConfirm = false }) { Text("取消", color = Color.Gray) }
+                    },
+                    containerColor = Color(0xFF16213E)
+            )
+        }
+        
+        // ③ 筛选面板（日期/学科/年级/难度，类似“设置”框）
+        if (showFilterDialog) {
+            val allSubjects =
+                    records.map { it.subject }.filter { it.isNotEmpty() }.distinct().sorted()
+            val allGrades =
+                    records.map { it.grade }.filter { it.isNotEmpty() }.distinct().sorted()
+            val difficultyOptions = listOf("易", "较易", "中", "较难", "难")
+            AlertDialog(
+                    onDismissRequest = { showFilterDialog = false },
+                    title = { Text("🔍 筛选历史记录", color = Color.White) },
+                    text = {
+                        Column(
+                                modifier = Modifier.verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("📅 日期范围", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                        value = historyStartDate,
+                                        onValueChange = { viewModel.historyStartDate.value = it; dateError = "" },
+                                        modifier = Modifier.weight(1f).height(44.dp),
+                                        placeholder = { Text("开始 2026-01-01", color = Color.Gray, fontSize = 12.sp) },
+                                        singleLine = true,
+                                        isError = dateError.isNotEmpty(),
+                                        colors = darkTextFieldColors(),
+                                        textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+                                )
+                                Text("至", color = Color.Gray, fontSize = 12.sp)
+                                OutlinedTextField(
+                                        value = historyEndDate,
+                                        onValueChange = { viewModel.historyEndDate.value = it; dateError = "" },
+                                        modifier = Modifier.weight(1f).height(44.dp),
+                                        placeholder = { Text("截止 2026-12-31", color = Color.Gray, fontSize = 12.sp) },
+                                        singleLine = true,
+                                        isError = dateError.isNotEmpty(),
+                                        colors = darkTextFieldColors(),
+                                        textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+                                )
+                            }
+                            if (dateError.isNotEmpty()) {
+                                Text(dateError, color = Color(0xFFF44336), fontSize = 12.sp)
+                            }
+                            
+                            Text("📚 学科", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                FilterChip(
+                                        selected = subjectFilter.isEmpty(),
+                                        onClick = { subjectFilter = "" },
+                                        label = { Text("全部", fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF00D2FF),
+                                                selectedLabelColor = Color.White,
+                                                labelColor = Color.White,
+                                                containerColor = Color(0xFF2D2D44)
+                                        )
+                                )
+                                allSubjects.forEach { subj ->
+                                    FilterChip(
+                                            selected = subjectFilter == subj,
+                                            onClick = { subjectFilter = if (subjectFilter == subj) "" else subj },
+                                            label = { Text(subj, fontSize = 12.sp) },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = Color(0xFF00D2FF),
+                                                    selectedLabelColor = Color.White,
+                                                    labelColor = Color.White,
+                                                    containerColor = Color(0xFF2D2D44)
+                                            )
+                                    )
+                                }
+                            }
+                            
+                            Text("🎓 年级", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                FilterChip(
+                                        selected = gradeFilter.isEmpty(),
+                                        onClick = { gradeFilter = "" },
+                                        label = { Text("全部", fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF7B2FBE),
+                                                selectedLabelColor = Color.White,
+                                                labelColor = Color.White,
+                                                containerColor = Color(0xFF2D2D44)
+                                        )
+                                )
+                                allGrades.forEach { g ->
+                                    FilterChip(
+                                            selected = gradeFilter == g,
+                                            onClick = { gradeFilter = if (gradeFilter == g) "" else g },
+                                            label = { Text(g, fontSize = 12.sp) },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = Color(0xFF7B2FBE),
+                                                    selectedLabelColor = Color.White,
+                                                    labelColor = Color.White,
+                                                    containerColor = Color(0xFF2D2D44)
+                                            )
+                                    )
+                                }
+                            }
+                            
+                            Text("📊 难度", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                FilterChip(
+                                        selected = difficultyFilter.isEmpty(),
+                                        onClick = { difficultyFilter = "" },
+                                        label = { Text("全部", fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF4CAF50),
+                                                selectedLabelColor = Color.White,
+                                                labelColor = Color.White,
+                                                containerColor = Color(0xFF2D2D44)
+                                        )
+                                )
+                                difficultyOptions.forEach { d ->
+                                    FilterChip(
+                                            selected = difficultyFilter == d,
+                                            onClick = { difficultyFilter = if (difficultyFilter == d) "" else d },
+                                            label = { Text(d, fontSize = 12.sp) },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = Color(0xFF4CAF50),
+                                                    selectedLabelColor = Color.White,
+                                                    labelColor = Color.White,
+                                                    containerColor = Color(0xFF2D2D44)
+                                            )
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                                onClick = {
+                                    showFilterDialog = false
+                                    loadHistory()
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                        ) { Text("应用", color = Color.Black, fontWeight = FontWeight.Bold) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showFilterDialog = false }) { Text("取消", color = Color.Gray) }
                     },
                     containerColor = Color(0xFF16213E)
             )
@@ -4314,14 +4553,26 @@ fun HistoryDetailScreen(
         isAsking = true
         pendingAsk = ""
         val sb = StringBuilder()
+        var answerRendered = false
         vm.viewModelScope.launch(Dispatchers.IO) {
             try {
-                vm.apiService.askQuestionStream(record.sessionId, q) { chunk ->
-                    appendStreamDelta(sb, chunk)
-                    pendingAsk = sb.toString()
-                }
+                vm.apiService.askQuestionStream(
+                        record.sessionId,
+                        q,
+                        onChunk = { chunk ->
+                            appendStreamDelta(sb, chunk)
+                            pendingAsk = sb.toString()
+                        },
+                        onRendered = { rendered ->
+                            // ① 追问LaTeX已渲染：用渲染后的Markdown替换
+                            answerRendered = true
+                            sb.setLength(0)
+                            sb.append(rendered)
+                            pendingAsk = rendered
+                        }
+                )
                 withContext(Dispatchers.Main) {
-                    historyQa = historyQa + QAItem(q, sb.toString())
+                    historyQa = historyQa + QAItem(q, sb.toString(), answerRendered)
                     pendingAsk = ""
                     isAsking = false
                 }
@@ -4414,7 +4665,7 @@ fun HistoryDetailScreen(
                         Text(displayTime, color = Color.White, fontSize = 13.sp)
                     }
                     
-                    if (record.grade.isNotEmpty() || record.subject.isNotEmpty()) {
+                    if (record.grade.isNotEmpty() || record.subject.isNotEmpty() || record.difficulty.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (record.grade.isNotEmpty()) {
@@ -4422,17 +4673,9 @@ fun HistoryDetailScreen(
                                 Text(record.grade, color = Color(0xFF7B2FBE), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             }
                             if (record.subject.isNotEmpty()) {
-                                Text("\n📉 学科:", color = Color.Gray, fontSize = 13.sp)
+                                Text("📉 学科:", color = Color.Gray, fontSize = 13.sp)
                                 Text(record.subject, color = Color(0xFF2196F3), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             }
-                        }
-                    }
-                    
-                    if (record.difficulty.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row {
-                            Text("📊 难度:", color = Color.Gray, fontSize = 13.sp)
-                            Spacer(modifier = Modifier.width(4.dp))
                             val diffColor = when (record.difficulty) {
                                 "易", "较易" -> Color(0xFF4CAF50)
                                 "中" -> Color(0xFFFF9800)
@@ -4447,7 +4690,6 @@ fun HistoryDetailScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("🔖 知识点", color = Color.Gray, fontSize = 13.sp)
                         Spacer(modifier = Modifier.height(4.dp))
-                        // ⑦ 每个知识点单独一行，避免挤在一行导致最后一个变成竖条
                         Column(
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -4675,12 +4917,20 @@ fun HistoryDetailScreen(
                                         shape = RoundedCornerShape(10.dp),
                                         modifier = Modifier.widthIn(max = 320.dp)
                                 ) {
-                                    Text(
-                                            item.answer,
-                                            color = Color(0xFFE0E0E0),
-                                            fontSize = 13.sp,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                    )
+                                    if (item.rendered || item.answer.contains("```") || item.answer.contains("![")) {
+                                        MarkdownView(
+                                                content = item.answer,
+                                                fontSize = 13f,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    } else {
+                                        Text(
+                                                item.answer,
+                                                color = Color(0xFFE0E0E0),
+                                                fontSize = 13.sp,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -4693,12 +4943,20 @@ fun HistoryDetailScreen(
                                         shape = RoundedCornerShape(10.dp),
                                         modifier = Modifier.widthIn(max = 320.dp)
                                 ) {
-                                    Text(
-                                            pendingAsk,
-                                            color = Color(0xFFE0E0E0),
-                                            fontSize = 13.sp,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                    )
+                                    if (pendingAsk.contains("```") || pendingAsk.contains("![")) {
+                                        MarkdownView(
+                                                content = pendingAsk,
+                                                fontSize = 13f,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    } else {
+                                        Text(
+                                                pendingAsk,
+                                                color = Color(0xFFE0E0E0),
+                                                fontSize = 13.sp,
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -4858,6 +5116,116 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                             showModules.toMutableMap().apply { put(key, it) }
                                 }
                         )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // ⑤ AI模型设置：大语言模型 + 视觉/OCR模型（千问）
+                    Text(
+                            "🤖 大语言模型",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                                selected = viewModel.llmProvider.value == "deepseek",
+                                onClick = {
+                                    viewModel.llmProvider.value = "deepseek"
+                                    viewModel.llmModel.value = ""
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("DeepSeek", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF2196F3)
+                                )
+                        )
+                        FilterChip(
+                                selected = viewModel.llmProvider.value == "qwen",
+                                onClick = {
+                                    viewModel.llmProvider.value = "qwen"
+                                    viewModel.llmModel.value = "qwen3.8-max"
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("千问 Qwen", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFFFF9800)
+                                )
+                        )
+                    }
+                    if (viewModel.llmProvider.value == "qwen") {
+                        Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("qwen3.8-max", "qwen3.7-plus", "qwen3.8-flash", "deepseek-v4-flash-0731", "kimi-k3", "glm-5.3", "MiniMax-M3").forEach { m ->
+                                FilterChip(
+                                        selected = viewModel.llmModel.value == m,
+                                        onClick = {
+                                            viewModel.llmModel.value = m
+                                            viewModel.saveAiSettings()
+                                        },
+                                        label = { Text(m, fontSize = 10.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFFFF9800)
+                                        )
+                                )
+                            }
+                        }
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    Text(
+                            "👁️ 文字识别（OCR）",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                                selected = viewModel.ocrMode.value == "paddle",
+                                onClick = {
+                                    viewModel.ocrMode.value = "paddle"
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("PaddleOCR（免费本地+API）", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF4CAF50)
+                                )
+                        )
+                        FilterChip(
+                                selected = viewModel.ocrMode.value == "qwen",
+                                onClick = {
+                                    viewModel.ocrMode.value = "qwen"
+                                    viewModel.visionModel.value = "qwen3.8-max"
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("千问视觉（流程图/统计图自动描述）", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFFFF9800)
+                                )
+                        )
+                    }
+                    if (viewModel.ocrMode.value == "qwen") {
+                        Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("qwen3.8-max", "qwen3.7-plus", "qwen3.5-omni-plus", "kimi-k3").forEach { m ->
+                                FilterChip(
+                                        selected = viewModel.visionModel.value == m,
+                                        onClick = {
+                                            viewModel.visionModel.value = m
+                                            viewModel.saveAiSettings()
+                                        },
+                                        label = { Text(m, fontSize = 10.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFFFF9800)
+                                        )
+                                )
+                            }
+                        }
                     }
 
                     Divider(color = Color.White.copy(alpha = 0.2f))
@@ -5189,7 +5557,7 @@ fun CountdownConfirmDialog(
                     ) {
                         // Markdown渲染（公式/加粗等可正常显示），高度受限可滚动
                         Box(
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp)
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)
                         ) {
                             MarkdownView(
                                 content = content,

@@ -71,17 +71,33 @@ class OCRService:
         os.environ['FLAGS_use_mkldnn'] = '0'
         os.environ['FLAGS_use_onednn'] = '0'
     
-    def recognize(self, image_path: str) -> Tuple[str, float, str]:
+    def recognize(self, image_path: str, mode: str = "paddle", vision_model: Optional[str] = None) -> Tuple[str, float, str]:
         """
-        双通道并行OCR识别（API + 本地同时进行）
+        OCR识别（Paddle双通道 或 千问视觉模型）
         
         Args:
             image_path: 图片文件路径
+            mode: "paddle"=PaddleOCR API+本地双通道（默认）；"qwen"=千问视觉模型（流程图/统计图会用自然语言描述）
+            vision_model: 千问视觉模型名（mode=qwen 时生效，默认 qwen3.8-max）
         
         Returns:
-            (合并后的识别文本, 耗时秒数, 来源说明)
-            来源说明："api", "local", "merged"
+            (识别文本, 耗时秒数, 来源说明)
         """
+        if mode == "qwen":
+            from server.services.ai_service import ai_service
+            text, elapsed = ai_service.recognize_image_with_vision(image_path, model=vision_model)
+            if text:
+                print(f"[OCR] 千问视觉识别完成，耗时{elapsed}s，文本长度={len(text)}")
+                return text, elapsed, "qwen_vision"
+            print("[OCR] 千问视觉识别失败/为空，回退到Paddle")
+            # 回退到 Paddle 通道
+            text2, elapsed2, src2 = self._recognize_paddle(image_path)
+            return text2, elapsed2, src2
+        
+        return self._recognize_paddle(image_path)
+    
+    def _recognize_paddle(self, image_path: str) -> Tuple[str, float, str]:
+        """PaddleOCR 双通道识别（API + 本地并行）"""
         start_total = time.time()
         results = {}  # source -> (text, time)
         

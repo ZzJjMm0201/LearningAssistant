@@ -18,9 +18,9 @@ class HandGestureRecognizer(
 ) {
     companion object {
         private const val TAG = "HandGesture"
-        private const val GESTURE_HOLD_THRESHOLD_MS = 600L  // 降到600ms，响应更快
+        private const val GESTURE_HOLD_THRESHOLD_MS = 1200L  // ⑦ 保持1.2秒才触发，避免过快误触
         private const val SMOOTHING_WINDOW_SIZE = 8         // 滑动窗口大小
-        private const val MIN_STABLE_COUNT = 5               // 窗口内至少出现次数才算稳定
+        private const val MIN_STABLE_COUNT = 6               // 窗口内至少出现次数才算稳定（提高准确率）
         private const val MAX_NO_HAND_FRAMES = 10            // 容忍短暂丢失
     }
 

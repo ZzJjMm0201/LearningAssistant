@@ -36,6 +36,14 @@ class APIConfig:
     DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY", "sk-3178b37524bf4a36a74fa8873d1ebdb5")
     DEEPSEEK_BASE_URL = "https://api.deepseek.com"
     
+    # 千问 API（阿里云百炼 OpenAI 兼容端点；Key 放 .env）
+    QWEN_API_KEY = _env("QWEN_API_KEY", "")
+    QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    
+    # 千问默认模型（客户端可在设置中选择）
+    QWEN_DEFAULT_LLM = "qwen3.8-max"
+    QWEN_DEFAULT_VISION = "qwen3.8-max"
+    
     # 好未来题库API
     SEARCH_ACCESS_KEY_ID = "1481449208266358784"
     SEARCH_ACCESS_KEY_SECRET = _env("SEARCH_ACCESS_KEY_SECRET", "8c329c183c8f470f9b52d006cb7282c5")

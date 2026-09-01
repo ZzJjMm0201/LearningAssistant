@@ -16,6 +16,13 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // MediaPipe tasks-vision 0.10.18 不提供 x86_64 的 so（只有 arm64-v8a/armeabi-v7a/x86）。
+        // 若 APK 混入其他库的 x86_64 so，系统会按 x86_64 运行导致 HandLandmarker 加载 JNI 失败闪退。
+        // 限定 arm64-v8a：真机正常；x86_64 模拟器会通过 ARM 翻译（abilist 含 arm64-v8a）运行手势识别。
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
