@@ -6,6 +6,58 @@ from openai import OpenAI
 from server.config import APIConfig, AI_MODEL
 from openai.types.chat import ChatCompletionMessageParam
 
+# ==================== 回答风格（②：可自定义，含各自temperature） ====================
+ANSWER_STYLES: Dict[str, Dict] = {
+    "formal": {
+        "label": "严谨规范",
+        "temperature": 0.3,
+        "instruction": "回答风格：严谨规范。用词准确、条理清晰、术语规范，像标准教辅解析。",
+    },
+    "plain": {
+        "label": "通俗易懂",
+        "temperature": 0.7,
+        "instruction": "回答风格：通俗易懂。像老师面对面讲解，多用比喻和生活化例子把概念讲明白，可适当口语化。",
+    },
+    "concise": {
+        "label": "简洁精炼",
+        "temperature": 0.4,
+        "instruction": "回答风格：简洁精炼。直奔重点，只保留关键步骤和结论，不铺垫、不啰嗦。",
+    },
+    "lively": {
+        "label": "活泼有趣",
+        "temperature": 0.9,
+        "instruction": "回答风格：活泼亲切。语气轻松自然，可少量使用emoji和鼓励性话语，但内容必须保持准确。",
+    },
+}
+DEFAULT_STYLE = "formal"
+
+# ==================== 重点颜色标记（⑥：[[#RRGGBB]]…[[#RRGGBB]]，深浅背景均可读） ====================
+COLOR_RULES = """【重点颜色标记（重要）】
+为了让重点更醒目，你可以在文字中给关键短句标色：
+格式：[[#RRGGBB]]需要标记的文字[[#RRGGBB]]（前后两个标记的颜色相同；RRGGBB为十六进制颜色值，例如 [[#E53935]]易错警示[[#E53935]]）
+规则：
+1. 只标记关键短句（30字以内），如核心结论、易错警示、重要公式结论；不要整段或大段标色，更不要全篇标色
+2. 颜色必须从下面“深浅背景都可读”的色板中选择：#E53935(警示红)、#FB8C00(强调橙)、#1E88E5(要点蓝)、#43A047(正确绿)、#8E24AA(进阶紫)、#00ACC1(补充青)、#6D4C41(注意棕)
+3. 不要把标记写进LaTeX公式、代码块、图片说明或JSON输出里
+4. 不要嵌套使用；一个标记结束后再开始下一个"""
+
+# ==================== 追问绘图强提示（①：追问必须能输出LaTeX/TikZ图形） ====================
+ASK_DRAW_RULE = ("回答要求：直接回答学生最新问题本身，用自然语言，禁止输出JSON格式或新的问题列表（除下方允许的LaTeX代码块外，不要输出其他代码块）。"
+                 "如讲解涉及函数图像、几何图形、过程示意等需要图形辅助的内容，务必在回答中输出1~3个可独立编译的```latex ... ```代码块"
+                 "（使用tikzpicture/pgfplots，不要documentclass等完整文档结构），每个代码块前用一行 **图N：标题** 说明该图作用，"
+                 "并把代码块放在对应讲解文字之后。若题目本身不含图形也可不输出。")
+
+
+def style_instruction(style: Optional[str]) -> str:
+    s = ANSWER_STYLES.get(style or "")
+    return s["instruction"] if s else ""
+
+
+def style_temperature(style: Optional[str]) -> Optional[float]:
+    s = ANSWER_STYLES.get(style or "")
+    return s["temperature"] if s else None
+
+
 class AIService:
     """AI多轮对话服务"""
     
@@ -35,30 +87,43 @@ class AIService:
             return self.qwen_client, model or self.qwen_model
         return self.client, model or self.model
     
-    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[Dict, None, None]:
+    def _thinking_supported(self, engine: Optional[str]) -> bool:
+        """思考模式（十一）：仅DeepSeek链路支持（千问模型未知是否支持，跳过）"""
+        return (engine or "deepseek") != "qwen"
+    
+    def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
+                             style: Optional[str] = None, thinking: bool = False) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
         Yields:
-            Dict: {"stage": "info"|"steps"|"solution"|"mindmap"|"questions", "content": ...}
+            Dict: {"stage": "info"|"steps"|"solution"|"mindmap"|"questions"|"thinking_chunk", "content": ...}
+        style: 回答风格id（②，影响文字类阶段的temperature与措辞）
+        thinking: 是否开启思考模式（十一，仅作用于“完整解析”阶段，思考内容经 thinking_chunk 下发）
         """
         start_time = time.time()
+        st_ins = style_instruction(style)
+        st_temp = style_temperature(style)
+        use_thinking = thinking and self._thinking_supported(engine)
         
-        # 构建系统提示
+        # 构建系统提示（含风格 + 颜色标记规则）
         system_prompt = self._build_system_prompt(ocr_text, search_result)
+        if st_ins:
+            system_prompt += "\n\n" + st_ins
+        system_prompt += "\n\n" + COLOR_RULES
         
         # 初始化对话历史
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
         
-        # === 第一阶段：结构化提取题目信息 ===
+        # === 第一阶段：结构化提取题目信息（⑩：含年级/学科/难度/知识点/易错点/难点） ===
         info_prompt = """请分析这道题目，以JSON格式输出以下信息：
     {
         "grade": "年级（如：高一、八年级、小学三年级）",
         "subject": "学科（语文、数学、英语、物理、化学、生物、历史、地理、政治）",
         "difficulty": "难度（易、较易、中、较难、难）",
         "knowledge_points": ["知识点1", "知识点2"],
-        "key_points": ["重点1", "重点2"],
         "easy_mistakes": ["易错点1", "易错点2"],
+        "difficult_points": ["难点1", "难点2"],
         "question_type": "题型（选择题、填空题、解答题、证明题等）"
     }
     只输出JSON，不要其他内容。"""
@@ -75,38 +140,56 @@ class AIService:
     1. 分步骤说明，每步简洁明了
     2. 指出解题的关键突破口
     3. 200字左右即可
-    4. 直接输出纯文本！禁止使用JSON格式、代码块或其他任何结构化标记，不要模仿上一轮的JSON输出"""
+    4. 直接输出纯文本！禁止使用JSON格式、代码块或其他任何结构化标记，不要模仿上一轮的JSON输出
+    5. 开头不要再重复题目的年级/学科/难度等信息（客户端已在顶部用标签展示）"""
+        if st_ins:
+            steps_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": info_response})
         messages.append({"role": "user", "content": steps_prompt})
         # 流式输出解题思路
         accumulated_steps = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
-            accumulated_steps = chunk
-            yield {"stage": "steps_chunk", "content": accumulated_steps}
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                           temperature=st_temp):
+            if evt["stage"] == "content":
+                accumulated_steps = evt["content"]
+                yield {"stage": "steps_chunk", "content": accumulated_steps}
         steps_response = accumulated_steps
         
         yield {"stage": "steps", "content": steps_response}
         
-        # === 第三阶段：完整解析（流式输出；暂不生成LaTeX图形，由后续单独环节补充） ===
+        # === 第三阶段：完整解析（流式输出；可开思考模式；末尾不再附年级/学科/难度——⑩） ===
         solution_prompt = """请给出完整的解题过程和答案。
     要求：
     1. 步骤完整，逻辑清晰
     2. 使用LaTeX语法编写数学公式
     3. 暂不要生成LaTeX/TikZ图形代码，稍后会有专门环节为本题补充图形
-    4. 最后附上：
-    **学科：**[学科]
-    **知识点：**[用顿号隔开]
-    **题目难度：**[难度]"""
+    4. 结尾不要再附“学科/知识点/题目难度”之类的汇总（客户端已在顶部用标签展示）"""
+        if st_ins:
+            solution_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": steps_response})
         messages.append({"role": "user", "content": solution_prompt})
         
-        # 流式输出完整解析
+        # 流式输出完整解析（思考模式：先流式下发思维链）
         accumulated_solution = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=8000):
-            accumulated_solution = chunk
-            yield {"stage": "solution_chunk", "content": accumulated_solution}
+        thinking_accumulated = ""
+        if use_thinking:
+            yield {"stage": "thinking_start", "content": ""}
+        
+        def _on_reasoning(accum: str):
+            nonlocal thinking_accumulated
+            thinking_accumulated = accum
+            yield {"stage": "thinking_chunk", "content": accum}
+        
+        for evt in self._call_api_streaming(messages, max_tokens=8000, engine=engine, model=model,
+                                            temperature=st_temp, thinking=use_thinking,
+                                            on_reasoning=_on_reasoning):
+            if evt["stage"] == "thinking_chunk":
+                yield evt
+            else:
+                accumulated_solution = evt["content"]
+                yield {"stage": "solution_chunk", "content": accumulated_solution}
         
         solution_response = accumulated_solution
         
@@ -125,9 +208,11 @@ class AIService:
         messages.append({"role": "user", "content": latex_prompt})
         # ② LaTeX图形生成改为流式（客户端显示“图形正在生成”占位）
         latex_accumulated = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model):
-            latex_accumulated = chunk
-            yield {"stage": "latex_chunk", "content": latex_accumulated}
+        for evt in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model,
+                                            temperature=st_temp):
+            if evt["stage"] == "content":
+                latex_accumulated = evt["content"]
+                yield {"stage": "latex_chunk", "content": latex_accumulated}
         latex_response = latex_accumulated
         
         yield {"stage": "latex_extras", "content": latex_response}
@@ -141,14 +226,18 @@ class AIService:
         └── 应用条件
     └── 知识点二
         └── 解题技巧"""
+        if st_ins:
+            mindmap_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": solution_response})
         messages.append({"role": "user", "content": mindmap_prompt})
         # 流式输出思维导图
         accumulated_mindmap = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
-            accumulated_mindmap = chunk
-            yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                            temperature=st_temp):
+            if evt["stage"] == "content":
+                accumulated_mindmap = evt["content"]
+                yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
         mindmap_response = accumulated_mindmap
         
         yield {"stage": "mindmap", "content": mindmap_response}
@@ -178,8 +267,10 @@ class AIService:
         """生成AI版学情报告（非流式，兼容旧调用）"""
         return "".join(self.generate_ai_report_stream(stats_summary, engine=engine, model=model))
 
-    def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None):
+    def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
+                                  style: Optional[str] = None):
         """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）"""
+        st_ins = style_instruction(style)
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
     {stats_summary}
@@ -190,6 +281,9 @@ class AIService:
     3. 指出需要加强的领域
     4. 给出具体的学习建议
     5. 500字左右"""
+        if st_ins:
+            prompt += "\n" + st_ins
+        prompt += "\n\n" + COLOR_RULES
         
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": "你是一位经验丰富的教育顾问，擅长用温暖鼓励的方式与学生沟通。"},
@@ -197,20 +291,30 @@ class AIService:
         ]
         
         prev_sent = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                            temperature=style_temperature(style)):
+            if evt["stage"] != "content":
+                continue
+            chunk = evt["content"]
             # 回调返回累积全文，只yield新增部分，客户端累加后不会重复
             delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
             prev_sent = chunk
             if delta:
                 yield delta
     
-    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[Dict, None, None]:
+    def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
+                                     style: Optional[str] = None) -> Generator[Dict, None, None]:
         """
         知识延伸多轮对话
         重点：总结归纳 + 易错点 + 知识拓展 + 延伸问题
         """
         start_time = time.time()
+        st_ins = style_instruction(style)
+        st_temp = style_temperature(style)
         system_prompt = self._build_system_prompt(ocr_text, search_result)
+        if st_ins:
+            system_prompt += "\n\n" + st_ins
+        system_prompt += "\n\n" + COLOR_RULES
         messages = [{"role": "system", "content": system_prompt}]
         
         # ===== 第一阶段：知识点总结与易错点 =====
@@ -238,14 +342,18 @@ class AIService:
     2. 说明为什么容易错
     3. 给出正确的思路
     4. 用具体例子说明"""
+        if st_ins:
+            mistakes_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": info_response})
         messages.append({"role": "user", "content": mistakes_prompt})
         # 流式输出易错点详解
         accumulated_mistakes = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
-            accumulated_mistakes = chunk
-            yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                            temperature=st_temp):
+            if evt["stage"] == "content":
+                accumulated_mistakes = evt["content"]
+                yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
         mistakes_detail = accumulated_mistakes
         
         yield {"stage": "mistakes", "content": mistakes_detail}
@@ -263,14 +371,18 @@ class AIService:
 2. 包含有趣的科普内容或实际应用场景
 3. 如果涉及公式，用LaTeX格式
 4. 300字左右"""
+        if st_ins:
+            extension_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": mistakes_detail})
         messages.append({"role": "user", "content": extension_prompt})
         # 流式输出知识拓展
         accumulated_extension = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
-            accumulated_extension = chunk
-            yield {"stage": "extension_chunk", "content": accumulated_extension}
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                            temperature=st_temp):
+            if evt["stage"] == "content":
+                accumulated_extension = evt["content"]
+                yield {"stage": "extension_chunk", "content": accumulated_extension}
         extension_content = accumulated_extension
         
         yield {"stage": "extension", "content": extension_content}
@@ -293,20 +405,32 @@ class AIService:
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
+    def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None,
+                              style: Optional[str] = None) -> str:
         """多轮对话 - 继续提问（非流式）"""
-        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。如需绘图辅助讲解（如函数图像、几何示意图），可在回答末尾附加一个 ```latex ... ``` 代码块（TikZ/pgfplots），代码块必须能独立编译。"})
+        system_add = ("你是学习助手。" + ASK_DRAW_RULE + "\n" + COLOR_RULES)
+        st_ins = style_instruction(style)
+        if st_ins:
+            system_add += "\n" + st_ins
+        messages.append({"role": "system", "content": system_add})
         messages.append({"role": "user", "content": user_question})
-        return self._call_api(messages, engine=engine, model=model)
+        return self._call_api(messages, engine=engine, model=model, temperature=style_temperature(style))
 
-    def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None) -> Generator[str, None, None]:
+    def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None,
+                                     style: Optional[str] = None) -> Generator[str, None, None]:
         """多轮对话 - 继续提问（流式，逐chunk累积文本）"""
-        messages.append({"role": "system", "content": "你是学习助手。请直接回答学生的最新问题本身，用自然语言作答，禁止输出JSON格式、代码块或新的问题列表。如需绘图辅助讲解（如函数图像、几何示意图），可在回答末尾附加一个 ```latex ... ``` 代码块（TikZ/pgfplots），代码块必须能独立编译。"})
+        system_add = ("你是学习助手。" + ASK_DRAW_RULE + "\n" + COLOR_RULES)
+        st_ins = style_instruction(style)
+        if st_ins:
+            system_add += "\n" + st_ins
+        messages.append({"role": "system", "content": system_add})
         messages.append({"role": "user", "content": user_question})
         accumulated = ""
-        for chunk in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model):
-            accumulated = chunk
-            yield accumulated
+        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+                                            temperature=style_temperature(style)):
+            if evt["stage"] == "content":
+                accumulated = evt["content"]
+                yield accumulated
 
     def generate_response(self, prompt: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """通用单轮生成（GeoGebra命令等）"""
@@ -347,9 +471,10 @@ class AIService:
             response = re.sub(r'```', '', response)
         return response.strip()
     
-    def _call_api(self, messages, max_tokens=None, engine=None, model=None):
+    def _call_api(self, messages, max_tokens=None, engine=None, model=None, temperature: Optional[float] = None):
         """调用AI API (非流式)"""
         client, m = self._get_client(engine, model)
+        temp = temperature if temperature is not None else self.temperature
         print(f"[AI] 调用API，引擎={engine or 'deepseek'}，模型={m}，消息数={len(messages)}")
         for attempt in range(3):
             try:
@@ -357,7 +482,7 @@ class AIService:
                 response = client.chat.completions.create(
                     model=m,
                     messages=messages,
-                    temperature=self.temperature,
+                    temperature=temp,
                     max_tokens=max_tokens or self.max_tokens,
                     stream=False,
                 )
@@ -371,41 +496,75 @@ class AIService:
                 time.sleep(1)
         return ""
     
-    def _call_api_streaming(self, messages, max_tokens=None, engine=None, model=None):
+    def _call_api_streaming(self, messages, max_tokens=None, engine=None, model=None,
+                            temperature: Optional[float] = None, thinking: bool = False,
+                            on_reasoning=None):
         """
         调用AI API (流式) - 逐chunk生成
         用于实现实时流式输出体验
         
+        Args:
+            temperature: 覆盖默认温度（回答风格温度）
+            thinking: 思考模式（十一；仅DeepSeek链路；不支持的模型自动降级重试）
+            on_reasoning: 思考模式回调，收到累计思维链文本时调用（用于转发给客户端）
+        
         Yields:
-            str: 每个chunk的文本内容
+            Dict[str, str]: {"stage": "content", "content": 累积文本}
+            或（仅thinking）: {"stage": "thinking", "content": 累积思维链}（内容阶段开始后不再yield thinking）
         """
         client, model = self._get_client(engine, model)
+        temp = temperature if temperature is not None else self.temperature
         print(f"[AI-Stream] 开始流式调用，引擎={engine or 'deepseek'}，模型={model}，消息数={len(messages)}")
-        for attempt in range(3):
+        thinking_on = thinking
+        for attempt in range(4):
             try:
-                print(f"[AI-Stream] 尝试 {attempt + 1}/3...")
-                response = client.chat.completions.create(
+                print(f"[AI-Stream] 尝试 {attempt + 1}/4...")
+                kwargs = dict(
                     model=model,
                     messages=messages,
-                    temperature=self.temperature,
+                    temperature=temp,
                     max_tokens=max_tokens or self.max_tokens,
                     stream=True,
                 )
+                if thinking_on:
+                    kwargs["reasoning_effort"] = "high"
+                    kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                response = client.chat.completions.create(**kwargs)
                 reasoning_content = ""
                 content = ""
+                thinking_done = False
                 for chunk in response:
                     if chunk.choices and chunk.choices[0].delta:
                         delta = chunk.choices[0].delta
                         if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
                             reasoning_content += delta.reasoning_content
+                            thinking_done = True
+                            if on_reasoning is not None:
+                                # 思维链期间不下发正文
+                                cb = on_reasoning(reasoning_content)
+                                if cb is not None:
+                                    try:
+                                        for evt in cb:
+                                            yield evt
+                                    except TypeError:
+                                        pass
                         elif delta.content:
                             content += delta.content
-                            yield content  # 增量返回完整累积内容用于淡入式显示
+                            yield {"stage": "content", "content": content}  # 增量返回完整累积内容用于淡入式显示
+                if thinking_on and reasoning_content and not content:
+                    # 只有思维链、没有正文的响应也要正常结束
+                    pass
                 print(f"[AI-Stream] 流式调用成功，总长度={len(content)}")
                 return
             except Exception as e:
                 print(f"[AI-Stream] 第{attempt + 1}次尝试失败: {e}")
-                if attempt == 2:
+                err = str(e)
+                # 思考模式不被该模型支持（400/参数错误）：自动降级为普通模式重试
+                if thinking_on and ("400" in err or "thinking" in err.lower() or "reasoning" in err.lower()):
+                    print("[AI-Stream] 模型不支持思考模式，自动降级为普通模式")
+                    thinking_on = False
+                    continue
+                if attempt == 3:
                     raise
                 time.sleep(1)
         return
@@ -413,7 +572,8 @@ class AIService:
     def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None) -> Tuple[str, float]:
         """使用视觉模型识别图片（OCR/图表描述）
         模型名以 deepseek 开头 → DeepSeek客户端；否则走千问客户端
-        默认提示词：识别全部文字；流程图/统计图用自然语言描述"""
+        ③ 提示词：手写内容转 *斜体* Markdown；流程图/统计图用自然语言描述（不输出纯文本）
+        """
         import base64 as _b64
         start = time.time()
         try:
@@ -426,7 +586,8 @@ class AIService:
                 img_b64 = _b64.b64encode(f.read()).decode("ascii")
             prompt = prompt or (
                 "请识别这张图片中的全部文字并完整输出（保持原有顺序和格式）。"
-                "如果图片中包含流程图、统计图、几何图形等非纯文字内容，请用自然语言描述其内容。"
+                "③ 手写的内容（包括手写解题过程、批注）请在输出中改用 *斜体*（Markdown斜体，单个星号包裹）表示，以与印刷体区分；印刷体保持原样。"
+                "如果图片中包含流程图、统计图、几何图形等非纯文字内容，请用自然语言描述其内容，不要尝试把图形转成文字列表。"
                 "只输出识别/描述结果，不要任何额外解释。"
             )
             resp = client.chat.completions.create(

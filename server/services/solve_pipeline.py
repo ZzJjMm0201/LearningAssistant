@@ -16,7 +16,7 @@ from server.database.models import SessionLocal, SubmissionRecord, ConversationH
 from server.services.ocr_service import ocr_service
 from server.services.search_service import search_service
 from server.services.ai_service import ai_service
-from server.utils.latex_processor import process_latex_blocks, process_latex_blocks_with_retry, extract_question_info_from_solution
+from server.utils.latex_processor import process_latex_blocks, process_latex_blocks_with_retry
 
 from typing import Dict, Generator, Optional, Union
 
@@ -41,7 +41,8 @@ class SolvePipeline:
     def __init__(self):
         pass
     
-    def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None) -> str:
+    def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
+                    style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -49,7 +50,8 @@ class SolvePipeline:
         
         thread = threading.Thread(
             target=self._solve_worker,
-            args=(request_id, image_path, session_id, base_host, user_id, engine, ocr_mode, vision_model, model)
+            args=(request_id, image_path, session_id, base_host, user_id, engine, ocr_mode, vision_model, model,
+                  style, thinking, search_enabled)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -100,7 +102,8 @@ class SolvePipeline:
             event.set()  # 让worker线程继续执行并退出
         self._cleanup(request_id)
     
-    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None):
+    def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
+                      style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True):
         """后台解题工作线程"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
@@ -139,21 +142,22 @@ class SolvePipeline:
                 print(f"[{request_id}] 用户已确认OCR结果")
             _pending_confirm.pop(request_id, None)
             
-            # ========== 阶段2: 题库搜索 ==========
-            self._emit_event(request_id, "info", "正在搜索题库...")
-            
-            search_result, search_time, search_items = search_service.search(ocr_text)
-            
-            if search_result:
-                self._emit_event(request_id, "search_complete", {
-                    "found": True,
-                    "time": search_time
-                })
+            # ========== 阶段2: 题库搜索（④ 设置中可关闭） ==========
+            search_result, search_time, search_items = "", 0, []
+            if search_enabled:
+                self._emit_event(request_id, "info", "正在搜索题库...")
+                try:
+                    search_result, search_time, search_items = search_service.search(ocr_text)
+                except Exception as e:
+                    print(f"[{request_id}] 搜索异常（忽略继续）: {e}")
+                    search_result, search_time, search_items = "", 0, []
             else:
-                self._emit_event(request_id, "search_complete", {
-                    "found": False,
-                    "time": search_time
-                })
+                print(f"[{request_id}] 搜题已关闭（设置中关闭）")
+            
+            self._emit_event(request_id, "search_complete", {
+                "found": bool(search_result),
+                "time": search_time
+            })
             # 搜题结果（结构化，客户端用按钮+Markdown展示）
             if search_items:
                 self._emit_event(request_id, "search_results", search_items)
@@ -165,11 +169,22 @@ class SolvePipeline:
             latex_extras_content = ""  # 补充的LaTeX图形代码
             
             # 使用流式处理AI对话的各个阶段
-            for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model):
+            first_question_info = None
+            for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model,
+                                                         style=style, thinking=thinking):
                 stage = event["stage"]
                 content = event["content"]
                 
+                if stage == "thinking_start":
+                    self._emit_event(request_id, "thinking_start", content)
+                    continue
+                elif stage == "thinking_chunk":
+                    self._emit_event(request_id, "thinking_chunk", content)
+                    continue
+                
                 if stage == "info":
+                    # ⑩ 第一轮JSON分析信息（客户端顶部标签展示）；保存供后续重发
+                    first_question_info = content
                     self._emit_event(request_id, "question_info", content)
                 elif stage == "steps_chunk":
                     # 流式chunk: content 是累积到当前的完整文本
@@ -250,9 +265,14 @@ class SolvePipeline:
                         
                         self._emit_event(request_id, "solution_rendered", final_solution)
                         
-                        # 提取题目结构化信息
-                        question_info = extract_question_info_from_solution(str(solution_content))
-                        self._emit_event(request_id, "question_info", question_info)
+                        # ⑩ 题目结构化信息以第一轮JSON为准（不再从完整解析二次提取——
+                        # 完整解析已不再输出“学科/知识点/难度”尾部汇总）
+                        try:
+                            _qi = first_question_info if first_question_info is not None else {}
+                            if isinstance(_qi, dict) and "raw" not in _qi:
+                                self._emit_event(request_id, "question_info", _qi)
+                        except Exception:
+                            pass
                     
                     # ========== 阶段5: 存储记录 ==========
                     self._save_record(
@@ -283,21 +303,23 @@ class SolvePipeline:
         finally:
             self._cleanup(request_id)
     
-    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None) -> str:
+    def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
+                                  style: Optional[str] = None) -> str:
         """启动知识延伸流程"""
         request_id = session_id or str(uuid.uuid4())
         _event_queues[request_id] = deque()
         
         thread = threading.Thread(
             target=self._extension_worker,
-            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model)
+            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model, style)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
         thread.start()
         return request_id
 
-    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None):
+    def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
+                          style: Optional[str] = None):
         """知识延伸工作线程"""
         print(f"[{request_id}] ========== 知识延伸流程启动 ==========\n")
         
@@ -320,7 +342,7 @@ class SolvePipeline:
             # AI 知识延伸
             self._emit_event(request_id, "info", "正在分析内容...")
             
-            for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model):
+            for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model, style=style):
                 stage = event["stage"]
                 content = event["content"]
                 

@@ -25,6 +25,11 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         private const val KEY_VISION_MODEL = "vision_model"
         private const val KEY_TOKEN = "auth_token"
         private const val KEY_USERNAME = "auth_username"
+        // ②④十一⑦ 新增设置
+        private const val KEY_ANSWER_STYLE = "answer_style"
+        private const val KEY_SEARCH_ENABLED = "search_enabled"
+        private const val KEY_THINKING_ENABLED = "thinking_enabled"
+        private const val KEY_THEME_MODE = "theme_mode"
     }
 
     private var sharedPreferences: SharedPreferences? = null
@@ -115,6 +120,11 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     var llmModel: String = ""              // 大语言模型名（空=提供方默认）
     var ocrMode: String = "paddle"         // paddle / qwen（千问视觉OCR）
     var visionModel: String = ""           // 视觉模型名（空=默认 qwen3.8-max）
+    // ② 回答风格 formal/plain/concise/lively（④⑦十一 相关请求头）
+    var answerStyle: String = "formal"
+    var searchEnabled: Boolean = true
+    var thinkingEnabled: Boolean = false
+    var themeMode: String = "system"       // system / light / dark（纯客户端，不发服务器）
 
     /**
      * 为任意请求追加认证头 + AI模型头（统一入口）
@@ -125,6 +135,10 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
         addHeader("X-OCR-Mode", ocrMode)
         if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
+        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关
+        addHeader("X-Style", answerStyle)
+        if (thinkingEnabled) addHeader("X-Thinking", "1")
+        if (!searchEnabled) addHeader("X-Search-Enabled", "0")
         return this
     }
 
@@ -149,6 +163,26 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         llmModel = sharedPreferences?.getString(KEY_LLM_MODEL, "") ?: ""
         ocrMode = sharedPreferences?.getString(KEY_OCR_MODE, "paddle") ?: "paddle"
         visionModel = sharedPreferences?.getString(KEY_VISION_MODEL, "") ?: ""
+        answerStyle = sharedPreferences?.getString(KEY_ANSWER_STYLE, "formal") ?: "formal"
+        searchEnabled = sharedPreferences?.getBoolean(KEY_SEARCH_ENABLED, true) ?: true
+        thinkingEnabled = sharedPreferences?.getBoolean(KEY_THINKING_ENABLED, false) ?: false
+        themeMode = sharedPreferences?.getString(KEY_THEME_MODE, "system") ?: "system"
+    }
+
+    /**
+     * 持久化 ②④⑦十一 扩展设置（风格/搜题/思考模式/主题）
+     */
+    fun saveExtraSettings(style: String, search: Boolean, thinking: Boolean, theme: String) {
+        sharedPreferences?.edit()
+            ?.putString(KEY_ANSWER_STYLE, style)
+            ?.putBoolean(KEY_SEARCH_ENABLED, search)
+            ?.putBoolean(KEY_THINKING_ENABLED, thinking)
+            ?.putString(KEY_THEME_MODE, theme)
+            ?.apply()
+        answerStyle = style
+        searchEnabled = search
+        thinkingEnabled = thinking
+        themeMode = theme
     }
 
     private val client = OkHttpClient.Builder()
