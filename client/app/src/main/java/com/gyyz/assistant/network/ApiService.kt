@@ -509,6 +509,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         subject: String = "",
         grade: String = "",
         difficulty: String = "",
+        mastery: String = "",
     ): HistoryResult {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply {
@@ -517,6 +518,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 put("subject", subject)
                 put("grade", grade)
                 put("difficulty", difficulty)
+                put("mastery", mastery)
             }
             val body = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url("$BASE_URL/history").post(body).withAuth().build()

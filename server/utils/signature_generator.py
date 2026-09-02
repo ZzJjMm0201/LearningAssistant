@@ -1,23 +1,53 @@
+"""
+好未来AI开放平台 HTTP 签名（官方算法）
+参考官方 Python Demo：HMAC-SHA1，key=secret+"&"
+body 作为 request_body 参数（json.dumps 默认格式），参数按 key 排序 k=v 用 & 连接，签名 base64 后 URL 编码
+"""
+import uuid
+import json
+import base64
 import hmac
 import hashlib
-import json
-from typing import Dict, Any
+from urllib.parse import quote
+from typing import Dict, Any, Tuple
 
 
-def generate_signature(url_params: Dict[str, Any], body_params: Dict[str, Any], secret: str) -> str:
+def build_sign_params(url_params: Dict[str, Any], body_params: Dict[str, Any]) -> Dict[str, Any]:
+    """组合签名参数：公共参数 + request_body（body的json字符串）"""
+    sign_param = {"request_body": json.dumps(body_params)}
+    sign_param.update({k: v for k, v in url_params.items()})
+    return sign_param
+
+
+def url_format(params: Dict[str, Any]) -> str:
+    """按key升序排序，k=v 用 & 连接（值不做URL编码）"""
+    return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+
+def generate_signature(
+    access_key_secret: str,
+    url_params: Dict[str, Any],
+    body_params: Dict[str, Any],
+) -> Tuple[str, str, str]:
     """
-    基于HMAC-SHA256的签名生成器（简化实现）
+    生成签名与nonce
 
-    采用对URL参数和body参数排序后JSON序列化的方式生成待签名字符串，
-    然后使用secret做HMAC-SHA256，返回十六进制摘要。
-
-    这是一个兼容性实现，满足项目中搜索请求的签名需求。
+    Returns:
+        (signature, signature_nonce, timestamp)
     """
-    # 规范化参数为字符串并排序
-    url_norm = {k: str(v) for k, v in sorted(url_params.items())}
-    body_norm = {k: str(v) for k, v in sorted(body_params.items())}
+    timestamp = __import__("time").strftime("%Y-%m-%dT%H:%M:%S", __import__("time").localtime())
+    signature_nonce = str(uuid.uuid1())
 
-    payload = json.dumps({"url": url_norm, "body": body_norm}, separators=(',', ':'), sort_keys=True, ensure_ascii=False)
+    params = dict(url_params)
+    params["access_key_id"] = params.get("access_key_id", "")
+    params["timestamp"] = timestamp
+    params["signature_nonce"] = signature_nonce
 
-    digest = hmac.new(secret.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
-    return digest
+    sign_param = build_sign_params(params, body_params)
+    string_to_sign = url_format(sign_param)
+
+    secret = access_key_secret + "&"
+    h = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1)
+    signature = base64.b64encode(h.digest()).decode("utf-8")
+
+    return quote(signature, "utf-8"), signature_nonce, timestamp

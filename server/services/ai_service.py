@@ -411,13 +411,17 @@ class AIService:
         return
     
     def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None) -> Tuple[str, float]:
-        """使用千问视觉模型识别图片（OCR/图表描述）
+        """使用视觉模型识别图片（OCR/图表描述）
+        模型名以 deepseek 开头 → DeepSeek客户端；否则走千问客户端
         默认提示词：识别全部文字；流程图/统计图用自然语言描述"""
         import base64 as _b64
         start = time.time()
         try:
-            if self.qwen_client is None:
-                return "OCR识别失败：未配置千问API Key", round(time.time() - start, 2)
+            model = model or APIConfig.QWEN_DEFAULT_VISION
+            is_deepseek_model = str(model).lower().startswith("deepseek")
+            client = self.client if is_deepseek_model else self.qwen_client
+            if client is None:
+                return f"OCR识别失败：未配置{'DeepSeek' if is_deepseek_model else '千问'}API Key", round(time.time() - start, 2)
             with open(image_path, "rb") as f:
                 img_b64 = _b64.b64encode(f.read()).decode("ascii")
             prompt = prompt or (
@@ -425,8 +429,8 @@ class AIService:
                 "如果图片中包含流程图、统计图、几何图形等非纯文字内容，请用自然语言描述其内容。"
                 "只输出识别/描述结果，不要任何额外解释。"
             )
-            resp = self.qwen_client.chat.completions.create(
-                model=model or APIConfig.QWEN_DEFAULT_VISION,
+            resp = client.chat.completions.create(
+                model=model,
                 messages=[{
                     "role": "user",
                     "content": [

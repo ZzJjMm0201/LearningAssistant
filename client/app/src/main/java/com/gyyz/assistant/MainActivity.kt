@@ -2306,15 +2306,13 @@ fun SolvingScreen(
         val solvingFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
         val solveProgress by (viewModel?.solveProgress ?: MutableStateFlow("")).collectAsState()
         var questionInput by remember { mutableStateOf("") }
-        Column(
-                modifier =
-                        Modifier.fillMaxSize()
-                                .verticalScroll(rememberScrollState())
-                                .padding(16.dp)
-        ) {
-            // Feature 14: 固定返回按钮在顶部
+        Column(modifier = Modifier.fillMaxSize()) {
+            // ③ 顶部栏固定在上方（返回/标题/阶段进度），不随内容滚动
             Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF16213E))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
             ) {
@@ -2345,6 +2343,14 @@ fun SolvingScreen(
                 )
             }
 
+            // 可滚动内容区
+            Column(
+                    modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp)
+            ) {
             Spacer(modifier = Modifier.height(16.dp))
 
             if (solveState.stage == SolveStage.UPLOADING || solveState.stage == SolveStage.ANALYZING) {
@@ -2583,23 +2589,13 @@ fun SolvingScreen(
                                 shape = RoundedCornerShape(12.dp, 12.dp, 12.dp, 4.dp),
                                 modifier = Modifier.fillMaxWidth(0.92f).padding(vertical = 4.dp)
                         ) {
-                            val pendContent = replaceLatexWithPlaceholder(
-                                    if (solveState.pendingAnswer.isNotEmpty()) solveState.pendingAnswer else "正在思考..."
+                            // ① 流式中只显示纯文本（Markdown等生成完再渲染，避免卡顿）
+                            Text(
+                                    if (solveState.pendingAnswer.isNotEmpty()) solveState.pendingAnswer else "正在思考...",
+                                    color = Color(0xFFE0E0E0),
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.padding(10.dp)
                             )
-                            if (shouldRenderMarkdown(pendContent)) {
-                                MarkdownView(
-                                        content = pendContent,
-                                        fontSize = 13f,
-                                        modifier = Modifier.padding(10.dp)
-                                )
-                            } else {
-                                Text(
-                                        pendContent,
-                                        color = Color(0xFFE0E0E0),
-                                        fontSize = 13.sp,
-                                        modifier = Modifier.padding(10.dp)
-                                )
-                            }
                         }
                     }
                 }
@@ -2701,6 +2697,7 @@ fun SolvingScreen(
             }
 
             Spacer(modifier = Modifier.height(32.dp))
+            }
         }
 
         // ③ GeoGebra生成时锁屏等待AI回复（② 追问已流式输出，不再锁屏）
@@ -3836,6 +3833,7 @@ fun HistoryViewScreen(
     var subjectFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
     var gradeFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
     var difficultyFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var masteryFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showFilterDialog by remember { mutableStateOf(false) }
     
     fun loadHistory() {
@@ -3862,6 +3860,7 @@ fun HistoryViewScreen(
                     subject = subjectFilter.joinToString(","),
                     grade = gradeFilter.joinToString(","),
                     difficulty = difficultyFilter.joinToString(","),
+                    mastery = masteryFilter.joinToString(","),
                 )
                 withContext(Dispatchers.Main) {
                     records = result.records
@@ -3980,8 +3979,12 @@ fun HistoryViewScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
             ) { Text("🔍 筛选", color = Color.White, fontSize = 13.sp) }
             val activeFilters =
-                    listOf(subjectFilter.joinToString("/"), gradeFilter.joinToString("/"), difficultyFilter.joinToString("/"))
-                            .filter { it.isNotEmpty() }
+                    listOf(
+                            subjectFilter.joinToString("/"),
+                            gradeFilter.joinToString("/"),
+                            difficultyFilter.joinToString("/"),
+                            masteryFilter.joinToString("/")
+                    ).filter { it.isNotEmpty() }
             if (activeFilters.isNotEmpty()) {
                 Text(
                         "已选：${activeFilters.joinToString(" / ")}",
@@ -3994,6 +3997,7 @@ fun HistoryViewScreen(
                             subjectFilter = emptySet()
                             gradeFilter = emptySet()
                             difficultyFilter = emptySet()
+                            masteryFilter = emptySet()
                             loadHistory()
                         }
                 ) { Text("重置", color = Color(0xFFF44336), fontSize = 12.sp) }
@@ -4078,6 +4082,7 @@ fun HistoryViewScreen(
                                 subjectFilter = emptySet()
                                 gradeFilter = emptySet()
                                 difficultyFilter = emptySet()
+                                masteryFilter = emptySet()
                                 loadHistory()
                             }) {
                                 Text("查看全部")
@@ -4355,6 +4360,41 @@ fun HistoryViewScreen(
                                     )
                                 }
                             }
+
+                            Text("📊 掌握程度", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                val masteryOptions = listOf("完全掌握", "部分掌握", "完全没掌握", "未记录")
+                                FilterChip(
+                                        selected = masteryFilter.isEmpty(),
+                                        onClick = { masteryFilter = emptySet() },
+                                        label = { Text("全部", fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFFFF9800),
+                                                selectedLabelColor = Color.White,
+                                                labelColor = Color.White,
+                                                containerColor = Color(0xFF2D2D44)
+                                        )
+                                )
+                                masteryOptions.forEach { mv ->
+                                    FilterChip(
+                                            selected = mv in masteryFilter,
+                                            onClick = {
+                                                masteryFilter =
+                                                        if (mv in masteryFilter) masteryFilter - mv else masteryFilter + mv
+                                            },
+                                            label = { Text(mv, fontSize = 12.sp) },
+                                            colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = Color(0xFFFF9800),
+                                                    selectedLabelColor = Color.White,
+                                                    labelColor = Color.White,
+                                                    containerColor = Color(0xFF2D2D44)
+                                            )
+                                    )
+                                }
+                            }
                         }
                     },
                     confirmButton = {
@@ -4462,6 +4502,27 @@ fun HistoryRecordCard(
                             ) {
                                 Text(
                                     record.difficulty,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        // ⑤ 掌握程度标签（与学科/难度同款）
+                        if (record.masteryLevel.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            val masteryColor = when (record.masteryLevel) {
+                                "完全掌握" -> Color(0xFF4CAF50)
+                                "部分掌握" -> Color(0xFFFF9800)
+                                "完全没掌握" -> Color(0xFFF44336)
+                                else -> Color.Gray
+                            }
+                            Surface(
+                                color = masteryColor.copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.masteryLevel,
                                     color = Color.White,
                                     fontSize = 9.sp,
                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
@@ -4992,21 +5053,13 @@ fun HistoryDetailScreen(
                                         shape = RoundedCornerShape(10.dp),
                                         modifier = Modifier.widthIn(max = 320.dp)
                                 ) {
-                                    val pendContent = replaceLatexWithPlaceholder(pendingAsk)
-                                    if (shouldRenderMarkdown(pendContent)) {
-                                        MarkdownView(
-                                                content = pendContent,
-                                                fontSize = 13f,
-                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                        )
-                                    } else {
-                                        Text(
-                                                pendContent,
-                                                color = Color(0xFFE0E0E0),
-                                                fontSize = 13.sp,
-                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                        )
-                                    }
+                                    // ① 流式中只显示纯文本（等完整回答后再Markdown渲染）
+                                    Text(
+                                            pendingAsk,
+                                            color = Color(0xFFE0E0E0),
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
                                 }
                             }
                         }
@@ -5256,7 +5309,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                     viewModel.visionModel.value = "qwen3.8-max"
                                     viewModel.saveAiSettings()
                                 },
-                                label = { Text("千问视觉\n流程图 & 统计图自动描述", fontSize = 12.sp) },
+                                label = { Text("AI视觉\n千问/DeepSeek", fontSize = 12.sp) },
                                 colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = Color(0xFFFF9800)
                                 )
@@ -5267,7 +5320,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            listOf("qwen3.8-max", "qwen3.7-plus", "qwen3.5-omni-plus", "kimi-k3", "deepseek-v4-flash-0731").forEach { m ->
+                            listOf("qwen3.8-max", "qwen3.7-plus", "qwen3.5-omni-plus", "kimi-k3", "deepseek-v4-flash-vision-exp").forEach { m ->
                                 FilterChip(
                                         selected = visionModel == m,
                                         onClick = {

@@ -68,13 +68,11 @@ class SearchService:
         start_time = time.time()
         
         try:
-            # 构建请求 (使用原有逻辑)
+            # 官方签名算法：HMAC-SHA1，key=secret+"&"，body作为request_body参数
             from server.utils.signature_generator import generate_signature
             
             url_params = {
                 "access_key_id": self.access_key_id,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                "signature_nonce": str(time.time()),
             }
             
             body_params = {
@@ -82,14 +80,19 @@ class SearchService:
                 "function": 0
             }
             
-            signature = generate_signature(
-                url_params, body_params, self.access_key_secret
+            signature, signature_nonce, timestamp = generate_signature(
+                self.access_key_secret, url_params, body_params
             )
+            url_params["access_key_id"] = self.access_key_id
+            url_params["timestamp"] = timestamp
+            url_params["signature_nonce"] = signature_nonce
             url_params["signature"] = signature
+            # 手动拼URL（requests params= 会二次编码已quote的签名 → 签名不一致）
+            from server.utils.signature_generator import url_format
+            request_url = self.url + "?" + url_format(url_params)
             
             response = requests.post(
-                self.url, 
-                params=url_params, 
+                request_url, 
                 json=body_params,
                 timeout=15
             )

@@ -348,7 +348,7 @@ async def ask_question_stream(request: Request, body: AskRequest):
                         final_answer, svg_dir, ai_service=ai_service,
                         engine=engine, model=llm_model
                     )
-                    rendered = rewrite_static_urls(rendered, get_request_host(request))
+                    rendered = rewrite_rendered_images(rendered, get_request_host(request), f"svgs_ask_{body.session_id[:16]}")
                     if rendered != final_answer:
                         final_answer = rendered
                         yield f"data: {json.dumps({'stage': 'answer_rendered', 'content': final_answer}, ensure_ascii=False)}\n\n"
@@ -585,6 +585,8 @@ async def get_history(request: Request, body: dict):
         filter_subjects = _parse_filters(body.get("subject"))
         filter_grades = _parse_filters(body.get("grade"))
         filter_difficulties = _parse_filters(body.get("difficulty"))
+        # ⑤ 掌握程度筛选（值：完全掌握/部分掌握/完全没掌握/未记录）
+        filter_masteries = _parse_filters(body.get("mastery"))
         
         result = []
         all_subjects = set()
@@ -660,6 +662,15 @@ async def get_history(request: Request, body: dict):
                     mastery_label = _MASTERY_LABELS.get(mj.get("mastery_level", ""), "")
                 except Exception:
                     pass
+            
+            # ⑤ 应用掌握程度多选筛选（“未记录”匹配没有掌握程度文件的记录）
+            if filter_masteries:
+                if mastery_label:
+                    if mastery_label not in filter_masteries:
+                        continue
+                else:
+                    if "未记录" not in filter_masteries:
+                        continue
             
             result.append({
                 "id": r.id,
@@ -777,7 +788,7 @@ async def render_history_record(record_id: int, request: Request):
             print(f"[history/render] 渲染失败 id={record_id}: {e}")
             return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
         host = get_request_host(request)
-        rendered = rewrite_static_urls(rendered, host)
+        rendered = rewrite_rendered_images(rendered, host, f"svgs_{record.session_id}")
         if rendered != record.full_solution:
             record.full_solution = rendered
             record.rendered_svg_dir = str(svg_dir)
@@ -1056,6 +1067,19 @@ def rewrite_static_urls(text: str, host: str) -> str:
     return text
 
 
+def rewrite_rendered_images(text: str, host: str, svg_rel_dir: str) -> str:
+    """② 把LaTeX渲染产物中的相对图片引用(diagram_xxx.png)补全为绝对URL，并把旧host统一到当前host
+    svg_rel_dir: 图片所在目录（相对history根），如 svgs_xxx 或 svgs_ask_xxx"""
+    if not text:
+        return text
+    import re as _re
+    base = f"http://{host}/static/"
+    text = _re.sub(r'!\[([^\]]*)\]\((diagram_[^)\s]+\.(?:png|svg))\)',
+                   rf'![\1]({base}{svg_rel_dir}/\2)', text)
+    text = _re.sub(r'https?://[^/]+/static/', base, text)
+    return text
+
+
 def _move_record_files_to_recycle_bin(record) -> str:
     """删除记录时把相关文件（原图/svg目录/solution.md/掌握程度）移入回收站目录"""
     import shutil
@@ -1109,6 +1133,18 @@ def ensure_geogebra_assets() -> str:
                         "https://www.geogebra.org/apps/deployggb.js", timeout=60) as resp, open(tmp, "wb") as f:
                     f.write(resp.read())
                 if tmp.exists() and tmp.stat().st_size > 10_000:
+                    # ⑦ 补丁：CDN base → 本地镜像（若镜像目录存在）
+                    _txt = tmp.read_text(encoding="utf-8", errors="replace")
+                    _m = __import__("re").search(r'https://www\.geogebra\.org/apps/([0-9.]+)/', _txt)
+                    if _m:
+                        _ver = _m.group(1)
+                        _mirror = _GEOGEBRA_ASSETS_DIR.parent / "geogebra_apps" / _ver
+                        if _mirror.exists():
+                            _txt = _txt.replace(
+                                f"https://www.geogebra.org/apps/{_ver}/",
+                                f"/static/geogebra_apps/{_ver}/")
+                            tmp.write_text(_txt, encoding="utf-8")
+                            print(f"[GeoGebra] 已应用本地镜像补丁: apps/{_ver}/")
                     tmp.replace(target)
                     print(f"[GeoGebra] 本地缓存完成: {target.stat().st_size} bytes")
                 else:
