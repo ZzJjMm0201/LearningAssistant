@@ -1366,6 +1366,8 @@ class MainViewModel : ViewModel() {
     val multiQuestionTexts = MutableStateFlow<List<String>>(emptyList())  // 各题OCR文本
     val currentQuestionIndex = MutableStateFlow(0)               // 当前查看的题号
     val multiSolveStates = MutableStateFlow<List<AppState.Solving>>(emptyList())  // 每题完整解题状态
+    // ⑩ 主页面相机对准预览开关
+    val cameraPreviewEnabled = MutableStateFlow(false)
 
     // ⑤ AI模型设置（大语言模型提供方/模型 + 视觉OCR模型）
     val llmProvider = MutableStateFlow("deepseek")
@@ -3969,15 +3971,37 @@ fun MainMenuScreen(
 ) {
     val voiceEnabled by viewModel.voiceEnabled.collectAsState()
     val showWelcome by viewModel.showWelcomeDialog.collectAsState()
+    // ⑩ 主页面相机对准预览
+    val cameraPreviewEnabled by viewModel.cameraPreviewEnabled.collectAsState()
     var showPickDialog by remember { mutableStateOf(false) }
     
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8)))
+                .background(
+                        // ⑩ 开启对准预览时，背景半透明让相机画面透出，便于对准题目
+                        if (cameraPreviewEnabled) tC(Color(0x660A0A1A), Color(0x88F2F4F8))
+                        else tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8))
+                )
         ) {
         TopStatusBar(statusText = statusText, viewModel = viewModel, showSettingsButton = true, showHelpButton = true)
+
+        // ⑩ 相机对准预览开关
+        Row(
+                modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("📷 相机对准", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Switch(
+                    checked = cameraPreviewEnabled,
+                    onCheckedChange = { viewModel.cameraPreviewEnabled.value = it },
+                    colors = SwitchDefaults.colors(checkedThumbColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+            )
+        }
 
         // 相机不可用时：醒目提示改用相册选图
         if (!isCameraReady) {
@@ -4006,7 +4030,8 @@ fun MainMenuScreen(
             modifier = Modifier
                 .weight(1f)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 16.dp)
+                .alpha(if (cameraPreviewEnabled) 0.55f else 1f),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             val buttons = listOf(
