@@ -79,11 +79,14 @@ class SolvePipeline:
         """获取事件队列（供异步端点轮询，避免阻塞事件循环）"""
         return _event_queues.get(request_id)
     
-    def _emit_event(self, request_id: str, stage: str, content):
-        """发送事件到队列"""
+    def _emit_event(self, request_id: str, stage: str, content, qi: Optional[int] = None):
+        """发送事件到队列；qi=题目索引（①多题模式，单题时为None）"""
         queue = _event_queues.get(request_id)
         if queue is not None:
-            queue.append({"stage": stage, "content": content})
+            evt = {"stage": stage, "content": content}
+            if qi is not None:
+                evt["qi"] = qi
+            queue.append(evt)
     
     def confirm_continue(self, request_id: str):
         """用户确认OCR结果后，继续流程"""
@@ -104,7 +107,7 @@ class SolvePipeline:
     
     def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
                       style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True, dialect: str = "", grade: str = ""):
-        """后台解题工作线程"""
+        """后台解题工作线程（① 支持多题：OCR后分题，逐题走完整流程）"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
         print(f"[{request_id}] 图片存在: {image_path.exists()}, 大小: {image_path.stat().st_size} bytes")
@@ -112,188 +115,57 @@ class SolvePipeline:
             # ========== 阶段1: OCR识别 ==========
             print(f"[{request_id}] 开始OCR识别...")
             self._emit_event(request_id, "info", "正在识别题目文字...")
-            
+
             ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
             print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
             print(f"[{request_id}] OCR内容预览: {ocr_text[:200]}...")
-            
+
             self._emit_event(request_id, "ocr_complete", {
                 "text": ocr_text,
                 "time": ocr_time,
                 "source": ocr_source
             })
-            
+
             if not ocr_text or ocr_text.startswith("OCR"):
                 self._emit_event(request_id, "error", "OCR识别失败，请重试")
                 self._emit_event(request_id, "complete", None)
                 return
-            
+
             # ========== 等待用户确认OCR结果 ==========
-            self._emit_event(request_id, "waiting_confirm", {
-                "text": ocr_text
-            })
+            self._emit_event(request_id, "waiting_confirm", {"text": ocr_text})
             confirm_event = threading.Event()
             _pending_confirm[request_id] = confirm_event
-            # 等待最多30秒用户确认
             if not confirm_event.wait(timeout=30):
-                # 超时未确认，继续流程（等同于确认）
                 print(f"[{request_id}] OCR确认超时，自动继续")
             else:
                 print(f"[{request_id}] 用户已确认OCR结果")
             _pending_confirm.pop(request_id, None)
-            
-            # ========== 阶段2: 题库搜索（④ 设置中可关闭） ==========
-            search_result, search_time, search_items = "", 0, []
-            if search_enabled:
-                self._emit_event(request_id, "info", "正在搜索题库...")
-                try:
-                    search_result, search_time, search_items = search_service.search(ocr_text)
-                except Exception as e:
-                    print(f"[{request_id}] 搜索异常（忽略继续）: {e}")
-                    search_result, search_time, search_items = "", 0, []
-            else:
-                print(f"[{request_id}] 搜题已关闭（设置中关闭）")
-            
-            self._emit_event(request_id, "search_complete", {
-                "found": bool(search_result),
-                "time": search_time
-            })
-            # 搜题结果（结构化，客户端用按钮+Markdown展示）
-            if search_items:
-                self._emit_event(request_id, "search_results", search_items)
-            
-            # ========== 阶段3: AI多轮对话（流式） ==========
-            self._emit_event(request_id, "info", "AI正在分析题目...")
-            solution_content = ""
-            solution_chunks = []  # 存储每个流式chunk
-            latex_extras_content = ""  # 补充的LaTeX图形代码
-            
-            # 使用流式处理AI对话的各个阶段
-            first_question_info = None
-            for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model,
-                                                         style=style, thinking=thinking, dialect=dialect, grade=grade):
-                stage = event["stage"]
-                content = event["content"]
-                
-                if stage == "thinking_start":
-                    self._emit_event(request_id, "thinking_start", content)
-                    continue
-                elif stage == "thinking_chunk":
-                    self._emit_event(request_id, "thinking_chunk", content)
-                    continue
-                
-                if stage == "info":
-                    # ⑩ 第一轮JSON分析信息（客户端顶部标签展示）；保存供后续重发
-                    first_question_info = content
-                    self._emit_event(request_id, "question_info", content)
-                elif stage == "steps_chunk":
-                    # 流式chunk: content 是累积到当前的完整文本
-                    self._emit_event(request_id, "solution_steps_chunk", content)
-                elif stage == "steps":
-                    self._emit_event(request_id, "solution_steps", content)
-                elif stage == "solution_chunk":
-                    # 流式chunk: content 是累积到当前的完整文本
-                    solution_content = content
-                    solution_chunks.append(content)
-                    self._emit_event(request_id, "solution_chunk", content)
-                elif stage == "solution":
-                    solution_content = content
-                    self._emit_event(request_id, "solution", content)
-                elif stage == "latex_extras":
-                    # 补充的LaTeX图形代码（可多个），随后统一渲染
-                    latex_extras_content = content
-                    self._emit_event(request_id, "info", "正在生成图解...")
-                elif stage == "latex_chunk":
-                    # ② LaTeX生成流式输出（客户端据此显示“图形正在生成”占位）
-                    self._emit_event(request_id, "latex_chunk", content)
-                elif stage == "mindmap_chunk":
-                    # 流式chunk: content 是累积到当前的完整文本（已规范化围栏）
-                    self._emit_event(request_id, "mindmap_chunk", _normalize_mindmap(content))
-                elif stage == "mindmap":
-                    self._emit_event(request_id, "mindmap", _normalize_mindmap(content))
-                elif stage == "questions":
-                    self._emit_event(request_id, "suggested_questions", content)
-                elif stage == "complete":
-                    # 记录总耗时
-                    total_time = content.get("total_time", 0)
-                    messages = content.get("messages", [])
-                    
-                    self._emit_event(request_id, "info", f"AI分析完成，耗时{total_time:.1f}s")
-                    
-                    # ========== 阶段4: LaTeX图形渲染 ==========
-                    if solution_content:
-                        print(f"[{request_id}] 开始渲染图形...")
-                        svg_dir = HISTORY_DIR / f"svgs_{request_id}"
-                        svg_dir.mkdir(exist_ok=True)
-                        
-                        self._emit_event(request_id, "info", "正在渲染图形...")
-                        
-                        import re
-                        # 动态构造图片URL：优先使用请求的Host头，回退到server_ip.txt
-                        host = (base_host or "").strip()
-                        if not host:
-                            try:
-                                ip_file = Path(__file__).resolve().parent.parent.parent / "server_ip.txt"
-                                host = ip_file.read_text(encoding="utf-8").strip()
-                            except Exception:
-                                host = "127.0.0.1:8000"
-                        host = host.removeprefix("http://").removeprefix("https://").rstrip("/")
-                        base_url = f"http://{host}/static/svgs_{request_id}"
-                        
-                        def _rewrite_img_urls(text: str) -> str:
-                            return re.sub(
-                                r'!\[([^\]]*)\]\((diagram_[^)]+\.(?:svg|png))\)',
-                                rf'![\1]({base_url}/\2)',
-                                text
-                            )
-                        
-                        # 1) 渲染完整解析中可能出现的LaTeX块
-                        processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
-                        processed_solution = _rewrite_img_urls(processed_solution)
-                        
-                        # 2) 渲染补充图解（AI单独一轮生成，可能多个）
-                        if latex_extras_content:
-                            processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
-                            processed_extras = _rewrite_img_urls(processed_extras)
-                            final_solution = (
-                                processed_solution
-                                + "\n\n---\n\n## 📐 图解辅助\n\n"
-                                + processed_extras
-                            )
-                        else:
-                            final_solution = processed_solution
-                        
-                        self._emit_event(request_id, "solution_rendered", final_solution)
-                        
-                        # ⑩ 题目结构化信息以第一轮JSON为准（不再从完整解析二次提取——
-                        # 完整解析已不再输出“学科/知识点/难度”尾部汇总）
-                        try:
-                            _qi = first_question_info if first_question_info is not None else {}
-                            if isinstance(_qi, dict) and "raw" not in _qi:
-                                self._emit_event(request_id, "question_info", _qi)
-                        except Exception:
-                            pass
-                    
-                    # ========== 阶段5: 存储记录 ==========
-                    self._save_record(
-                        request_id=request_id,
-                        session_id=session_id,
-                        ocr_text=ocr_text,
-                        ocr_time=ocr_time,
-                        search_result=search_result,
-                        search_time=search_time,
-                        messages=messages,
-                        user_id=user_id,
-                        full_solution_rendered=final_solution if solution_content else "",
-                    )
-                    
-                    self._emit_event(request_id, "complete", {
-                        "request_id": request_id,
-                        "total_time": total_time
-                    })
-                    break
-                
-            
+
+            # ========== ① 多题分题 ==========
+            from server.utils.split_service import split_questions
+            questions = split_questions(ocr_text, ocr_source, ai_service=ai_service, engine=engine, model=model)
+            questions = [q for q in questions if q and q.strip()]
+            if len(questions) == 0:
+                questions = [ocr_text]
+            print(f"[{request_id}] 分题结果: {len(questions)} 道题")
+
+            if len(questions) > 1:
+                self._emit_event(request_id, "question_split", {"count": len(questions), "questions": questions})
+
+            # 逐题走完整流程（循环）
+            for qi, q_text in enumerate(questions):
+                q_session = f"{session_id}__q{qi}" if len(questions) > 1 else session_id
+                self._solve_one(
+                    request_id=request_id, qi=qi if len(questions) > 1 else None,
+                    ocr_text=q_text, session_id=q_session, base_host=base_host,
+                    user_id=user_id, engine=engine, model=model, style=style,
+                    thinking=thinking, search_enabled=search_enabled,
+                    dialect=dialect, grade=grade,
+                    ocr_time=ocr_time,
+                )
+
+            self._emit_event(request_id, "complete", {"request_id": request_id})
+
         except Exception as e:
             print(f"[{request_id}] 解题流程异常: {e}")
             import traceback
@@ -302,7 +174,132 @@ class SolvePipeline:
             self._emit_event(request_id, "complete", None)
         finally:
             self._cleanup(request_id)
-    
+
+    def _solve_one(self, request_id: str, qi: Optional[int], ocr_text: str, session_id: Optional[str], base_host: Optional[str], user_id: Optional[int], engine: Optional[str], model: Optional[str],
+                   style: Optional[str], thinking: bool, search_enabled: bool, dialect: str, grade: str, ocr_time: float = 0.0):
+        """解单道题：题库搜索 + AI多轮 + LaTeX渲染 + 保存（事件带 qi 标记）"""
+        # ========== 阶段2: 题库搜索（④ 设置中可关闭） ==========
+        search_result, search_time, search_items = "", 0, []
+        if search_enabled:
+            self._emit_event(request_id, "info", "正在搜索题库...", qi)
+            try:
+                search_result, search_time, search_items = search_service.search(ocr_text)
+            except Exception as e:
+                print(f"[{request_id}] 搜索异常（忽略继续）: {e}")
+                search_result, search_time, search_items = "", 0, []
+        else:
+            print(f"[{request_id}] 搜题已关闭（设置中关闭）")
+
+        self._emit_event(request_id, "search_complete", {"found": bool(search_result), "time": search_time}, qi)
+        if search_items:
+            self._emit_event(request_id, "search_results", search_items, qi)
+
+        # ========== 阶段3: AI多轮对话（流式） ==========
+        self._emit_event(request_id, "info", "AI正在分析题目...", qi)
+        solution_content = ""
+        latex_extras_content = ""
+        first_question_info = None
+
+        for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model,
+                                                     style=style, thinking=thinking, dialect=dialect, grade=grade):
+            stage = event["stage"]
+            content = event["content"]
+
+            if stage == "thinking_start":
+                self._emit_event(request_id, "thinking_start", content, qi)
+                continue
+            elif stage == "thinking_chunk":
+                self._emit_event(request_id, "thinking_chunk", content, qi)
+                continue
+
+            if stage == "info":
+                first_question_info = content
+                self._emit_event(request_id, "question_info", content, qi)
+            elif stage == "steps_chunk":
+                self._emit_event(request_id, "solution_steps_chunk", content, qi)
+            elif stage == "steps":
+                self._emit_event(request_id, "solution_steps", content, qi)
+            elif stage == "solution_chunk":
+                solution_content = content
+                self._emit_event(request_id, "solution_chunk", content, qi)
+            elif stage == "solution":
+                solution_content = content
+                self._emit_event(request_id, "solution", content, qi)
+            elif stage == "latex_extras":
+                latex_extras_content = content
+                self._emit_event(request_id, "info", "正在生成图解...", qi)
+            elif stage == "latex_chunk":
+                self._emit_event(request_id, "latex_chunk", content, qi)
+            elif stage == "mindmap_chunk":
+                self._emit_event(request_id, "mindmap_chunk", _normalize_mindmap(content), qi)
+            elif stage == "mindmap":
+                self._emit_event(request_id, "mindmap", _normalize_mindmap(content), qi)
+            elif stage == "questions":
+                self._emit_event(request_id, "suggested_questions", content, qi)
+            elif stage == "complete":
+                total_time = content.get("total_time", 0)
+                messages = content.get("messages", [])
+                self._emit_event(request_id, "info", f"AI分析完成，耗时{total_time:.1f}s", qi)
+
+                # ========== 阶段4: LaTeX图形渲染 ==========
+                final_solution = ""
+                if solution_content:
+                    print(f"[{request_id}] 开始渲染图形...")
+                    svg_dir = HISTORY_DIR / f"svgs_{session_id or request_id}"
+                    svg_dir.mkdir(exist_ok=True)
+                    self._emit_event(request_id, "info", "正在渲染图形...", qi)
+
+                    import re
+                    host = (base_host or "").strip()
+                    if not host:
+                        try:
+                            ip_file = Path(__file__).resolve().parent.parent.parent / "server_ip.txt"
+                            host = ip_file.read_text(encoding="utf-8").strip()
+                        except Exception:
+                            host = "127.0.0.1:8000"
+                    host = host.removeprefix("http://").removeprefix("https://").rstrip("/")
+                    base_url = f"http://{host}/static/svgs_{session_id or request_id}"
+
+                    def _rewrite_img_urls(text: str) -> str:
+                        return re.sub(
+                            r'!\[([^\]]*)\]\((diagram_[^)]+\.(?:svg|png))\)',
+                            rf'![\1]({base_url}/\2)',
+                            text
+                        )
+
+                    processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
+                    processed_solution = _rewrite_img_urls(processed_solution)
+
+                    if latex_extras_content:
+                        processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
+                        processed_extras = _rewrite_img_urls(processed_extras)
+                        final_solution = processed_solution + "\n\n---\n\n## 📐 图解辅助\n\n" + processed_extras
+                    else:
+                        final_solution = processed_solution
+
+                    self._emit_event(request_id, "solution_rendered", final_solution, qi)
+
+                    try:
+                        _qi = first_question_info if first_question_info is not None else {}
+                        if isinstance(_qi, dict) and "raw" not in _qi:
+                            self._emit_event(request_id, "question_info", _qi, qi)
+                    except Exception:
+                        pass
+
+                # ========== 阶段5: 存储记录 ==========
+                self._save_record(
+                    request_id=request_id,
+                    session_id=session_id,
+                    ocr_text=ocr_text,
+                    ocr_time=ocr_time,
+                    search_result=search_result,
+                    search_time=search_time,
+                    messages=messages,
+                    user_id=user_id,
+                    full_solution_rendered=final_solution if solution_content else "",
+                )
+                break
+
     def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
                                   style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
         """启动知识延伸流程"""
@@ -475,13 +472,13 @@ class SolvePipeline:
                 search_result=search_result,
                 search_time_seconds=search_time,
                 original_image_path=str(HISTORY_DIR / f"{request_id}.jpg"),
-                rendered_svg_dir=str(HISTORY_DIR / f"svgs_{request_id}"),
+                rendered_svg_dir=str(HISTORY_DIR / f"svgs_{session_id or request_id}"),
             )
             
             db.add(record)
             
-            # 保存 Markdown 文件
-            md_path = HISTORY_DIR / f"{request_id}_solution.md"
+            # 保存 Markdown 文件（多题时按每题 session_id 区分）
+            md_path = HISTORY_DIR / f"{session_id or request_id}_solution.md"
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(f"# 解题结果\n\n")
                 f.write(f"## 解题思路\n\n{solution_steps}\n\n")
