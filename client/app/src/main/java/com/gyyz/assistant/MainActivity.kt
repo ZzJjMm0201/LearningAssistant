@@ -3365,8 +3365,8 @@ fun MarkdownView(
     val viewText = if (dark) android.graphics.Color.WHITE else 0xFF16181D.toInt()
     val viewDivider = if (dark) "#2D2D44" else "#E0E0E0"
 
-    // ⑥ 颜色标记 [[#RRGGBB]…[[#RRGGBB] → HTML <span style=\"color:#...\"> 渲染（Markwon原生支持HTML）
-    val cleanMarked = remember(content) { extractColorSegments(content) }
+    // ⑥ 颜色标记 [[#RRGGBB]…[[#RRGGBB] → 哨兵字符 + 渲染后自建 SpannableStringBuilder 回填颜色
+    val (cleanMarked, markColors) = remember(content) { extractColorSegments(content) }
     val processedContent = remember(cleanMarked) { prepareMarkdownContent(cleanMarked) }
 
     val markwon = remember(dark, fontSize) {
@@ -3426,6 +3426,10 @@ fun MarkdownView(
                     try {
                         textView.setTextColor(viewText)
                         markwon.setMarkdown(textView, processedContent)
+                        // ⑥ 回填颜色标记（自建 builder，不依赖 textView.text 类型，不会残留哨兵）
+                        if (markColors.isNotEmpty()) {
+                            applyColorMarkers(textView, markColors)
+                        }
                         onRendered?.invoke()
                     } catch (e: Exception) {
                         Log.e("MarkdownView", "渲染失败: ${e.message}")
@@ -3441,32 +3445,75 @@ fun MarkdownView(
 }
 
 // ==================== ⑥ 颜色标记 [[#RRGGBB]文字[[#RRGGBB] 解析与渲染 ====================
+private const val COLOR_MARK_OPEN = '\uE000'
+private const val COLOR_MARK_CLOSE = '\uE001'
 private val colorMarkerRegex =
         Regex("""\[\[#([0-9A-Fa-f]{6})\]\](.*?)\[\[#[0-9A-Fa-f]{6}\]\]""", RegexOption.DOT_MATCHES_ALL)
 
 private fun parseHexColor(hex: String): Int =
         try { android.graphics.Color.parseColor("#$hex") } catch (e: Exception) { -1 }
 
-/** 把颜色标记替换为 HTML <span>；Markwon 原生支持 HTML 渲染，不会产生哨兵字形 */
-private fun extractColorSegments(text: String): String {
-    if (!text.contains("[[")) return text
+/** 把颜色标记替换为哨兵字符；返回(清理后文本, 颜色列表-按出现顺序) */
+private fun extractColorSegments(text: String): Pair<String, List<Int>> {
+    if (!text.contains("[[")) return text to emptyList()
+    val colors = mutableListOf<Int>()
     val sb = StringBuilder()
     var last = 0
     var any = false
     for (mm in colorMarkerRegex.findAll(text)) {
         any = true
+        colors.add(parseHexColor(mm.groupValues[1]))
         sb.append(text, last, mm.range.first)
-        sb.append("<span style='color:#")
-        sb.append(mm.groupValues[1])
-        sb.append("'>")
-        // 转义内部文本中的 < 和 > 避免 HTML 解析问题
-        sb.append(mm.groupValues[2].replace("<", "&lt;").replace(">", "&gt;"))
-        sb.append("</span>")
+        sb.append(COLOR_MARK_OPEN)
+        sb.append(mm.groupValues[2])
+        sb.append(COLOR_MARK_CLOSE)
         last = mm.range.last + 1
     }
-    if (!any) return text
+    if (!any) return text to emptyList()
     sb.append(text, last, text.length)
-    return sb.toString()
+    return sb.toString() to colors
+}
+
+/** 渲染后：自建 SpannableStringBuilder，跳过哨兵字符并给其间文字上色（无残留字形、不依赖 textView.text 类型） */
+private fun applyColorMarkers(textView: TextView, colors: List<Int>) {
+    try {
+        val src = textView.text
+        if (src == null || src.isEmpty()) return
+        val rebuilt = android.text.SpannableStringBuilder()
+        var openRebuilt = -1
+        var segIdx = 0
+        var i = 0
+        val n = src.length
+        while (i < n) {
+            val ch = src[i]
+            when {
+                ch == COLOR_MARK_OPEN -> {
+                    openRebuilt = rebuilt.length
+                }
+                ch == COLOR_MARK_CLOSE && openRebuilt >= 0 && segIdx < colors.size -> {
+                    val col = colors[segIdx]
+                    if (col != -1 && rebuilt.length > openRebuilt) {
+                        rebuilt.setSpan(
+                                android.text.style.ForegroundColorSpan(col),
+                                openRebuilt, rebuilt.length,
+                                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                        )
+                        // 复制区间内的样式（粗体/斜体等）——ForegroundColorSpan 已覆盖颜色，无需额外
+                    }
+                    segIdx++
+                    openRebuilt = -1
+                }
+                else -> {
+                    rebuilt.append(ch)
+                }
+            }
+            i++
+        }
+        // 若还有未闭合的开标记忽略
+        textView.text = rebuilt
+    } catch (e: Exception) {
+        Log.e("MarkdownView", "颜色标记渲染失败: ${e.message}")
+    }
 }
 
 /**
