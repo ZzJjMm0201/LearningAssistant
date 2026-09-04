@@ -268,6 +268,8 @@ class MainViewModel : ViewModel() {
         searchEnabled.value = apiService.searchEnabled
         thinkingEnabled.value = apiService.thinkingEnabled
         themeMode.value = apiService.themeMode
+        dialect.value = apiService.dialect
+        grade.value = apiService.grade
         if (apiService.isLoggedIn()) {
             _isLoggedIn.value = true
             _loggedInUsername.value = apiService.getUsername() ?: ""
@@ -1109,7 +1111,7 @@ class MainViewModel : ViewModel() {
                     _statusText.value = "正在生成数据学情报告..."
                 }
 
-                val response = apiService.getDataReport(reportDaysVal)
+                val response = apiService.getDataReport(reportDaysVal, theme = if (AppDarkTheme) "dark" else "light")
 
                 withContext(Dispatchers.Main) {
                     if (response.status == "ok") {
@@ -1370,12 +1372,19 @@ class MainViewModel : ViewModel() {
     val searchEnabled = MutableStateFlow(true)
     val thinkingEnabled = MutableStateFlow(false)
     val themeMode = MutableStateFlow("system")   // system / light / dark
+    // ③ 方言 / ④ 年级
+    val dialect = MutableStateFlow("四川话")
+    val grade = MutableStateFlow("")
 
     fun saveExtraSettings() {
         apiService.saveExtraSettings(
             answerStyle.value, searchEnabled.value,
             thinkingEnabled.value, themeMode.value
         )
+    }
+
+    fun saveDialectGrade() {
+        apiService.saveDialectGrade(dialect.value, grade.value)
     }
 
     fun updateServerAddress(address: String) {
@@ -4104,7 +4113,7 @@ fun WelcomeDialog(onDismiss: () -> Unit, viewModel: MainViewModel) {
                                 onCheckedChange = { dontShowAgain = it },
                                 colors = CheckboxDefaults.colors(checkedColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
                         )
-                        Text("不再提醒", color = Color.White, fontSize = 14.sp)
+                        Text("不再提醒", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
                     }
                 }
             },
@@ -5448,6 +5457,8 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val searchEnabled by viewModel.searchEnabled.collectAsState()
     val thinkingEnabled by viewModel.thinkingEnabled.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
+    val dialect by viewModel.dialect.collectAsState()
+    val grade by viewModel.grade.collectAsState()
 
     AlertDialog(
             onDismissRequest = onDismiss,
@@ -5498,6 +5509,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                 "plain" to "通俗易懂",
                                 "concise" to "简洁精炼",
                                 "lively" to "活泼有趣",
+                                "dialect" to "方言",
                         ).forEach { (id, label) ->
                             FilterChip(
                                     selected = answerStyle == id,
@@ -5513,7 +5525,62 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         }
                     }
 
+                    // ③ 方言二级选择（风格选“方言”时显示）
+                    if (answerStyle == "dialect") {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                                "🗣️ 方言名称",
+                                color = tC(Color.White, Color(0xFF16181D)),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                        )
+                        Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话").forEach { d ->
+                                FilterChip(
+                                        selected = dialect == d,
+                                        onClick = {
+                                            viewModel.dialect.value = d
+                                            viewModel.saveDialectGrade()
+                                        },
+                                        label = { Text(d, fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF00ACC1)
+                                        )
+                                )
+                            }
+                        }
+                    }
+
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
+
+                    // ④ 年级设置（投给AI + 应用于AI报告）
+                    Text(
+                            "🏫 年级设置",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("" to "不限", "小学" to "小学", "初中" to "初中", "高中" to "高中", "考研" to "考研").forEach { (id, label) ->
+                            FilterChip(
+                                    selected = grade == id,
+                                    onClick = {
+                                        viewModel.grade.value = id
+                                        viewModel.saveDialectGrade()
+                                    },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF4CAF50)
+                                    )
+                            )
+                        }
+                    }
 
                     // ④ 搜题开关
                     SettingSwitch(

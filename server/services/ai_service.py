@@ -28,8 +28,19 @@ ANSWER_STYLES: Dict[str, Dict] = {
         "temperature": 0.9,
         "instruction": "回答风格：活泼亲切。语气轻松自然，可少量使用emoji和鼓励性话语，但内容必须保持准确。",
     },
+    "dialect": {
+        "label": "方言",
+        "temperature": 0.85,
+        "instruction": "回答风格：用地道的{方言}口吻讲解（语气、用词、口头禅都贴近{方言}本地说话方式），但专业术语、公式、数字必须保持准确，不要因为方言影响正确性。",
+    },
 }
 DEFAULT_STYLE = "formal"
+
+# ④ 可选择的方言名称（③ 风格选“方言”后二级选择）
+DIALECTS = ["四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话"]
+
+# ④ 年级候选（设置中选，投给AI时可影响讲解深度）
+GRADES = ["小学", "初中", "高中", "考研"]
 
 # ==================== 重点颜色标记（⑥：[[#RRGGBB]]…[[#RRGGBB]]，深浅背景均可读） ====================
 COLOR_RULES = """【重点颜色标记（重要）】
@@ -48,14 +59,30 @@ ASK_DRAW_RULE = ("回答要求：直接回答学生最新问题本身，用自�
                  "并把代码块放在对应讲解文字之后。若题目本身不含图形也可不输出。")
 
 
-def style_instruction(style: Optional[str]) -> str:
+def style_instruction(style: Optional[str], dialect: str = "") -> str:
     s = ANSWER_STYLES.get(style or "")
-    return s["instruction"] if s else ""
+    if not s:
+        return ""
+    instr = s["instruction"]
+    if style == "dialect" and dialect:
+        instr = instr.replace("{方言}", dialect)
+    elif style == "dialect":
+        instr = instr.replace("{方言}", "四川话")
+    return instr
 
 
 def style_temperature(style: Optional[str]) -> Optional[float]:
     s = ANSWER_STYLES.get(style or "")
     return s["temperature"] if s else None
+
+
+def grade_instruction(grade: Optional[str]) -> str:
+    """④ 年级设置：把讲解深度适配到学生年级（投给AI时注入）"""
+    g = (grade or "").strip()
+    if not g:
+        return ""
+    return (f"请面向【{g}】学生讲解：解释深度、举例、公式推导的详细程度都要适配{g}学生的接受能力，"
+            f"不要使用超出{g}水平过多的超纲内容（除非题目本身需要）。")
 
 
 class AIService:
@@ -92,17 +119,22 @@ class AIService:
         return (engine or "deepseek") != "qwen"
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
-                             style: Optional[str] = None, thinking: bool = False) -> Generator[Dict, None, None]:
+                             style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "") -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
         Yields:
             Dict: {"stage": "info"|"steps"|"solution"|"mindmap"|"questions"|"thinking_chunk", "content": ...}
         style: 回答风格id（②，影响文字类阶段的temperature与措辞）
+        dialect: 方言名称（③，style=dialect 时生效）
+        grade: 年级（④，影响讲解深度）
         thinking: 是否开启思考模式（十一，仅作用于“完整解析”阶段，思考内容经 thinking_chunk 下发）
         """
         start_time = time.time()
-        st_ins = style_instruction(style)
+        st_ins = style_instruction(style, dialect)
+        g_ins = grade_instruction(grade)
+        if g_ins:
+            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
         st_temp = style_temperature(style)
         use_thinking = thinking and self._thinking_supported(engine)
         
@@ -263,14 +295,18 @@ class AIService:
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
-    def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
+    def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
+                           style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
         """生成AI版学情报告（非流式，兼容旧调用）"""
-        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine, model=model))
+        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine, model=model, style=style, dialect=dialect, grade=grade))
 
     def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
-                                  style: Optional[str] = None):
+                                  style: Optional[str] = None, dialect: str = "", grade: str = ""):
         """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）"""
-        st_ins = style_instruction(style)
+        st_ins = style_instruction(style, dialect)
+        g_ins = grade_instruction(grade)
+        if g_ins:
+            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
     {stats_summary}
@@ -303,13 +339,16 @@ class AIService:
                 yield delta
     
     def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
-                                     style: Optional[str] = None) -> Generator[Dict, None, None]:
+                                     style: Optional[str] = None, dialect: str = "", grade: str = "") -> Generator[Dict, None, None]:
         """
         知识延伸多轮对话
         重点：总结归纳 + 易错点 + 知识拓展 + 延伸问题
         """
         start_time = time.time()
-        st_ins = style_instruction(style)
+        st_ins = style_instruction(style, dialect)
+        g_ins = grade_instruction(grade)
+        if g_ins:
+            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
         st_temp = style_temperature(style)
         system_prompt = self._build_system_prompt(ocr_text, search_result)
         if st_ins:
@@ -406,10 +445,13 @@ class AIService:
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
     
     def continue_conversation(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None,
-                              style: Optional[str] = None) -> str:
+                              style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
         """多轮对话 - 继续提问（非流式）"""
         system_add = ("你是学习助手。" + ASK_DRAW_RULE + "\n" + COLOR_RULES)
-        st_ins = style_instruction(style)
+        st_ins = style_instruction(style, dialect)
+        g_ins = grade_instruction(grade)
+        if g_ins:
+            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
         if st_ins:
             system_add += "\n" + st_ins
         messages.append({"role": "system", "content": system_add})
@@ -417,10 +459,13 @@ class AIService:
         return self._call_api(messages, engine=engine, model=model, temperature=style_temperature(style))
 
     def continue_conversation_stream(self, messages: List[ChatCompletionMessageParam], user_question: str, engine: Optional[str] = None, model: Optional[str] = None,
-                                     style: Optional[str] = None) -> Generator[str, None, None]:
+                                     style: Optional[str] = None, dialect: str = "", grade: str = "") -> Generator[str, None, None]:
         """多轮对话 - 继续提问（流式，逐chunk累积文本）"""
         system_add = ("你是学习助手。" + ASK_DRAW_RULE + "\n" + COLOR_RULES)
-        st_ins = style_instruction(style)
+        st_ins = style_instruction(style, dialect)
+        g_ins = grade_instruction(grade)
+        if g_ins:
+            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
         if st_ins:
             system_add += "\n" + st_ins
         messages.append({"role": "system", "content": system_add})

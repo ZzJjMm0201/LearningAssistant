@@ -112,7 +112,7 @@ class ReportGenerator:
     def __init__(self, db_session):
         self.db = db_session
     
-    def generate_data_report_html(self, days: int = 30, user_id: Optional[int] = None) -> str | None:
+    def generate_data_report_html(self, days: int = 30, user_id: Optional[int] = None, theme: str = "dark") -> str | None:
         """
         生成数据版学情报告（HTML 格式）
         
@@ -265,6 +265,17 @@ class ReportGenerator:
         focus_dates = sorted(daily_focus.keys())[-7:]
         focus_values = [round(daily_focus.get(d, 0) / 60, 1) for d in focus_dates]  # 分钟
         
+        # ② 浅色/深色主题变量（theme=light 时背景/文字变浅）
+        _light = theme == "light"
+        TPL = "plotly_white" if _light else "plotly_dark"
+        PBG = "#ffffff" if _light else "#16213e"
+        FCOL = "#222222" if _light else "white"
+        CARD_BG = "#f5f7fa" if _light else "#16213e"
+        BODY_BG = "#f2f4f8" if _light else "#1a1a2e"
+        BODY_FG = "#222222" if _light else "white"
+        BODY_SUB = "#555555" if _light else "#aaa"
+        BODY_ACCENT = "#0086b3" if _light else "#00d2ff"
+
         # 生成图表
         # 禁用所有图表的交互功能（缩放、点击放大等）
         config = {
@@ -283,7 +294,7 @@ class ReportGenerator:
             hole=0.4,
         )
         fig1.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=350)
-        fig1.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig1.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
         fig1.update_layout(dragmode=False, hovermode=False)
         fig1.update_xaxes(fixedrange=True)
         fig1.update_yaxes(fixedrange=True)
@@ -309,7 +320,7 @@ class ReportGenerator:
             dragmode=False,
             hovermode=False,
         )
-        fig2.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig2.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
         fig2.update_xaxes(fixedrange=True)
         fig2.update_yaxes(fixedrange=True)
         
@@ -329,7 +340,7 @@ class ReportGenerator:
                     dragmode=False,
                     hovermode=False,
                 )
-                fig3.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+                fig3.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
         
         # 4. 易错点（① 改为文字段落，见HTML组装末尾）
         fig4 = None
@@ -362,7 +373,7 @@ class ReportGenerator:
             hovermode=False,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
         )
-        fig5.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+        fig5.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
         fig5.update_xaxes(fixedrange=True)
         fig5.update_yaxes(fixedrange=True)
 
@@ -381,7 +392,7 @@ class ReportGenerator:
                 )
             ])
             fig7.update_layout(title="专注状态分布（分钟）", margin=dict(l=20, r=20, t=50, b=20), height=320, dragmode=False, hovermode=False)
-            fig7.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig7.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
         
         # 8. 每日专注时长趋势（最近7天，分钟）
         fig8 = None
@@ -403,7 +414,7 @@ class ReportGenerator:
                 dragmode=False,
                 hovermode=False,
             )
-            fig8.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig8.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
             fig8.update_xaxes(fixedrange=True)
             fig8.update_yaxes(fixedrange=True)
 
@@ -433,7 +444,7 @@ class ReportGenerator:
                 hovermode=False,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
             )
-            fig9.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig9.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
             fig9.update_xaxes(fixedrange=True)
             fig9.update_yaxes(fixedrange=True, range=[-0.1, 1.1])
 
@@ -459,7 +470,7 @@ class ReportGenerator:
                 dragmode=False,
                 hovermode=False,
             )
-            fig10.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig10.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
             fig10.update_xaxes(fixedrange=True)
             fig10.update_yaxes(fixedrange=True)
         
@@ -473,7 +484,7 @@ class ReportGenerator:
                 color_discrete_sequence=["#4CAF50", "#FFC107", "#F44336"],
             )
             fig6.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=300, dragmode=False, hovermode=False)
-            fig6.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
+            fig6.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
             fig6.update_xaxes(fixedrange=True)
             fig6.update_yaxes(fixedrange=True)
         
@@ -491,15 +502,15 @@ class ReportGenerator:
     <script src="{plotly_src}"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: -apple-system, sans-serif; background: #1a1a2e; color: white; padding: 20px; }}
-        .header {{ text-align: center; padding: 20px; background: #16213e; border-radius: 12px; margin-bottom: 16px; }}
-        .header h1 {{ font-size: 24px; color: #00d2ff; }}
-        .header p {{ color: #aaa; margin-top: 8px; }}
+        body {{ font-family: -apple-system, sans-serif; background: {BODY_BG}; color: {BODY_FG}; padding: 20px; }}
+        .header {{ text-align: center; padding: 20px; background: {CARD_BG}; border-radius: 12px; margin-bottom: 16px; }}
+        .header h1 {{ font-size: 24px; color: {BODY_ACCENT}; }}
+        .header p {{ color: {BODY_SUB}; margin-top: 8px; }}
         .stats {{ display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }}
-        .stat-card {{ flex: 1; min-width: 120px; background: #16213e; border-radius: 12px; padding: 16px; text-align: center; }}
-        .stat-card .number {{ font-size: 32px; font-weight: bold; color: #00d2ff; }}
-        .stat-card .label {{ color: #aaa; margin-top: 4px; font-size: 14px; }}
-        .chart-container {{ background: #16213e; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
+        .stat-card {{ flex: 1; min-width: 120px; background: {CARD_BG}; border-radius: 12px; padding: 16px; text-align: center; }}
+        .stat-card .number {{ font-size: 32px; font-weight: bold; color: {BODY_ACCENT}; }}
+        .stat-card .label {{ color: {BODY_SUB}; margin-top: 4px; font-size: 14px; }}
+        .chart-container {{ background: {CARD_BG}; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
     </style>
 </head>
 <body>
@@ -540,7 +551,7 @@ class ReportGenerator:
     {'<div class="chart-container">' + fig9.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig9 else ''}
     {'<div class="chart-container">' + fig10.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig10 else ''}
     
-    {f'<div class="chart-container" style="text-align:left"><h3 style="color:#FF5722;margin-bottom:10px">常见易错点</h3><p style="line-height:2;white-space:pre-line">{mistake_text}</p></div>' if mistake_text else ''}
+    {f'<div class="chart-container" style="text-align:left"><h3 style="color:{BODY_ACCENT};margin-bottom:10px">常见易错点</h3><p style="line-height:2;white-space:pre-line">{mistake_text}</p></div>' if mistake_text else ''}
 </body>
 </html>
 """

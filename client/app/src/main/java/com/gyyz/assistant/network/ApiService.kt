@@ -30,6 +30,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         private const val KEY_SEARCH_ENABLED = "search_enabled"
         private const val KEY_THINKING_ENABLED = "thinking_enabled"
         private const val KEY_THEME_MODE = "theme_mode"
+        private const val KEY_DIALECT = "dialect"
+        private const val KEY_GRADE = "grade"
     }
 
     private var sharedPreferences: SharedPreferences? = null
@@ -120,11 +122,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     var llmModel: String = ""              // 大语言模型名（空=提供方默认）
     var ocrMode: String = "paddle"         // paddle / qwen（千问视觉OCR）
     var visionModel: String = ""           // 视觉模型名（空=默认 qwen3.8-max）
-    // ② 回答风格 formal/plain/concise/lively（④⑦十一 相关请求头）
+    // ② 回答风格 formal/plain/concise/lively/dialect（④⑦十一 相关请求头）
     var answerStyle: String = "formal"
     var searchEnabled: Boolean = true
     var thinkingEnabled: Boolean = false
     var themeMode: String = "system"       // system / light / dark（纯客户端，不发服务器）
+    var dialect: String = "四川话"         // ③ 方言名称（style=dialect 时）
+    var grade: String = ""                 // ④ 年级（小学/初中/高中/考研）
 
     /**
      * 为任意请求追加认证头 + AI模型头（统一入口）
@@ -135,10 +139,12 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
         addHeader("X-OCR-Mode", ocrMode)
         if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
-        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关
+        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级
         addHeader("X-Style", answerStyle)
         if (thinkingEnabled) addHeader("X-Thinking", "1")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
+        if (answerStyle == "dialect" && dialect.isNotEmpty()) addHeader("X-Dialect", dialect)
+        if (grade.isNotEmpty()) addHeader("X-Grade", grade)
         return this
     }
 
@@ -167,6 +173,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         searchEnabled = sharedPreferences?.getBoolean(KEY_SEARCH_ENABLED, true) ?: true
         thinkingEnabled = sharedPreferences?.getBoolean(KEY_THINKING_ENABLED, false) ?: false
         themeMode = sharedPreferences?.getString(KEY_THEME_MODE, "system") ?: "system"
+        dialect = sharedPreferences?.getString(KEY_DIALECT, "四川话") ?: "四川话"
+        grade = sharedPreferences?.getString(KEY_GRADE, "") ?: ""
     }
 
     /**
@@ -183,6 +191,16 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         searchEnabled = search
         thinkingEnabled = thinking
         themeMode = theme
+    }
+
+    /** 持久化 ③④ 方言/年级 */
+    fun saveDialectGrade(dialect: String, grade: String) {
+        sharedPreferences?.edit()
+            ?.putString(KEY_DIALECT, dialect)
+            ?.putString(KEY_GRADE, grade)
+            ?.apply()
+        this.dialect = dialect
+        this.grade = grade
     }
 
     private val client = OkHttpClient.Builder()
@@ -367,9 +385,9 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         }
     }
 
-    suspend fun getDataReport(days: Int = 30): ReportResponse {
+    suspend fun getDataReport(days: Int = 30, theme: String = "dark"): ReportResponse {
         return withContext(Dispatchers.IO) {
-            val json = JSONObject().apply { put("days", days) }
+            val json = JSONObject().apply { put("days", days); put("theme", theme) }
             val body = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url("$BASE_URL/report/data").post(body).withAuth().build()
             val response = client.newCall(request).execute()

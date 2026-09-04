@@ -140,6 +140,7 @@ class AskRequest(BaseModel):
 
 class ReportRequest(BaseModel):
     days: int = 30
+    theme: str = "dark"  # dark / light（② 数据报告深浅色）
 
 class TrackingData(BaseModel):
     session_id: str
@@ -197,7 +198,17 @@ def get_vision_model(request: Request) -> Optional[str]:
 def get_answer_style(request: Request) -> Optional[str]:
     """② 回答风格（X-Style头：formal/plain/concise/lively），未指定用默认"""
     s = (request.headers.get("X-Style") or "").strip().lower()
-    return s if s in ("formal", "plain", "concise", "lively") else None
+    return s if s in ("formal", "plain", "concise", "lively", "dialect") else None
+
+
+def get_dialect(request: Request) -> str:
+    """③ 方言名称（X-Dialect头，style=dialect 时生效）"""
+    return (request.headers.get("X-Dialect") or "").strip()
+
+
+def get_grade(request: Request) -> str:
+    """④ 年级（X-Grade头，如 高中）"""
+    return (request.headers.get("X-Grade") or "").strip()
 
 
 def get_thinking_enabled(request: Request) -> bool:
@@ -233,6 +244,8 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         style=get_answer_style(request),
         thinking=get_thinking_enabled(request),
         search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
     )
     
     return {
@@ -316,7 +329,7 @@ async def ask_question(request: AskRequest):
             [{"role": h.role, "content": h.content} for h in history]
         )
 
-        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request))
+        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
 
         # 保存本次问答到数据库，保证后续追问上下文连续
         for role, content in (("user", request.question), ("assistant", response)):
@@ -346,11 +359,13 @@ async def ask_question_stream(request: Request, body: AskRequest):
         engine = get_engine(request)
         llm_model = get_llm_model(request)
         style = get_answer_style(request)
+        dialect = get_dialect(request)
+        grade = get_grade(request)
 
         async def event_stream():
             accumulated = ""
             prev_sent = ""
-            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine, model=llm_model, style=style):
+            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine, model=llm_model, style=style, dialect=dialect, grade=grade):
                 accumulated = chunk
                 # AI流式回调返回“累积到当前”的全文：只下发新增部分，客户端累加后不会重复
                 delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
@@ -464,7 +479,8 @@ async def data_report(request: Request, body: ReportRequest):
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
-        html_path = generator.generate_data_report_html(body.days, user_id=get_current_user(request))
+        theme = "light" if (body.theme or "").lower() == "light" else "dark"
+        html_path = generator.generate_data_report_html(body.days, user_id=get_current_user(request), theme=theme)
         
         if html_path:
             filename = Path(html_path).name
@@ -488,7 +504,7 @@ async def ai_report(request: Request, body: ReportRequest):
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
         
-        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request))
+        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
         
         return {
             "status": "ok",
@@ -513,7 +529,7 @@ async def ai_report_stream(request: Request, body: ReportRequest):
             # 先发摘要供客户端展示
             yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
             # 流式生成报告正文
-            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request)):
+            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request)):
                 yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
             yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
@@ -555,7 +571,7 @@ async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     # 最长边压缩至1000像素以下，便于后续OCR识别
     save_uploaded_image(await file.read(), image_path)
     
-    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request), ocr_mode=get_ocr_mode(request), vision_model=get_vision_model(request), model=get_llm_model(request), style=get_answer_style(request))
+    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request), ocr_mode=get_ocr_mode(request), vision_model=get_vision_model(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
     
     return {"request_id": request_id, "status": "processing"}
 

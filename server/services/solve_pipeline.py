@@ -42,7 +42,7 @@ class SolvePipeline:
         pass
     
     def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                    style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True) -> str:
+                    style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True, dialect: str = "", grade: str = "") -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -51,7 +51,7 @@ class SolvePipeline:
         thread = threading.Thread(
             target=self._solve_worker,
             args=(request_id, image_path, session_id, base_host, user_id, engine, ocr_mode, vision_model, model,
-                  style, thinking, search_enabled)
+                  style, thinking, search_enabled, dialect, grade)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -103,7 +103,7 @@ class SolvePipeline:
         self._cleanup(request_id)
     
     def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                      style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True):
+                      style: Optional[str] = None, thinking: bool = False, search_enabled: bool = True, dialect: str = "", grade: str = ""):
         """后台解题工作线程"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
@@ -171,7 +171,7 @@ class SolvePipeline:
             # 使用流式处理AI对话的各个阶段
             first_question_info = None
             for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model,
-                                                         style=style, thinking=thinking):
+                                                         style=style, thinking=thinking, dialect=dialect, grade=grade):
                 stage = event["stage"]
                 content = event["content"]
                 
@@ -304,14 +304,14 @@ class SolvePipeline:
             self._cleanup(request_id)
     
     def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                                  style: Optional[str] = None) -> str:
+                                  style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
         """启动知识延伸流程"""
         request_id = session_id or str(uuid.uuid4())
         _event_queues[request_id] = deque()
         
         thread = threading.Thread(
             target=self._extension_worker,
-            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model, style)
+            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model, style, dialect, grade)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -319,7 +319,7 @@ class SolvePipeline:
         return request_id
 
     def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                          style: Optional[str] = None):
+                          style: Optional[str] = None, dialect: str = "", grade: str = ""):
         """知识延伸工作线程"""
         print(f"[{request_id}] ========== 知识延伸流程启动 ==========\n")
         
@@ -347,7 +347,7 @@ class SolvePipeline:
             ext_extension = ""
             ext_questions = []
             
-            for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model, style=style):
+            for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model, style=style, dialect=dialect, grade=grade):
                 stage = event["stage"]
                 content = event["content"]
                 
