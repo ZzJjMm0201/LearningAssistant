@@ -11,6 +11,22 @@ from pathlib import Path
 from typing import List, Tuple
 from server.utils.tikz_md_renderer import render_latex_blocks, is_real_png
 
+
+def _make_dark_png(png_path) -> None:
+    """⑧ 生成深色版 PNG（白底黑字 → 黑底白字），文件名加 _dark 后缀
+    供客户端深色模式加载 LaTeX 图时使用（反转像素亮度）"""
+    try:
+        from PIL import Image
+        from PIL import ImageChops
+        p = Image.open(png_path).convert("RGB")
+        inverted = ImageChops.invert(p)
+        dark_path = png_path.with_name(png_path.stem + "_dark" + png_path.suffix)
+        inverted.save(dark_path)
+        print(f"  [LaTeX] 生成深色版: {dark_path.name}")
+    except Exception as e:
+        print(f"  [LaTeX] 深色版生成失败(忽略): {e}")
+
+
 def extract_latex_blocks(text: str) -> List[Tuple[str, str, int, int]]:
     """
     提取文本中的LaTeX代码块
@@ -60,6 +76,7 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
         if success:
             # 优先使用真正的PNG（客户端Glide可直接解码）
             if is_real_png(png_path):
+                _make_dark_png(png_path)  # ⑧ 深色版
                 replacement = f"\n\n![图解]({png_path.name})\n\n"
             elif svg_path.exists():
                 replacement = f"\n\n![图解]({svg_path.name})\n\n"
@@ -116,6 +133,7 @@ def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=N
             png_path = output_dir / f"diagram_{cur_block_id}.png"
             svg_path = output_dir / f"diagram_{cur_block_id}.svg"
             if is_real_png(png_path):
+                _make_dark_png(png_path)  # ⑧ 深色版
                 replacement = f"\n\n![图解]({png_path.name})\n\n"
             elif svg_path.exists():
                 replacement = f"\n\n![图解]({svg_path.name})\n\n"

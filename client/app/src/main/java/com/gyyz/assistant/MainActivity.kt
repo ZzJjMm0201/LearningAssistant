@@ -3465,7 +3465,12 @@ fun MarkdownView(
 
     // ⑥ 颜色标记 [[#RRGGBB]…[[#RRGGBB] → 哨兵字符 + 渲染后自建 SpannableStringBuilder 回填颜色
     val (cleanMarked, markColors) = remember(content) { extractColorSegments(content) }
-    val processedContent = remember(cleanMarked) { prepareMarkdownContent(cleanMarked) }
+    val processedContent = remember(cleanMarked, dark) {
+        var t = prepareMarkdownContent(cleanMarked)
+        // ⑧ 深色模式：LaTeX 图改用反色版（diagram_xxx.png → diagram_xxx_dark.png）
+        if (dark) t = rewriteLatexImageForDark(t)
+        t
+    }
 
     val markwon = remember(dark, fontSize) {
         Markwon.builder(context)
@@ -3694,6 +3699,16 @@ private fun formatMindMap(text: String): String {
     if (text.isBlank()) return text
     val fenced = text.trimStart().startsWith("```") || (text.split("```").size - 1) >= 2
     return if (fenced) text else "```\n$text\n```"
+}
+
+/** ⑧ 深色模式：把 LaTeX 图 URL 重写为反色版（diagram_xxx.png → diagram_xxx_dark.png；忽略已是 _dark 的） */
+private fun rewriteLatexImageForDark(content: String): String {
+    if (content.isEmpty()) return content
+    return content.replace(
+        Regex("""(diagram_)([0-9a-fA-F]+)\.png(?!_dark)""")
+    ) { m ->
+        "${m.groupValues[1]}${m.groupValues[2]}_dark.png"
+    }
 }
 
 private fun prepareMarkdownContent(content: String): String {
