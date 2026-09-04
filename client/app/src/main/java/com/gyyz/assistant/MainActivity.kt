@@ -5047,10 +5047,10 @@ fun HistoryRecordCard(
                             factory = { ctx ->
                                 android.widget.ImageView(ctx).apply {
                                     scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-                                    setBackgroundColor(android.graphics.Color.parseColor("#12122A"))
+                                    setBackgroundColor(android.graphics.Color.parseColor(if (AppDarkTheme) "#12122A" else "#FFFFFF"))
                                     com.bumptech.glide.Glide.with(ctx)
                                             .load(fullImageUrl)
-                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor("#2D2D44")))
+                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor(if (AppDarkTheme) "#2D2D44" else "#E9EDF4")))
                                             .into(this)
                                 }
                             },
@@ -5314,10 +5314,10 @@ fun HistoryDetailScreen(
                                 factory = { ctx ->
                                     android.widget.ImageView(ctx).apply {
                                         scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-                                        setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
+                                        setBackgroundColor(android.graphics.Color.parseColor(if (AppDarkTheme) "#1A1A2E" else "#FFFFFF"))
                                         com.bumptech.glide.Glide.with(ctx)
                                             .load(fullImageUrl)
-                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor("#2D2D44")))
+                                            .placeholder(android.graphics.drawable.ColorDrawable(android.graphics.Color.parseColor(if (AppDarkTheme) "#2D2D44" else "#E9EDF4")))
                                             .into(this)
                                     }
                                 },
