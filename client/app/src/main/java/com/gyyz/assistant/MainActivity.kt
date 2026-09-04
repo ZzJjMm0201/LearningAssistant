@@ -122,10 +122,10 @@ sealed class AppState {
 
     data class Knowledge(
             val summary: String = "",
-            val mistakes: String = "",
             val extension: String = "",
-            val suggestedQuestions: List<String> = emptyList(),
-            val mistakesStreaming: Boolean = false,
+            val similarQuestions: List<QAItem> = emptyList(),
+            val suggestedQuestions: List<QAItem> = emptyList(),
+            val summaryStreaming: Boolean = false,
             val extensionStreaming: Boolean = false
     ) : AppState()
 }
@@ -134,6 +134,25 @@ sealed class AppState {
  * 问答对：问题 + 答案（AI预判问题自带答案；用户追问后追加）
  */
 data class QAItem(val question: String, val answer: String = "", val rendered: Boolean = false)
+
+/** 解析服务端下发的 [{question,answer}] 或 ["q1","q2"] 为 QAItem 列表 */
+private fun parseQAList(content: Any?): List<QAItem> {
+    if (content == null) return emptyList()
+    val arr = content as? JSONArray ?: return emptyList()
+    val out = mutableListOf<QAItem>()
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i)
+        if (obj != null) {
+            val q = obj.optString("question", "")
+            val a = obj.optString("answer", "")
+            if (q.isNotEmpty()) out.add(QAItem(q, a))
+        } else {
+            val s = arr.optString(i, "")
+            if (s.isNotEmpty()) out.add(QAItem(s, ""))
+        }
+    }
+    return out
+}
 
 enum class SolveStage {
     UPLOADING,
@@ -1204,10 +1223,10 @@ class MainViewModel : ViewModel() {
             val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
             var dataBuffer = StringBuilder()
             var summary = ""
-            var mistakes = ""
             var extension = ""
-            var questions = emptyList<String>()
-            var lastMistakesUpdate = 0L
+            var similar = emptyList<QAItem>()
+            var questions = emptyList<QAItem>()
+            var lastSummaryUpdate = 0L
             var lastExtensionUpdate = 0L
 
             while (true) {
@@ -1232,84 +1251,52 @@ class MainViewModel : ViewModel() {
                                     _appState.value = AppState.Knowledge()
                                     _statusText.value = "正在总结知识点..."
                                 }
-                                "mistakes_chunk" -> {
-                                    // 流式增量：易错点详解打字机效果
+                                "summary_chunk" -> {
                                     val chunk = json.optString("content", "")
                                     if (chunk.isNotEmpty()) {
                                         val now = System.currentTimeMillis()
-                                        if (now - lastMistakesUpdate >= 100) {
-                                            lastMistakesUpdate = now
-                                            mistakes = chunk
-                                            _appState.value =
-                                                    AppState.Knowledge(
-                                                            summary = summary,
-                                                            mistakes = mistakes,
-                                                            mistakesStreaming = true
-                                                    )
-                                            _statusText.value = "正在生成易错点详解..."
+                                        if (now - lastSummaryUpdate >= 100) {
+                                            lastSummaryUpdate = now
+                                            summary = chunk
+                                            _appState.value = AppState.Knowledge(summary = summary, summaryStreaming = true)
+                                            _statusText.value = "正在总结知识点..."
                                         }
                                     }
                                 }
-                                "mistakes" -> {
-                                    mistakes = json.optString("content", "")
-                                    _appState.value =
-                                            AppState.Knowledge(
-                                                    summary = summary,
-                                                    mistakes = mistakes
-                                            )
-                                    _statusText.value = "易错点已生成"
+                                "summary" -> {
+                                    summary = json.optString("content", "")
+                                    _appState.value = AppState.Knowledge(summary = summary)
+                                    _statusText.value = "知识点已总结"
+                                }
+                                "similar_questions" -> {
+                                    similar = parseQAList(json.opt("content"))
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar)
+                                    _statusText.value = "已推荐相似题"
                                 }
                                 "extension_chunk" -> {
-                                    // 流式增量：知识拓展打字机效果
                                     val chunk = json.optString("content", "")
                                     if (chunk.isNotEmpty()) {
                                         val now = System.currentTimeMillis()
                                         if (now - lastExtensionUpdate >= 100) {
                                             lastExtensionUpdate = now
                                             extension = chunk
-                                            _appState.value =
-                                                    AppState.Knowledge(
-                                                            summary = summary,
-                                                            mistakes = mistakes,
-                                                            extension = extension,
-                                                            extensionStreaming = true
-                                                    )
+                                            _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, extensionStreaming = true)
                                             _statusText.value = "正在生成知识拓展..."
                                         }
                                     }
                                 }
                                 "extension" -> {
                                     extension = json.optString("content", "")
-                                    _appState.value =
-                                            AppState.Knowledge(
-                                                    summary = summary,
-                                                    mistakes = mistakes,
-                                                    extension = extension
-                                            )
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension)
                                     _statusText.value = "知识拓展已生成"
                                 }
                                 "suggested_questions" -> {
-                                    val arr = json.optJSONArray("content")
-                                    if (arr != null) {
-                                        questions = (0 until arr.length()).map { arr.getString(it) }
-                                    }
-                                    _appState.value =
-                                            AppState.Knowledge(
-                                                    summary = summary,
-                                                    mistakes = mistakes,
-                                                    extension = extension,
-                                                    suggestedQuestions = questions
-                                            )
+                                    questions = parseQAList(json.opt("content"))
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions)
                                     _statusText.value = "延伸完成"
                                 }
                                 "complete" -> {
-                                    _appState.value =
-                                            AppState.Knowledge(
-                                                    summary = summary,
-                                                    mistakes = mistakes,
-                                                    extension = extension,
-                                                    suggestedQuestions = questions
-                                            )
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions)
                                     _statusText.value = "延伸完成"
                                 }
                                 "error" -> _statusText.value = "错误: ${json.optString("content")}"
@@ -1368,7 +1355,6 @@ class MainViewModel : ViewModel() {
                             "full_solution" to true,
                             "mind_map" to true,
                             "suggested_questions" to true,
-                            "mistakes" to true,
                             "extension" to true,
                     )
             )
@@ -3161,7 +3147,7 @@ fun KnowledgeScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            if (state.summary.isEmpty() && state.mistakes.isEmpty()) {
+            if (state.summary.isEmpty() && state.extension.isEmpty()) {
                 LoadingOverlay("正在分析内容...")
             }
 
@@ -3171,18 +3157,8 @@ fun KnowledgeScreen(
                         content = state.summary,
                         color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
                         fontSize = knowledgeFontSize,
-                        initiallyCollapsed = !showModules.getOrDefault("solution_steps", true)
-                )
-            }
-
-            if (state.mistakes.isNotEmpty()) {
-                SolutionCard(
-                        title = "📝 易错点总结",
-                        content = state.mistakes,
-                        color = Color(0xFFFF5722),
-                        fontSize = knowledgeFontSize,
-                        initiallyCollapsed = !showModules.getOrDefault("mistakes", true),
-                        streaming = state.mistakesStreaming
+                        initiallyCollapsed = !showModules.getOrDefault("solution_steps", true),
+                        streaming = state.summaryStreaming
                 )
             }
 
@@ -3197,6 +3173,42 @@ fun KnowledgeScreen(
                 )
             }
 
+            // ② 相似题推荐（3个，折叠展示题目+答案）
+            if (state.similarQuestions.isNotEmpty()) {
+                Text(
+                        text = "🔗 相似题推荐：",
+                        color = tC(Color.White, Color(0xFF16181D)),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                )
+                state.similarQuestions.forEach { item ->
+                    var expanded by remember(item.question) { mutableStateOf(false) }
+                    Card(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                    ) {
+                        Column(
+                                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(12.dp)
+                        ) {
+                            Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(item.question, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                Text(if (expanded) "▲" else "▼", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                            }
+                            if (expanded && item.answer.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text("📝 ${item.answer}", color = tC(Color(0xFFB0BEC5), Color(0xFF546E7A)), fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ② 延伸思考（折叠块，带答案 + 问追问，同AI解答样式）
             if (state.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
                 Text(
                         text = "💬 延伸思考：",
@@ -3205,13 +3217,36 @@ fun KnowledgeScreen(
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
                 )
-
-                state.suggestedQuestions.forEach { question ->
-                    Button(
-                            onClick = { onAskQuestion(question) },
+                state.suggestedQuestions.forEach { item ->
+                    var expanded by remember(item.question) { mutableStateOf(false) }
+                    Card(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
-                    ) { Text(question, color = Color.White, fontSize = 14.sp) }
+                            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF)))
+                    ) {
+                        Column(
+                                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(12.dp)
+                        ) {
+                            Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("❓ ${item.question}", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                Text(if (expanded) "▲" else "▼", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                            }
+                            if (expanded) {
+                                if (item.answer.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text("💡 ${item.answer}", color = tC(Color(0xFFE0E0E0), Color(0xFF3A3F47)), fontSize = 13.sp)
+                                }
+                                TextButton(
+                                        onClick = { onAskQuestion(item.question) }
+                                ) {
+                                    Text("追问", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             

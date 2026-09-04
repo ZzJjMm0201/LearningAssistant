@@ -340,9 +340,10 @@ class SolvePipeline:
             self._emit_event(request_id, "info", "正在分析内容...")
             
             ext_info = {}
-            ext_mistakes = ""
+            ext_summary = ""
             ext_extension = ""
             ext_questions = []
+            ext_similar = []
             
             for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model, style=style, dialect=dialect, grade=grade):
                 stage = event["stage"]
@@ -351,14 +352,15 @@ class SolvePipeline:
                 if stage == "info":
                     ext_info = content if isinstance(content, dict) else {}
                     self._emit_event(request_id, "question_info", content)
-                elif stage == "mistakes_chunk":
-                    # 流式chunk: content 是累积到当前的完整文本
-                    self._emit_event(request_id, "mistakes_chunk", content)
-                elif stage == "mistakes":
-                    ext_mistakes = content or ""
-                    self._emit_event(request_id, "mistakes", content)
+                elif stage == "summary_chunk":
+                    self._emit_event(request_id, "summary_chunk", content)
+                elif stage == "summary":
+                    ext_summary = content or ""
+                    self._emit_event(request_id, "summary", content)
+                elif stage == "similar_questions":
+                    ext_similar = content if isinstance(content, list) else []
+                    self._emit_event(request_id, "similar_questions", content)
                 elif stage == "extension_chunk":
-                    # 流式chunk: content 是累积到当前的完整文本
                     self._emit_event(request_id, "extension_chunk", content)
                 elif stage == "extension":
                     ext_extension = content or ""
@@ -374,8 +376,8 @@ class SolvePipeline:
                         db = SessionLocal()
                         try:
                             parts = []
-                            if ext_mistakes:
-                                parts.append(f"## 易错点详解\n\n{ext_mistakes}")
+                            if ext_summary:
+                                parts.append(f"## 知识点总结\n\n{ext_summary}")
                             if ext_extension:
                                 parts.append(f"## 知识拓展\n\n{ext_extension}")
                             body = "\n\n".join(parts)
@@ -386,7 +388,7 @@ class SolvePipeline:
                                 record_type="extension",
                                 title=title,
                                 content=body,
-                                extra_json={"questions": ext_questions, "subject": (ext_info or {}).get("subject", "")},
+                                extra_json={"questions": ext_questions, "similar": ext_similar, "subject": (ext_info or {}).get("subject", "")},
                             )
                             db.add(rec)
                             db.commit()

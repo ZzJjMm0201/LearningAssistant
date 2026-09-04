@@ -341,8 +341,8 @@ class AIService:
     def generate_knowledge_extension(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
                                      style: Optional[str] = None, dialect: str = "", grade: str = "") -> Generator[Dict, None, None]:
         """
-        知识延伸多轮对话
-        重点：总结归纳 + 易错点 + 知识拓展 + 延伸问题
+        知识延伸多轮对话（②：删易错点板块，改为 知识点总结 + 知识拓展 + 相似题推荐 + 延伸思考(带答案)）
+        阶段：info(JSON含相似题) → summary(知识点总结) → similar_questions(相似题推荐) → extension(知识拓展) → questions(延伸思考QA)
         """
         start_time = time.time()
         st_ins = style_instruction(style, dialect)
@@ -356,51 +356,63 @@ class AIService:
         system_prompt += "\n\n" + COLOR_RULES
         messages = [{"role": "system", "content": system_prompt}]
         
-        # ===== 第一阶段：知识点总结与易错点 =====
+        # ===== 第一阶段：结构化分析（含相似题推荐、延伸思考题） =====
         summary_prompt = """请分析这道题目，以JSON格式输出：
     {
         "core_concept": "核心概念（一句话）",
         "knowledge_summary": "知识点总结（100字内）",
-        "easy_mistakes": ["易错点1及避坑方法", "易错点2及避坑方法", "易错点3及避坑方法"],
         "extension_topics": ["可延伸的知识点1", "可延伸的知识点2"],
+        "similar_questions": [
+            {"question": "相似题1（与本题同知识点的另一道题）", "answer": "简要答案1"},
+            {"question": "相似题2", "answer": "简要答案2"},
+            {"question": "相似题3", "answer": "简要答案3"}
+        ],
+        "extension_questions": [
+            {"question": "延伸思考题1", "answer": "完整答案1"},
+            {"question": "延伸思考题2", "answer": "完整答案2"},
+            {"question": "延伸思考题3", "answer": "完整答案3"}
+        ],
         "difficulty": "易/较易/中/较难/难",
         "subject": "学科"
     }
-    只输出JSON。"""
+    相似题推荐要换成与本题知识点相关的、还没做过的题目；延伸思考题要有深度、引导思考，并给出完整答案。只输出JSON。"""
         
         messages.append({"role": "user", "content": summary_prompt})
         info_response = self._call_api(messages, engine=engine, model=model)
         info = self._parse_json_response(info_response)
         yield {"stage": "info", "content": info}
         
-        # ===== 第二阶段：易错点详解 =====
-        mistakes_prompt = f"""针对以下易错点，逐一给出详细解释和避坑方法：
-    {json.dumps(info.get('easy_mistakes', []), ensure_ascii=False) if isinstance(info, dict) else []}
-    要求：
-    1. 每个易错点单独一段
-    2. 说明为什么容易错
-    3. 给出正确的思路
-    4. 用具体例子说明"""
+        # ===== 第二阶段：知识点总结（流式） =====
+        knowledge_summary = (info or {}).get('knowledge_summary', '') if isinstance(info, dict) else ''
+        core_concept = (info or {}).get('core_concept', '') if isinstance(info, dict) else ''
+        summary_expand_prompt = f"""请围绕核心概念“{core_concept}”，把知识点总结展开成清晰易懂的讲解：
+{knowledge_summary}
+要求：
+1. 分点讲清楚每个知识点的含义
+2. 结合本题说明如何运用
+3. 200字左右"""
         if st_ins:
-            mistakes_prompt += "\n" + st_ins
+            summary_expand_prompt += "\n" + st_ins
         
         messages.append({"role": "assistant", "content": info_response})
-        messages.append({"role": "user", "content": mistakes_prompt})
-        # 流式输出易错点详解
-        accumulated_mistakes = ""
+        messages.append({"role": "user", "content": summary_expand_prompt})
+        accumulated_summary = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
                                             temperature=st_temp):
             if evt["stage"] == "content":
-                accumulated_mistakes = evt["content"]
-                yield {"stage": "mistakes_chunk", "content": accumulated_mistakes}
-        mistakes_detail = accumulated_mistakes
+                accumulated_summary = evt["content"]
+                yield {"stage": "summary_chunk", "content": accumulated_summary}
+        summary_content = accumulated_summary
+        yield {"stage": "summary", "content": summary_content}
         
-        yield {"stage": "mistakes", "content": mistakes_detail}
+        # ===== 第三阶段：相似题推荐（直接下发 info 里的 similar_questions） =====
+        similar = (info or {}).get('similar_questions', []) if isinstance(info, dict) else []
+        if not isinstance(similar, list):
+            similar = []
+        yield {"stage": "similar_questions", "content": similar}
         
-        # ===== 第三阶段：知识拓展 =====
-        core_concept = info.get('core_concept', '') if isinstance(info, dict) else ''
-        extension_topics = info.get('extension_topics', []) if isinstance(info, dict) else []
-        
+        # ===== 第四阶段：知识拓展（流式） =====
+        extension_topics = (info or {}).get('extension_topics', []) if isinstance(info, dict) else []
         extension_prompt = f"""请针对以下核心概念进行知识拓展：
 核心概念：{core_concept}
 可延伸知识点：{extension_topics}
@@ -413,9 +425,8 @@ class AIService:
         if st_ins:
             extension_prompt += "\n" + st_ins
         
-        messages.append({"role": "assistant", "content": mistakes_detail})
+        messages.append({"role": "assistant", "content": summary_content})
         messages.append({"role": "user", "content": extension_prompt})
-        # 流式输出知识拓展
         accumulated_extension = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
                                             temperature=st_temp):
@@ -423,23 +434,13 @@ class AIService:
                 accumulated_extension = evt["content"]
                 yield {"stage": "extension_chunk", "content": accumulated_extension}
         extension_content = accumulated_extension
-        
         yield {"stage": "extension", "content": extension_content}
         
-        # ===== 第四阶段：延伸问题 =====
-        questions_prompt = """请生成3个延伸思考问题，以JSON数组格式输出：
-    ["问题1", "问题2", "问题3"]
-    这些问题应该：
-    1. 引导深入思考
-    2. 联系其他知识点
-    3. 有一定挑战性
-    只输出JSON数组。"""
-        
-        messages.append({"role": "assistant", "content": extension_content})
-        messages.append({"role": "user", "content": questions_prompt})
-        questions_response = self._call_api(messages, engine=engine, model=model)
-        questions = self._parse_json_response(questions_response)
-        yield {"stage": "questions", "content": questions}
+        # ===== 第五阶段：延伸思考（带答案的QA，可追问） =====
+        ext_questions = (info or {}).get('extension_questions', []) if isinstance(info, dict) else []
+        if not isinstance(ext_questions, list):
+            ext_questions = []
+        yield {"stage": "questions", "content": ext_questions}
         
         elapsed = time.time() - start_time
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
