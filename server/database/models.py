@@ -88,6 +88,25 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
 
 
+class AuxRecord(Base):
+    """辅助记录表（③ 历史记录也收集：知识延伸 / AI动画）"""
+    __tablename__ = 'aux_records'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user_id = Column(Integer, nullable=True, index=True)
+
+    # 类型：extension（知识延伸）/ animation（AI动画）
+    record_type = Column(String(16), nullable=False, index=True)
+    # 展示标题
+    title = Column(String(200))
+    # 正文内容（知识延伸：合并总结/易错点/拓展/延伸题；动画：HTML文件URL）
+    content = Column(Text)
+    # 扩展JSON（延伸题列表等）
+    extra_json = Column(JSON, nullable=True)
+
+
 class ConversationHistory(Base):
     """多轮对话历史表"""
     __tablename__ = 'conversation_history'

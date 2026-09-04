@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+
 package com.gyyz.assistant
 import android.Manifest
 import android.content.Intent
@@ -21,6 +23,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -3352,8 +3356,8 @@ fun MarkdownView(
     val viewText = if (dark) android.graphics.Color.WHITE else 0xFF16181D.toInt()
     val viewDivider = if (dark) "#2D2D44" else "#E0E0E0"
 
-    // ⑥ 颜色标记 [[#RRGGBB]…[[#RRGGBB]：先替换为哨兵字符再交给Markdown，渲染后回填颜色
-    val (cleanMarked, markColors) = remember(content) { extractColorSegments(content) }
+    // ⑥ 颜色标记 [[#RRGGBB]…[[#RRGGBB] → HTML <span style=\"color:#...\"> 渲染（Markwon原生支持HTML）
+    val cleanMarked = remember(content) { extractColorSegments(content) }
     val processedContent = remember(cleanMarked) { prepareMarkdownContent(cleanMarked) }
 
     val markwon = remember(dark, fontSize) {
@@ -3401,7 +3405,7 @@ fun MarkdownView(
                     textSize = fontSize
                     setPadding(30, 20, 30, 20)
                     // 行间距随字体大小缩放，避免放大文字时行距变窄
-                    setLineSpacing(fontSize * 0.45f, 1.4f)
+                    setLineSpacing(fontSize * 0.2f, 1.2f)
                     setTextIsSelectable(true)
                     setBackgroundColor(android.graphics.Color.parseColor(viewBg))
                     // 允许长内容在固定高度容器内滚动（弹窗/详情页）
@@ -3413,10 +3417,6 @@ fun MarkdownView(
                     try {
                         textView.setTextColor(viewText)
                         markwon.setMarkdown(textView, processedContent)
-                        // ⑥ 回填颜色标记
-                        if (markColors.isNotEmpty()) {
-                            applyColorSpans(textView, markColors)
-                        }
                         onRendered?.invoke()
                     } catch (e: Exception) {
                         Log.e("MarkdownView", "渲染失败: ${e.message}")
@@ -3432,74 +3432,32 @@ fun MarkdownView(
 }
 
 // ==================== ⑥ 颜色标记 [[#RRGGBB]文字[[#RRGGBB] 解析与渲染 ====================
-private const val COLOR_MARK_OPEN = '\uE000'
-private const val COLOR_MARK_CLOSE = '\uE001'
 private val colorMarkerRegex =
         Regex("""\[\[#([0-9A-Fa-f]{6})\]\](.*?)\[\[#[0-9A-Fa-f]{6}\]\]""", RegexOption.DOT_MATCHES_ALL)
 
 private fun parseHexColor(hex: String): Int =
         try { android.graphics.Color.parseColor("#$hex") } catch (e: Exception) { -1 }
 
-/** 把颜色标记替换为哨兵字符；返回(清理后文本, 颜色列表-按出现顺序) */
-private fun extractColorSegments(text: String): Pair<String, List<Int>> {
-    if (!text.contains("[[")) return text to emptyList()
-    val colors = mutableListOf<Int>()
+/** 把颜色标记替换为 HTML <span>；Markwon 原生支持 HTML 渲染，不会产生哨兵字形 */
+private fun extractColorSegments(text: String): String {
+    if (!text.contains("[[")) return text
     val sb = StringBuilder()
     var last = 0
     var any = false
     for (mm in colorMarkerRegex.findAll(text)) {
         any = true
-        colors.add(parseHexColor(mm.groupValues[1]))
         sb.append(text, last, mm.range.first)
-        sb.append(COLOR_MARK_OPEN)
-        sb.append(mm.groupValues[2])
-        sb.append(COLOR_MARK_CLOSE)
+        sb.append("<span style='color:#")
+        sb.append(mm.groupValues[1])
+        sb.append("'>")
+        // 转义内部文本中的 < 和 > 避免 HTML 解析问题
+        sb.append(mm.groupValues[2].replace("<", "&lt;").replace(">", "&gt;"))
+        sb.append("</span>")
         last = mm.range.last + 1
     }
-    if (!any) return text to emptyList()
+    if (!any) return text
     sb.append(text, last, text.length)
-    return sb.toString() to colors
-}
-
-/** 渲染后：扫描哨兵字符，给其间文字上色并删除哨兵 */
-private fun applyColorSpans(textView: TextView, colors: List<Int>) {
-    try {
-        val sb = textView.text as? android.text.Spannable ?: return
-        var openIdx = -1
-        var ci = 0
-        val deletions = mutableListOf<Int>()
-        var i = 0
-        while (i < sb.length) {
-            val ch = sb[i]
-            when {
-                ch == COLOR_MARK_OPEN -> {
-                    openIdx = i
-                    deletions.add(i)
-                    i++
-                }
-                ch == COLOR_MARK_CLOSE && openIdx >= 0 && ci < colors.size -> {
-                    val col = colors[ci]
-                    if (col != -1 && openIdx + 1 < i) {
-                        sb.setSpan(
-                                android.text.style.ForegroundColorSpan(col),
-                                openIdx + 1, i,
-                                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                        )
-                    }
-                    ci++
-                    deletions.add(i)
-                    openIdx = -1
-                    i++
-                }
-                else -> i++
-            }
-        }
-        for (d in deletions.sortedDescending()) {
-            (sb as? android.text.SpannableStringBuilder)?.delete(d, d + 1)
-        }
-    } catch (e: Exception) {
-        Log.e("MarkdownView", "颜色标记渲染失败: ${e.message}")
-    }
+    return sb.toString()
 }
 
 /**
@@ -4495,7 +4453,9 @@ fun HistoryViewScreen(
                                 color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.align(Alignment.CenterVertically)
+                                modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 8.dp)
                         )
                     } else {
                     // 使用服务端返回的真实总数/学科数
@@ -4508,7 +4468,9 @@ fun HistoryViewScreen(
                         "共${displayTotal} 条记录 \n ${displaySubjects} 门学科$filterNote",
                         color = tC(Color.Gray, Color(0xFF5C6470)),
                         fontSize = 12.sp,
-                        modifier = Modifier.align(Alignment.CenterVertically)
+                        modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 8.dp)
                     )
                     }
                     
@@ -4893,7 +4855,12 @@ fun HistoryRecordCard(
                 Spacer(modifier = Modifier.height(6.dp))
                 
                 if (record.knowledgePoints.isNotEmpty()) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // 知识点像标签一样一个个接着排列，超宽自动换行，避免被压缩成竖条
+                    FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                    ) {
                         record.knowledgePoints.take(3).forEach { kp ->
                             Surface(
                                 color = tC(Color(0xFF00D2FF).copy(alpha = 0.15f), Color(0xFF0086B3).copy(alpha = 0.15f)),
@@ -5155,15 +5122,15 @@ fun HistoryDetailScreen(
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("🔖 知识点", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
                         Spacer(modifier = Modifier.height(4.dp))
-                        Column(
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             record.knowledgePoints.forEach { kp ->
                                 Surface(
                                     color = tC(Color(0xFF00D2FF).copy(alpha = 0.15f), Color(0xFF0086B3).copy(alpha = 0.15f)),
-                                    shape = RoundedCornerShape(4.dp),
-                                    modifier = Modifier.fillMaxWidth()
+                                    shape = RoundedCornerShape(4.dp)
                                 ) {
                                     Text(
                                         kp,

@@ -12,6 +12,61 @@ import plotly.express as px
 from server.config import REPORT_DIR, HISTORY_DIR
 from server.database.models import SubmissionRecord, TrackingRecord
 
+# ① 知识点词云：中文分词（jieba）+ 停用词过滤
+import jieba
+
+def _segment_knowledge_points(all_kp):
+    """对知识点短语列表做分词，统计词频，返回 [(词, 次数)] 按频率降序（过滤单字/停用词/纯符号）"""
+    stop = {"的", "了", "与", "和", "及", "或", "是", "在", "等", "中", "定律", "规律", "关系", "条件", "方法",
+            "特点", "概念", "计算", "求解", "应用", "性质", "分析", "理解", "其", "一个", "进行", "通过"}
+    counter = {}
+    for kp in all_kp:
+        if not kp or not isinstance(kp, str):
+            continue
+        for w in jieba.cut(kp):
+            w = w.strip()
+            if len(w) < 2:
+                continue
+            if w.isdigit() or w in stop:
+                continue
+            if not any('\u4e00' <= ch <= '\u9fff' or ch.isalpha() for ch in w):
+                continue
+            counter[w] = counter.get(w, 0) + 1
+    return sorted(counter.items(), key=lambda x: -x[1])
+
+def _wordcloud_trace(top_words):
+    """用 plotly scatter 生成词云数据（词 + 次数；字号/颜色随频率缩放，网格布局避免重叠）"""
+    if not top_words:
+        return None, []
+    words = [w for w, _ in top_words]
+    counts = [c for _, c in top_words]
+    n = len(words)
+    # 金字塔式螺旋布局：按 (r, 角度) 放置，避免完全重叠
+    import math
+    positions = []
+    angle = 0.0
+    radius = 0.0
+    for i in range(n):
+        radius = 0.6 * math.sqrt(i + 1)
+        angle += 2.39996  # 黄金角
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        positions.append((x, y))
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+    maxc = max(counts) if counts else 1
+    sizes = [int(12 + 30 * (c / maxc)) for c in counts]
+    # 颜色：蓝-青-绿渐变色板
+    palette = ['#2196F3', '#00BCD4', '#4CAF50', '#00D2FF', '#7B2FBE', '#8BC34A', '#03A9F4']
+    colors = [palette[i % len(palette)] for i in range(n)]
+    labels = [f"{w}({c})" for w, c in top_words]
+    trace = go.Scatter(
+        x=xs, y=ys, mode='text', text=labels,
+        textfont=dict(size=sizes, color=colors),
+        hoverinfo='skip',
+    )
+    return trace, top_words
+
 
 def ensure_plotly_local() -> str:
     """确保本地 plotly.min.js 存在（下载缓存一次），返回HTML里用的相对路径；失败回退CDN"""
@@ -97,19 +152,21 @@ class ReportGenerator:
         difficulties = [r.question_info.get("difficulty", "未知") if r.question_info else "未知" for r in records]
         diff_counts = dict(Counter(difficulties))
         
-        # 知识点统计
+        # 知识点统计（① 改为分词后的词频，用于词云图）
         all_kp = []
         for r in records:
             if r.question_info:
                 all_kp.extend(r.question_info.get("knowledge_points", []))
-        kp_counts = dict(Counter(all_kp).most_common(10))
+        kp_counts = dict(Counter(all_kp).most_common(10))  # 兼容旧图需要
+        kp_word_freq = _segment_knowledge_points(all_kp)[:24]  # ① 分词词频（词云用，取前24个）
         
-        # 易错点统计
+        # 易错点统计（① 改为文字段落，放在报告最后）
         all_mistakes = []
         for r in records:
             if r.question_info:
                 all_mistakes.extend(r.question_info.get("easy_mistakes", []))
-        mistake_counts = dict(Counter(all_mistakes).most_common(10))
+        mistake_counts = list(Counter(all_mistakes).most_common(10))  # [(易错点, 次数)]
+        mistake_text = "".join(f"{'①②③④⑤⑥⑦⑧⑨⑩'[i]} {m}\n" for i, (m, _) in enumerate(mistake_counts)) if mistake_counts else ""
         
         # 掌握程度统计
         mastery_dir = HISTORY_DIR / "mastery_records"
@@ -256,40 +313,26 @@ class ReportGenerator:
         fig2.update_xaxes(fixedrange=True)
         fig2.update_yaxes(fixedrange=True)
         
-        # 3. 高频知识点横向柱状图
-        fig3 = go.Figure(data=[
-            go.Bar(
-                y=list(kp_counts.keys()),
-                x=list(kp_counts.values()),
-                orientation="h",
-                marker_color="#2196F3",
-                text=list(kp_counts.values()),
-                textposition="auto",
-            )
-        ])
-        fig3.update_layout(
-            title="高频知识点 TOP10",
-            margin=dict(l=20, r=20, t=50, b=20),
-            height=400,
-            yaxis=dict(autorange="reversed"),
-            dragmode=False,
-            hovermode=False,
-        )
-        fig3.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
-        fig3.update_xaxes(fixedrange=True)
-        fig3.update_yaxes(fixedrange=True)
+        # 3. 高频知识点词云图（① 分词后词频，词后带(数量)）
+        fig3 = None
+        if kp_word_freq:
+            fig3 = go.Figure()
+            word_trace, _ = _wordcloud_trace(kp_word_freq)
+            if word_trace is not None:
+                fig3.add_trace(word_trace)
+                fig3.update_layout(
+                    title="高频知识点词云（词后为出现次数）",
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    height=420,
+                    xaxis=dict(visible=False, range=[-6, 6]),
+                    yaxis=dict(visible=False, range=[-6, 6], scaleanchor="x", scaleratio=1),
+                    dragmode=False,
+                    hovermode=False,
+                )
+                fig3.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
         
-        # 4. 易错点统计
-        fig4 = go.Figure(data=[
-            go.Bar(
-                y=list(mistake_counts.keys()),
-                x=list(mistake_counts.values()),
-                orientation="h",
-                marker_color="#FF5722",
-                text=list(mistake_counts.values()),
-                textposition="auto",
-            )
-        ])
+        # 4. 易错点（① 改为文字段落，见HTML组装末尾）
+        fig4 = None
         
         # 5. 每日做题趋势（折线图 + 3日移动平均线）
         fig5 = go.Figure()
@@ -433,17 +476,6 @@ class ReportGenerator:
             fig6.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
             fig6.update_xaxes(fixedrange=True)
             fig6.update_yaxes(fixedrange=True)
-        fig4.update_layout(
-            title="常见易错点 TOP10",
-            margin=dict(l=20, r=20, t=50, b=20),
-            height=400,
-            yaxis=dict(autorange="reversed"),
-            dragmode=False,
-            hovermode=False,
-        )
-        fig4.update_layout(template='plotly_dark', paper_bgcolor='#16213e', plot_bgcolor='#16213e', font=dict(color='white'))
-        fig4.update_xaxes(fixedrange=True)
-        fig4.update_yaxes(fixedrange=True)
         
         # 组装 HTML
         period = f"{cutoff_date.strftime('%Y-%m-%d')} 至 {datetime.utcnow().strftime('%Y-%m-%d')}"
@@ -499,13 +531,7 @@ class ReportGenerator:
         {fig2.to_html(full_html=False, include_plotlyjs=False)}
     </div>
     
-    <div class="chart-container">
-        {fig3.to_html(full_html=False, include_plotlyjs=False)}
-    </div>
-    
-    <div class="chart-container">
-        {fig4.to_html(full_html=False, include_plotlyjs=False)}
-    </div>
+    {'<div class="chart-container">' + fig3.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig3 else ''}
     
     {'<div class="chart-container">' + fig5.to_html(full_html=False, include_plotlyjs=False) + '</div>' if daily_dates else ''}
     {'<div class="chart-container">' + fig6.to_html(full_html=False, include_plotlyjs=False) + '</div>' if mastery_counts else ''}
@@ -513,6 +539,8 @@ class ReportGenerator:
     {'<div class="chart-container">' + fig8.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig8 else ''}
     {'<div class="chart-container">' + fig9.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig9 else ''}
     {'<div class="chart-container">' + fig10.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig10 else ''}
+    
+    {f'<div class="chart-container" style="text-align:left"><h3 style="color:#FF5722;margin-bottom:10px">常见易错点</h3><p style="line-height:2;white-space:pre-line">{mistake_text}</p></div>' if mistake_text else ''}
 </body>
 </html>
 """

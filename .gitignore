@@ -24,6 +24,12 @@ client/local.properties
 history/*.jpg
 history/animations/
 history/svgs_*/
+history/*.md
+history/mastery_records/
+history/recycle_bin/
+history/geogebra/
+history/geogebra_apps/
+history/geogebra_assets/
 reports/*.html
 data/*.db
 server_ip.txt

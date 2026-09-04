@@ -422,9 +422,29 @@ async def create_animation(file: UploadFile = File(...)):
     if html_path:
         # 返回动画文件的 URL
         filename = Path(html_path).name
+        url = f"/static/animations/{filename}"
+        # ③ 保存 AI 动画记录到历史
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="animation",
+                    title="AI动画",
+                    content=url,
+                    extra_json={"ocr_text": ocr_text[:200]},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[动画] 保存历史记录失败: {e}")
         return {
             "status": "ok",
-            "url": f"/static/animations/{filename}",
+            "url": url,
             "request_id": request_id
         }
     else:
@@ -698,6 +718,7 @@ async def get_history(request: Request, body: dict):
                 "id": r.id,
                 "session_id": r.session_id or "",
                 "timestamp": display_ts,
+                "record_type": "solve",
                 "ocr_text": clean_ocr,
                 "question_info_raw": json.dumps(question_info, ensure_ascii=False) if isinstance(question_info, dict) else str(question_info),
                 "grade": grade,
@@ -709,6 +730,45 @@ async def get_history(request: Request, body: dict):
                 "image_url": image_url,
                 "mastery_level": mastery_label,
             })
+        
+        # ③ 合并知识延伸 / AI动画记录到历史列表
+        from server.database.models import AuxRecord
+        aux_query = db.query(AuxRecord)
+        if user_id is not None:
+            aux_query = aux_query.filter(or_(AuxRecord.user_id == user_id, AuxRecord.user_id.is_(None)))
+        else:
+            aux_query = aux_query.filter(AuxRecord.user_id.is_(None))
+        for a in aux_query.order_by(AuxRecord.timestamp.desc()).all():
+            try:
+                a_ts = (a.timestamp + local_offset).isoformat() if a.timestamp else ""
+            except Exception:
+                a_ts = ""
+            extra = a.extra_json or {}
+            result.append({
+                "id": a.id,
+                "session_id": a.session_id or "",
+                "timestamp": a_ts,
+                "record_type": a.record_type,  # extension / animation
+                "ocr_text": "",
+                "question_info_raw": "",
+                "grade": "",
+                "subject": (extra.get("subject") or "") if isinstance(extra, dict) else "",
+                "difficulty": "",
+                "knowledge_points": [],
+                "solution_steps": "",
+                "full_solution": a.content or "",
+                "image_url": "",
+                "mastery_level": "",
+                "title": a.title or "",
+            })
+        
+        # 按时间降序排序（solve + aux 合并后）
+        def _ts_key(r):
+            try:
+                return r["timestamp"]
+            except Exception:
+                return ""
+        result.sort(key=_ts_key, reverse=True)
         
         return {
             "status": "ok",
@@ -736,6 +796,13 @@ async def clear_history(request: Request):
         for rec in records:
             _move_record_files_to_recycle_bin(rec)
             db.delete(rec)
+        # ③ 同时清除知识延伸/AI动画记录
+        from server.database.models import AuxRecord
+        aux_list = db.query(AuxRecord).filter(
+            AuxRecord.user_id == user_id if user_id is not None else AuxRecord.user_id.is_(None)
+        ).all()
+        for a in aux_list:
+            db.delete(a)
         db.commit()
         return {"status": "ok", "message": f"历史记录已清除（{len(records)} 条，文件已移入回收站）"}
     finally:

@@ -342,26 +342,62 @@ class SolvePipeline:
             # AI 知识延伸
             self._emit_event(request_id, "info", "正在分析内容...")
             
+            ext_info = {}
+            ext_mistakes = ""
+            ext_extension = ""
+            ext_questions = []
+            
             for event in ai_service.generate_knowledge_extension(ocr_text, engine=engine, model=model, style=style):
                 stage = event["stage"]
                 content = event["content"]
                 
                 if stage == "info":
+                    ext_info = content if isinstance(content, dict) else {}
                     self._emit_event(request_id, "question_info", content)
                 elif stage == "mistakes_chunk":
                     # 流式chunk: content 是累积到当前的完整文本
                     self._emit_event(request_id, "mistakes_chunk", content)
                 elif stage == "mistakes":
+                    ext_mistakes = content or ""
                     self._emit_event(request_id, "mistakes", content)
                 elif stage == "extension_chunk":
                     # 流式chunk: content 是累积到当前的完整文本
                     self._emit_event(request_id, "extension_chunk", content)
                 elif stage == "extension":
+                    ext_extension = content or ""
                     self._emit_event(request_id, "extension", content)
                 elif stage == "questions":
+                    ext_questions = content if isinstance(content, list) else []
                     self._emit_event(request_id, "suggested_questions", content)
                 elif stage == "complete":
                     total_time = content.get("total_time", 0)
+                    # ③ 保存知识延伸记录到历史
+                    try:
+                        from server.database.models import AuxRecord
+                        db = SessionLocal()
+                        try:
+                            parts = []
+                            if ext_mistakes:
+                                parts.append(f"## 易错点详解\n\n{ext_mistakes}")
+                            if ext_extension:
+                                parts.append(f"## 知识拓展\n\n{ext_extension}")
+                            body = "\n\n".join(parts)
+                            title = (ext_info.get("core_concept") or "知识延伸") if isinstance(ext_info, dict) else "知识延伸"
+                            rec = AuxRecord(
+                                session_id=session_id or request_id,
+                                user_id=user_id,
+                                record_type="extension",
+                                title=title,
+                                content=body,
+                                extra_json={"questions": ext_questions, "subject": (ext_info or {}).get("subject", "")},
+                            )
+                            db.add(rec)
+                            db.commit()
+                            print(f"[{request_id}] 知识延伸记录已保存")
+                        finally:
+                            db.close()
+                    except Exception as e:
+                        print(f"[{request_id}] 保存知识延伸记录失败: {e}")
                     self._emit_event(request_id, "complete", {
                         "request_id": request_id,
                         "total_time": total_time
