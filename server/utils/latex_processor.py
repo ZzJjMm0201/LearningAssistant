@@ -27,6 +27,31 @@ def _make_dark_png(png_path) -> None:
         print(f"  [LaTeX] 深色版生成失败(忽略): {e}")
 
 
+_REVIEW_PROMPT = (
+    "请审查这张数学图形渲染图，只关注【严重影响理解】的问题：文字重叠、标注错误、图形与题目明显不符、"
+    "坐标轴/比例明显错误等。如果图形基本正确、不影响理解，只回复 OK。"
+    "如果存在明显问题，用一句话描述问题所在（不要给修复代码，只描述问题）。"
+)
+
+
+def review_latex_image(png_path, ai_service, vision_model=None, engine=None) -> str:
+    """⑦ 用视觉模型审查 LaTeX 渲染图，返回问题描述；无问题返回空字符串"""
+    try:
+        if ai_service is None:
+            return ""
+        text, _ = ai_service.recognize_image_with_vision(str(png_path), model=vision_model, prompt=_REVIEW_PROMPT)
+        text = (text or "").strip()
+        if not text or text.upper() in ("OK", "OK。", "OK！", "无", "无问题", "图形正确", "没问题"):
+            return ""
+        # 带前缀的情况，如 "OK，图形正确" — 视为无问题
+        if text.upper().startswith("OK"):
+            return ""
+        return text[:200]
+    except Exception as e:
+        print(f"  [LaTeX审核] 视觉审图失败（忽略）: {e}")
+        return ""
+
+
 def extract_latex_blocks(text: str) -> List[Tuple[str, str, int, int]]:
     """
     提取文本中的LaTeX代码块
@@ -90,11 +115,12 @@ def process_latex_blocks(md_text: str, output_dir: Path) -> str:
     
     return result
 
-def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=None, engine: str = None, model: str = None, max_retries: int = 3) -> str:
+def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=None, engine: str = None, model: str = None, max_retries: int = 3, vision_model: str = None, enable_review: bool = False) -> str:
     """
-    处理Markdown中的LaTeX代码块（带AI修复重试）：
+    处理Markdown中的LaTeX代码块（带AI修复重试 + ⑦ 视觉审核）：
     1. 编译失败 → 把关键报错发给AI修复，最多重试 max_retries 次
-    2. 重试仍失败 → 移除该图形块（客户端不显示代码）
+    2. enable_review 时：渲染成功后用视觉模型审图，明显有问题→再修复；3次仍未过→备注
+    3. 重试仍失败 → 移除该图形块（客户端不显示代码）
     """
     if not output_dir.exists():
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -132,13 +158,40 @@ def process_latex_blocks_with_retry(md_text: str, output_dir: Path, ai_service=N
         if success:
             png_path = output_dir / f"diagram_{cur_block_id}.png"
             svg_path = output_dir / f"diagram_{cur_block_id}.svg"
+            # ⑦ 视觉审核：显严重问题时再修复（最多3轮），仍不过则备注
+            review_note = ""
+            if enable_review and is_real_png(png_path) and ai_service is not None:
+                for rv in range(3):
+                    suggestion = review_latex_image(png_path, ai_service, vision_model=vision_model, engine=engine)
+                    if not suggestion:
+                        break
+                    print(f"  [LaTeX审核] 第{rv + 1}次发现图形问题: {suggestion[:100]}")
+                    # 用视觉模型的问题描述让AI修复
+                    fixed = ai_service.fix_latex(final_code, f"图形问题描述：{suggestion}", engine=engine, model=model)
+                    if fixed and fixed.strip() and fixed != final_code:
+                        final_code = fixed
+                        cur_block_id = hashlib.md5(final_code.encode()).hexdigest()[:8]
+                        old_png = png_path
+                        png_path = output_dir / f"diagram_{cur_block_id}.png"
+                        svg_path = output_dir / f"diagram_{cur_block_id}.svg"
+                        if render_latex_blocks(final_code, png_path, engine="xelatex"):
+                            continue
+                        else:
+                            png_path = old_png  # 修复失败，回退旧图
+                            cur_block_id = hashlib.md5(final_code.encode()).hexdigest()[:8]
+                    else:
+                        break
+                else:
+                    review_note = "（⚠️图形可能有误，已多次修正仍未通过审核）"
             if is_real_png(png_path):
                 _make_dark_png(png_path)  # ⑧ 深色版
                 replacement = f"\n\n![图解]({png_path.name})\n\n"
+                if review_note:
+                    replacement += f">{review_note}\n\n"
             elif svg_path.exists():
                 replacement = f"\n\n![图解]({svg_path.name})\n\n"
             else:
-                replacement = ""
+                replacement = f"\n\n>  ⚠️ 图形生成失败{review_note}\n\n"
         else:
             # 重试仍失败：移除该块并给出失败提示，不显示LaTeX代码
             print(f"[LaTeX] 重试{max_retries}次仍失败，移除该图形块: {error_text[:150]}")

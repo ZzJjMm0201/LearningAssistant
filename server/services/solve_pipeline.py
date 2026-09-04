@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict, Generator, Optional
 from collections import deque
 
-from server.config import HISTORY_DIR
+from server.config import HISTORY_DIR, FEATURE_FLAGS
 from server.database.models import SessionLocal, SubmissionRecord, ConversationHistory
 from server.services.ocr_service import ocr_service
 from server.services.search_service import search_service
@@ -161,7 +161,7 @@ class SolvePipeline:
                     user_id=user_id, engine=engine, model=model, style=style,
                     thinking=thinking, search_enabled=search_enabled,
                     dialect=dialect, grade=grade,
-                    ocr_time=ocr_time,
+                    ocr_time=ocr_time, vision_model=vision_model,
                 )
 
             self._emit_event(request_id, "complete", {"request_id": request_id})
@@ -176,7 +176,7 @@ class SolvePipeline:
             self._cleanup(request_id)
 
     def _solve_one(self, request_id: str, qi: Optional[int], ocr_text: str, session_id: Optional[str], base_host: Optional[str], user_id: Optional[int], engine: Optional[str], model: Optional[str],
-                   style: Optional[str], thinking: bool, search_enabled: bool, dialect: str, grade: str, ocr_time: float = 0.0):
+                   style: Optional[str], thinking: bool, search_enabled: bool, dialect: str, grade: str, ocr_time: float = 0.0, vision_model: Optional[str] = None):
         """解单道题：题库搜索 + AI多轮 + LaTeX渲染 + 保存（事件带 qi 标记）"""
         # ========== 阶段2: 题库搜索（④ 设置中可关闭） ==========
         search_result, search_time, search_items = "", 0, []
@@ -267,11 +267,11 @@ class SolvePipeline:
                             text
                         )
 
-                    processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
+                    processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine, model=model, vision_model=vision_model, enable_review=FEATURE_FLAGS.get("enable_latex_review", False))
                     processed_solution = _rewrite_img_urls(processed_solution)
 
                     if latex_extras_content:
-                        processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine, model=model)
+                        processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine, model=model, vision_model=vision_model, enable_review=FEATURE_FLAGS.get("enable_latex_review", False))
                         processed_extras = _rewrite_img_urls(processed_extras)
                         final_solution = processed_solution + "\n\n---\n\n## 📐 图解辅助\n\n" + processed_extras
                     else:
