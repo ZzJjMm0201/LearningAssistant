@@ -558,6 +558,11 @@ class MainViewModel : ViewModel() {
         solveQuestionInfo.value = emptyMap()
         solveThinkingText.value = ""
         solvingThinkingVisible.value = false
+        // ① 重置多题状态
+        multiQuestionCount.value = 0
+        multiQuestionTexts.value = emptyList()
+        currentQuestionIndex.value = 0
+        multiSolveStates.value = emptyList()
         lastPhotoFile = photoFile
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -623,21 +628,37 @@ class MainViewModel : ViewModel() {
             var eventType = ""
             var dataBuffer = StringBuilder()
 
-            var solutionSteps = ""
-            var fullSolution = ""
-            var mindMap = ""
-            var suggestedQuestions = emptyList<String>()
-            var suggestedQA = emptyList<QAItem>()
-            var qaList = emptyList<QAItem>()
-            var subject = ""
-            var ocrText = ""
-            // 流式显示节流：每100ms最多刷新一次UI，避免AR眼镜低性能CPU卡顿
+            // ① 多题：每题独立累积（按 qi 键控）
+            val stepsMap = mutableMapOf<Int, String>()
+            val fullMap = mutableMapOf<Int, String>()
+            val mindMapMap = mutableMapOf<Int, String>()
+            val suggQAMap = mutableMapOf<Int, List<QAItem>>()
+            val suggMap = mutableMapOf<Int, List<String>>()
+            val qaMap = mutableMapOf<Int, List<QAItem>>()
+            val subjectMap = mutableMapOf<Int, String>()
+            val ocrMap = mutableMapOf<Int, String>()
+            // 流式显示节流：每100ms最多刷新一次UI
             var lastSolutionUpdate = 0L
             var lastStepsUpdate = 0L
             var lastMindmapUpdate = 0L
 
+            fun cur(key: Int): Int = if (key >= 0) key else 0
+
+            // 统一写入：多题→列表并刷新当前页；单题→_appState
+            fun emit(qiKey: Int, s: AppState.Solving) {
+                if (multiQuestionCount.value > 1 && qiKey >= 0) {
+                    val list = multiSolveStates.value.toMutableList()
+                    while (list.size <= qiKey) list.add(AppState.Solving(stage = SolveStage.ANALYZING, requestId = requestId, ocrText = ocrMap[qiKey] ?: ""))
+                    list[qiKey] = s
+                    multiSolveStates.value = list
+                    currentQuestionIndex.value = qiKey
+                    _appState.value = s
+                } else {
+                    _appState.value = s
+                }
+            }
+
             while (true) {
-                // Feature 5: 检查取消标志
                 if (cancelCurrentSSE) {
                     Log.d("MainViewModel", "SSE接收已取消")
                     reader.close()
@@ -648,7 +669,7 @@ class MainViewModel : ViewModel() {
                     }
                     return
                 }
-                
+
                 val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
 
                 when {
@@ -667,55 +688,60 @@ class MainViewModel : ViewModel() {
                             try {
                                 val json = JSONObject(data)
                                 val stage = json.optString("stage", "")
+                                val qiKey = json.optInt("qi", -1)
 
                                 when (stage) {
+                                    "question_split" -> {
+                                        val cnt = json.optJSONObject("content")?.optInt("count", 0) ?: 0
+                                        val qs = mutableListOf<String>()
+                                        json.optJSONObject("content")?.optJSONArray("questions")?.let { arr ->
+                                            for (i in 0 until arr.length()) qs.add(arr.optString(i, ""))
+                                        }
+                                        multiQuestionCount.value = if (cnt > 1) cnt else (if (qs.size > 1) qs.size else 0)
+                                        multiQuestionTexts.value = qs
+                                        _statusText.value = "识别到 ${multiQuestionCount.value} 道题，正在逐题解答..."
+                                    }
                                     "info" -> {
                                         _statusText.value = json.optString("content", "处理中...")
                                         val infoText = json.optString("content", "")
-                                        // LaTeX图解阶段提示（右上角进度）
                                         if (infoText.contains("图解") || infoText.contains("渲染")) {
                                             solveProgress.value = "阶段 4/6 · LaTeX图解"
                                         }
                                     }
                                     "ocr_complete" -> {
-                                        // 服务端content为{"text":...}对象，需取text字段，避免把JSON显示给用户
                                         val ocrObj = json.optJSONObject("content")
-                                        ocrText = if (ocrObj != null) ocrObj.optString("text", "") else json.optString("content", "")
+                                        val ocrText0 = if (ocrObj != null) ocrObj.optString("text", "") else json.optString("content", "")
+                                        ocrMap[cur(qiKey)] = ocrText0
                                         _statusText.value = "正在搜索题库..."
-                                        // Feature 9: OCR确认弹窗（确认后将回传服务端继续流程）
                                         _pendingOcrRequestId.value = requestId
                                         showOcrConfirmDialog.value = true
-                                        ocrConfirmText.value = ocrText
+                                        ocrConfirmText.value = ocrText0
                                         ocrConfirmTitle.value = "确认识别结果"
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.ANALYZING,
-                                                        requestId = requestId,
-                                                        ocrText = ocrText
-                                                )
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.ANALYZING,
+                                                requestId = requestId,
+                                                ocrText = ocrText0
+                                        ))
                                     }
                                     "search_complete" -> {
                                         solveProgress.value = "阶段 1/6 · 搜索题库"
                                         _statusText.value = "AI正在分析..."
                                     }
                                     "search_results" -> {
-                                        // ④ 搜题结果：客户端用按钮+Markdown展示
                                         val arr = json.optJSONArray("content")
                                         val items = mutableListOf<Map<String, String>>()
                                         if (arr != null) {
                                             for (i in 0 until arr.length()) {
                                                 val o = arr.optJSONObject(i)
                                                 if (o != null) {
-                                                    items.add(
-                                                            mapOf(
-                                                                    "question_md" to o.optString("question_md", ""),
-                                                                    "hint_md" to o.optString("hint_md", ""),
-                                                                    "answer_md" to o.optString("answer_md", ""),
-                                                                    "subject" to o.optString("subject", ""),
-                                                                    "grade" to o.optString("grade", ""),
-                                                                    "point_name" to o.optString("point_name", ""),
-                                                            )
-                                                    )
+                                                    items.add(mapOf(
+                                                            "question_md" to o.optString("question_md", ""),
+                                                            "hint_md" to o.optString("hint_md", ""),
+                                                            "answer_md" to o.optString("answer_md", ""),
+                                                            "subject" to o.optString("subject", ""),
+                                                            "grade" to o.optString("grade", ""),
+                                                            "point_name" to o.optString("point_name", ""),
+                                                    ))
                                                 }
                                             }
                                         }
@@ -725,10 +751,10 @@ class MainViewModel : ViewModel() {
                                     "question_info" -> {
                                         _statusText.value = "正在生成解题思路..."
                                         solveProgress.value = "阶段 1/6 · AI分析题目"
-                                        // ⑩ 解析JSON题目分析（年级/学科/难度/知识点/易错点/难点）→ 顶部标签
                                         val qiObj = json.optJSONObject("content")
+                                        var subject0 = ""
                                         if (qiObj != null) {
-                                            subject = qiObj.optString("subject", "")
+                                            subject0 = qiObj.optString("subject", "")
                                             val infoMap = mutableMapOf<String, String>()
                                             val gradeV = qiObj.optString("grade", "")
                                             val diffV = qiObj.optString("difficulty", "")
@@ -736,18 +762,16 @@ class MainViewModel : ViewModel() {
                                             val ems = qiObj.optJSONArray("easy_mistakes")
                                             val dps = qiObj.optJSONArray("difficult_points")
                                             infoMap["grade"] = gradeV
-                                            infoMap["subject"] = subject
+                                            infoMap["subject"] = subject0
                                             infoMap["difficulty"] = diffV
                                             fun joinArr(arr: JSONArray?): String =
-                                                    if (arr != null) {
-                                                        (0 until arr.length()).map { arr.optString(it, "") }
-                                                                .filter { it.isNotEmpty() }.joinToString("、")
-                                                    } else ""
+                                                    if (arr != null) (0 until arr.length()).map { arr.optString(it, "") }.filter { it.isNotEmpty() }.joinToString("、") else ""
                                             infoMap["knowledge_points"] = joinArr(kps)
                                             infoMap["easy_mistakes"] = joinArr(ems)
                                             infoMap["difficult_points"] = joinArr(dps)
-                                            solveQuestionInfo.value = infoMap
+                                            if (qiKey == -1 || currentQuestionIndex.value == qiKey) solveQuestionInfo.value = infoMap
                                         }
+                                        subjectMap[cur(qiKey)] = subject0
                                     }
                                     "thinking_start" -> {
                                         solveThinkingText.value = ""
@@ -759,98 +783,99 @@ class MainViewModel : ViewModel() {
                                         solveThinkingText.value = json.optString("content", "")
                                     }
                                     "solution_steps_chunk" -> {
-                                        // 流式增量：解题思路打字机效果
                                         val chunk = json.optString("content", "")
                                         if (chunk.isNotEmpty()) {
                                             val now = System.currentTimeMillis()
                                             if (now - lastStepsUpdate >= 100) {
                                                 lastStepsUpdate = now
-                                                solutionSteps = extractStepsText(chunk)
-                                                _appState.value =
-                                                        AppState.Solving(
-                                                                stage = SolveStage.DISPLAY_STEPS,
-                                                                requestId = requestId,
-                                                                solutionSteps = solutionSteps,
-                                                                stepsStreaming = true
-                                                        )
+                                                val ss = extractStepsText(chunk)
+                                                stepsMap[cur(qiKey)] = ss
+                                                emit(qiKey, AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_STEPS,
+                                                        requestId = requestId,
+                                                        ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                        solutionSteps = ss,
+                                                        stepsStreaming = true
+                                                ))
                                             }
                                         }
                                     }
                                     "solution_steps" -> {
-                                        solutionSteps = extractStepsText(json.optString("content", ""))
+                                        val ss = extractStepsText(json.optString("content", ""))
+                                        stepsMap[cur(qiKey)] = ss
                                         solveProgress.value = "阶段 2/6 · 解题思路"
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.DISPLAY_STEPS,
-                                                        requestId = requestId,
-                                                        solutionSteps = solutionSteps
-                                                )
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.DISPLAY_STEPS,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = ss
+                                        ))
                                     }
                                     "solution_chunk" -> {
-                                        // 流式增量：content 是累积到当前的完整文本，节流刷新实现“打字机”效果
                                         val chunk = json.optString("content", "")
                                         if (chunk.isNotEmpty()) {
                                             val now = System.currentTimeMillis()
                                             if (now - lastSolutionUpdate >= 100) {
                                                 lastSolutionUpdate = now
-                                                fullSolution = chunk
+                                                fullMap[cur(qiKey)] = chunk
                                                 _statusText.value = "AI正在生成完整解析..."
-                                                _appState.value =
-                                                        AppState.Solving(
-                                                                stage = SolveStage.DISPLAY_FULL,
-                                                                requestId = requestId,
-                                                                solutionSteps = solutionSteps,
-                                                                fullSolution = fullSolution,
-                                                                solutionStreaming = true
-                                                        )
+                                                emit(qiKey, AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_FULL,
+                                                        requestId = requestId,
+                                                        ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                        solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                        fullSolution = chunk,
+                                                        solutionStreaming = true
+                                                ))
                                             }
                                         }
                                     }
                                     "solution", "solution_rendered" -> {
-                                        fullSolution = json.optString("content", "")
+                                        val fs = json.optString("content", "")
+                                        fullMap[cur(qiKey)] = fs
                                         solveProgress.value = if (stage == "solution_rendered") "阶段 4/6 · 渲染完成" else "阶段 3/6 · 完整解析"
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.DISPLAY_FULL,
-                                                        requestId = requestId,
-                                                        solutionSteps = solutionSteps,
-                                                        fullSolution = fullSolution
-                                                )
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.DISPLAY_FULL,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                fullSolution = fs
+                                        ))
                                     }
                                     "mindmap_chunk" -> {
-                                        // 流式增量：思维导图打字机效果
                                         val chunk = json.optString("content", "")
                                         if (chunk.isNotEmpty()) {
                                             val now = System.currentTimeMillis()
                                             if (now - lastMindmapUpdate >= 100) {
                                                 lastMindmapUpdate = now
-                                                mindMap = formatMindMap(chunk)
-                                                _appState.value =
-                                                        AppState.Solving(
-                                                                stage = SolveStage.DISPLAY_MINDMAP,
-                                                                requestId = requestId,
-                                                                solutionSteps = solutionSteps,
-                                                                fullSolution = fullSolution,
-                                                                mindMap = mindMap,
-                                                                mindmapStreaming = true
-                                                        )
+                                                val mm = formatMindMap(chunk)
+                                                mindMapMap[cur(qiKey)] = mm
+                                                emit(qiKey, AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_MINDMAP,
+                                                        requestId = requestId,
+                                                        ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                        solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                        fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                        mindMap = mm,
+                                                        mindmapStreaming = true
+                                                ))
                                             }
                                         }
                                     }
                                     "mindmap" -> {
-                                        mindMap = formatMindMap(json.optString("content", ""))
+                                        val mm = formatMindMap(json.optString("content", ""))
+                                        mindMapMap[cur(qiKey)] = mm
                                         solveProgress.value = "阶段 5/6 · 思维导图"
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.DISPLAY_MINDMAP,
-                                                        requestId = requestId,
-                                                        solutionSteps = solutionSteps,
-                                                        fullSolution = fullSolution,
-                                                        mindMap = mindMap
-                                                )
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.DISPLAY_MINDMAP,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                mindMap = mm
+                                        ))
                                     }
                                     "suggested_questions" -> {
-                                        // 兼容两种格式：字符串数组 或 {question,answer} 对象数组
                                         val content = json.opt("content")
                                         val qaItems = mutableListOf<QAItem>()
                                         val qStrings = mutableListOf<String>()
@@ -860,48 +885,43 @@ class MainViewModel : ViewModel() {
                                                 if (obj != null) {
                                                     val q = obj.optString("question", "")
                                                     val a = obj.optString("answer", "")
-                                                    if (q.isNotEmpty()) {
-                                                        qaItems.add(QAItem(q, a))
-                                                        qStrings.add(q)
-                                                    }
+                                                    if (q.isNotEmpty()) { qaItems.add(QAItem(q, a)); qStrings.add(q) }
                                                 } else {
                                                     content.optString(i, "").takeIf { it.isNotEmpty() }?.let { qStrings.add(it) }
                                                 }
                                             }
                                         }
-                                        suggestedQA = qaItems
-                                        if (qStrings.isNotEmpty()) suggestedQuestions = qStrings
+                                        suggQAMap[cur(qiKey)] = qaItems
+                                        suggMap[cur(qiKey)] = qStrings
                                         solveProgress.value = "阶段 6/6 · 预判问题"
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.INTERACTIVE,
-                                                        requestId = requestId,
-                                                        solutionSteps = solutionSteps,
-                                                        fullSolution = fullSolution,
-                                                        mindMap = mindMap,
-                                                        suggestedQuestions = suggestedQuestions,
-                                                        suggestedQA = suggestedQA,
-                                                        qaList = qaList,
-                                                        subject = subject
-                                                )
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.INTERACTIVE,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                mindMap = mindMapMap[cur(qiKey)] ?: "",
+                                                suggestedQuestions = qStrings,
+                                                suggestedQA = qaItems,
+                                                qaList = qaMap[cur(qiKey)] ?: emptyList(),
+                                                subject = subjectMap[cur(qiKey)] ?: ""
+                                        ))
                                     }
                                     "complete" -> {
                                         solveProgress.value = ""
-                                        _appState.value =
-                                                AppState.Solving(
-                                                        stage = SolveStage.COMPLETED,
-                                                        requestId = requestId,
-                                                        solutionSteps = solutionSteps,
-                                                        fullSolution = fullSolution,
-                                                        mindMap = mindMap,
-                                                        suggestedQuestions = suggestedQuestions,
-                                                        suggestedQA = suggestedQA,
-                                                        qaList = qaList,
-                                                        subject = subject,
-                                                        ocrText = ocrText
-                                                )
-                                        _statusText.value = "解答完成"
-                                        // 掌握程度改为模块下方按钮（不再弹窗）
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.COMPLETED,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                mindMap = mindMapMap[cur(qiKey)] ?: "",
+                                                suggestedQuestions = suggMap[cur(qiKey)] ?: emptyList(),
+                                                suggestedQA = suggQAMap[cur(qiKey)] ?: emptyList(),
+                                                qaList = qaMap[cur(qiKey)] ?: emptyList(),
+                                                subject = subjectMap[cur(qiKey)] ?: ""
+                                        ))
+                                        _statusText.value = if (multiQuestionCount.value > 1) "全部题目解答完成" else "解答完成"
                                         masteryVisible.value = true
                                     }
                                     "error" ->
@@ -1355,6 +1375,12 @@ class MainViewModel : ViewModel() {
 
     val historyStartDate = MutableStateFlow("")
     val historyEndDate = MutableStateFlow("")
+    // ① 多题模式
+    val multiQuestionCount = MutableStateFlow(0)                 // 分题后题目总数（>1 表示多题模式）
+    val multiQuestionTexts = MutableStateFlow<List<String>>(emptyList())  // 各题OCR文本
+    val currentQuestionIndex = MutableStateFlow(0)               // 当前查看的题号
+    val multiSolveStates = MutableStateFlow<List<AppState.Solving>>(emptyList())  // 每题完整解题状态
+
     // ⑤ AI模型设置（大语言模型提供方/模型 + 视觉OCR模型）
     val llmProvider = MutableStateFlow("deepseek")
     val llmModel = MutableStateFlow("")
@@ -1385,6 +1411,15 @@ class MainViewModel : ViewModel() {
 
     fun saveDialectGrade() {
         apiService.saveDialectGrade(dialect.value, grade.value)
+    }
+
+    // ① 多题切换：切换到指定题目页
+    fun switchQuestion(index: Int) {
+        val list = multiSolveStates.value
+        if (index in list.indices) {
+            currentQuestionIndex.value = index
+            _appState.value = list[index]
+        }
     }
 
     fun updateServerAddress(address: String) {
@@ -2424,6 +2459,34 @@ fun SolvingScreen(
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
                 )
+            }
+
+            // ① 多题切换器（分题>1时显示）
+            val multiCount by (viewModel?.multiQuestionCount ?: MutableStateFlow(0)).collectAsState()
+            val multiStates by (viewModel?.multiSolveStates ?: MutableStateFlow(emptyList())).collectAsState()
+            val curQIndex by (viewModel?.currentQuestionIndex ?: MutableStateFlow(0)).collectAsState()
+            if (multiCount > 1) {
+                Row(
+                        modifier = Modifier
+                                .fillMaxWidth()
+                                .background(tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    (0 until multiCount).forEach { idx ->
+                        FilterChip(
+                                selected = curQIndex == idx,
+                                onClick = {
+                                    viewModel?.switchQuestion(idx)
+                                },
+                                label = { Text("题目 ${idx + 1}", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3))
+                                )
+                        )
+                    }
+                }
             }
 
             // 可滚动内容区
