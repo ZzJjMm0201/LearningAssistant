@@ -1410,6 +1410,18 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    // ④ 导出 PDF/Word（服务端生成后返回本地路径，经回调交给UI分享）
+    fun exportContent(title: String, content: String, format: String, onResult: (String?, String?) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val path = apiService.exportDocument(title, content, format)
+                withContext(Dispatchers.Main) { onResult(path, null) }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { onResult(null, e.message ?: "导出失败") }
+            }
+        }
+    }
+
     fun updateServerAddress(address: String) {
         serverAddress.value = address.removePrefix("http://")
         apiService.updateServerAddress(address)
@@ -2882,6 +2894,17 @@ fun SolvingScreen(
                 }
             }
 
+            // ④ 导出（截图/PDF/Word）— 导出解题思路+完整解析+思维导图
+            val exportContent = buildString {
+                append("# 学习助手解题结果\n\n")
+                if (solveState.solutionSteps.isNotEmpty()) append("## 解题思路\n\n${solveState.solutionSteps}\n\n")
+                if (solveState.fullSolution.isNotEmpty()) append("## 完整解析\n\n${solveState.fullSolution}\n\n")
+                if (solveState.mindMap.isNotEmpty()) append("## 思维导图\n\n${solveState.mindMap}\n")
+            }
+            if (exportContent.isNotBlank() && (solveState.stage == SolveStage.INTERACTIVE || solveState.stage == SolveStage.COMPLETED)) {
+                ExportActions(viewModel = viewModel, title = "学习助手解题结果", content = exportContent, allowPdf = true)
+            }
+
             Spacer(modifier = Modifier.height(32.dp))
             }
         }
@@ -3252,6 +3275,19 @@ fun KnowledgeScreen(
                 }
             }
             
+            // ④ 导出（截图/PDF/Word）— 知识延伸内容
+            val exportContent = buildString {
+                if (state.summary.isNotEmpty()) append("## 知识点总结\n\n${state.summary}\n\n")
+                if (state.extension.isNotEmpty()) append("## 知识拓展\n\n${state.extension}\n\n")
+                if (state.similarQuestions.isNotEmpty()) {
+                    append("## 相似题推荐\n\n")
+                    state.similarQuestions.forEach { append("- ${it.question}\n") }
+                }
+            }
+            if (exportContent.isNotBlank()) {
+                ExportActions(viewModel = viewModel, title = "知识延伸", content = exportContent, allowPdf = true)
+            }
+
             Spacer(modifier = Modifier.height(32.dp))
         }
     }
@@ -6448,5 +6484,114 @@ fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+
+// ==================== ④ 截图 / 导出（PDF/Word 由服务端生成） ====================
+/** 把当前 Activity 画面截图为 PNG 存到相册，返回保存路径（失败返回null） */
+fun captureScreenToGallery(context: android.content.Context): String? {
+    try {
+        val activity = context as? android.app.Activity ?: return null
+        val view = activity.window.decorView
+        view.isDrawingCacheEnabled = true
+        view.buildDrawingCache(true)
+        val bitmap = android.graphics.Bitmap.createBitmap(view.drawingCache ?: return null)
+        view.isDrawingCacheEnabled = false
+        val name = "learntogether_${System.currentTimeMillis()}.png"
+        return saveBitmapToGallery(context, bitmap, name, "image/png")
+    } catch (e: Exception) {
+        android.util.Log.e("Export", "截图失败: ${e.message}")
+        return null
+    }
+}
+
+/** 保存位图到相册（Android 10+ 用 MediaStore，否则存 DCIM 目录），返回路径 */
+fun saveBitmapToGallery(context: android.content.Context, bitmap: android.graphics.Bitmap, fileName: String, mimeType: String): String? {
+    return try {
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(android.provider.MediaStore.Images.Media.MIME_TYPE, mimeType)
+                put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/LearningAssistant")
+            }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+            resolver.openOutputStream(uri)?.use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            uri.toString()
+        } else {
+            val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES)
+            val sub = java.io.File(dir, "LearningAssistant")
+            if (!sub.exists()) sub.mkdirs()
+            val f = java.io.File(sub, fileName)
+            java.io.FileOutputStream(f).use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            f.absolutePath
+        }
+    } catch (e: Exception) {
+        android.util.Log.e("Export", "保存图片失败: ${e.message}")
+        null
+    }
+}
+
+/** 通过系统分享/打开一个文件 */
+fun shareFile(context: android.content.Context, path: String, mimeType: String) {
+    try {
+        val f = java.io.File(path)
+        val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".provider", f)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "导出/分享"))
+    } catch (e: Exception) {
+        android.widget.Toast.makeText(context, "文件已保存：$path", android.widget.Toast.LENGTH_LONG).show()
+    }
+}
+
+/** ④ 通用导出操作行：截图 / 导出PDF / 导出Word（数据报告不允许PDF时 allowPdf=false） */
+@Composable
+fun ExportActions(
+        viewModel: MainViewModel?,
+        title: String,
+        content: String,
+        allowPdf: Boolean = true,
+) {
+    val context = LocalContext.current
+    Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Button(
+                onClick = {
+                    val saved = captureScreenToGallery(context)
+                    Toast.makeText(context, if (saved != null) "截图已保存到相册" else "截图失败", Toast.LENGTH_SHORT).show()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+        ) { Text("📷 截图", fontSize = 12.sp) }
+        if (allowPdf) {
+            Button(
+                    onClick = {
+                        if (viewModel != null && content.isNotBlank()) {
+                            viewModel.exportContent(title, content, "pdf") { path, err ->
+                                if (path != null) shareFile(context, path, "application/pdf")
+                                else Toast.makeText(context, err ?: "导出失败", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+            ) { Text("📄 PDF", fontSize = 12.sp) }
+        }
+        Button(
+                onClick = {
+                    if (viewModel != null && content.isNotBlank()) {
+                        viewModel.exportContent(title, content, "word") { path, err ->
+                            if (path != null) shareFile(context, path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                            else Toast.makeText(context, err ?: "导出失败", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+        ) { Text("📝 Word", fontSize = 12.sp) }
     }
 }

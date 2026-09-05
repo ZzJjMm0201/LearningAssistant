@@ -25,6 +25,7 @@ from server.services.ai_service import ai_service
 from server.services.search_service import search_service
 from server.services.report_generator import ReportGenerator
 from server.utils.latex_processor import process_latex_blocks, clean_markdown_for_display
+from server.utils.export_service import export_pdf, export_word
 
 # ==================== 日志系统（文件轮转 + 控制台） ====================
 import logging as _logging
@@ -141,6 +142,12 @@ class AskRequest(BaseModel):
 class ReportRequest(BaseModel):
     days: int = 30
     theme: str = "dark"  # dark / light（② 数据报告深浅色）
+
+class ExportRequest(BaseModel):
+    title: str = "导出"
+    content: str = ""
+    format: str = "pdf"  # pdf / word
+
 
 class TrackingData(BaseModel):
     session_id: str
@@ -553,6 +560,33 @@ async def get_report(filename: str):
     if file_path.exists():
         return FileResponse(file_path, media_type="text/html")
     return {"detail": "Not Found"}
+
+@app.post("/export")
+async def export_content(request: Request, body: ExportRequest):
+    """④ 导出 PDF / Word（服务端生成，公式转纯文本；返回文件URL供客户端下载）"""
+    import uuid as _uuid
+    export_dir = REPORT_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (body.format or "pdf").lower()
+    if fmt not in ("pdf", "word"):
+        fmt = "pdf"
+    ext = "pdf" if fmt == "pdf" else "docx"
+    fname = f"export_{_uuid.uuid4().hex[:10]}.{ext}"
+    out_path = export_dir / fname
+    ok = export_pdf(body.title, body.content, out_path) if fmt == "pdf" else export_word(body.title, body.content, out_path)
+    if not ok:
+        return {"status": "error", "message": "导出失败"}
+    return {"status": "ok", "url": f"/static/exports/{fname}", "filename": fname}
+
+@app.get("/static/exports/{filename}")
+async def get_export_file(filename: str):
+    """获取导出的 PDF/Word 文件"""
+    file_path = REPORT_DIR / "exports" / filename
+    if not file_path.exists():
+        return {"detail": "Not Found"}
+    mt = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if filename.endswith(".docx") else "application/pdf"
+    return FileResponse(file_path, media_type=mt, filename=filename)
+
 
 @app.get("/static/{filename:path}")
 async def get_history_image(filename: str):

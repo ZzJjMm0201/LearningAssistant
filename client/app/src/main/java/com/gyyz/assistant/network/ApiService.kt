@@ -36,11 +36,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
     private var sharedPreferences: SharedPreferences? = null
     private var authToken: String? = null
+    private var appContext: Context? = null
 
     /**
      * 初始化SharedPreferences（需在Activity中调用）
      */
     fun init(context: Context) {
+        appContext = context.applicationContext
         sharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         authToken = sharedPreferences?.getString(KEY_TOKEN, null)
         loadAiSettings()
@@ -755,6 +757,42 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 .withAuth()
                 .build()
             client.newCall(request).execute()
+        }
+    }
+
+    /**
+     * ④ 导出 PDF / Word：调用服务端生成，下载到本地缓存，返回本地文件路径
+     */
+    suspend fun exportDocument(title: String, content: String, format: String = "pdf"): String {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().apply {
+                put("title", title)
+                put("content", content)
+                put("format", format)
+            }
+            val requestBody = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("$BASE_URL/export")
+                .post(requestBody)
+                .withAuth()
+                .build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: throw Exception("导出响应为空")
+            val respJson = JSONObject(body)
+            if (respJson.optString("status") != "ok") {
+                throw Exception(respJson.optString("message", "导出失败"))
+            }
+            val url = respJson.optString("url", "")
+            val fname = respJson.optString("filename", "export.$format")
+            // 下载文件到缓存目录
+            val fileReq = Request.Builder().url("$BASE_URL$url").withAuth().build()
+            val fileResp = client.newCall(fileReq).execute()
+            val bytes = fileResp.body?.bytes() ?: throw Exception("下载文件为空")
+            val dir = java.io.File(appContext?.getExternalFilesDir(null), "export")
+            if (!dir.exists()) dir.mkdirs()
+            val out = java.io.File(dir, fname)
+            out.writeBytes(bytes)
+            out.absolutePath
         }
     }
 }
