@@ -19,6 +19,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -40,6 +41,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -1104,7 +1106,13 @@ class MainViewModel : ViewModel() {
     }
 
     fun loadAiReport(days: Int? = null) {
-        val reportDaysVal = days ?: reportDays.value
+        if (days == null) {
+            // ② 无参数→先弹时间范围选择
+            pendingReportType.value = "ai"
+            showReportRangeDialog.value = true
+            return
+        }
+        val reportDaysVal = days
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) {
@@ -1142,7 +1150,13 @@ class MainViewModel : ViewModel() {
     }
 
     fun loadDataReport(days: Int? = null) {
-        val reportDaysVal = days ?: reportDays.value
+        if (days == null) {
+            // ② 无参数→先弹时间范围选择
+            pendingReportType.value = "data"
+            showReportRangeDialog.value = true
+            return
+        }
+        val reportDaysVal = days
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) {
@@ -1368,6 +1382,9 @@ class MainViewModel : ViewModel() {
     val multiSolveStates = MutableStateFlow<List<AppState.Solving>>(emptyList())  // 每题完整解题状态
     // ⑩ 主页面相机对准预览开关
     val cameraPreviewEnabled = MutableStateFlow(false)
+    // ② 报告时间范围弹窗（生成报告前先询问）
+    val showReportRangeDialog = MutableStateFlow(false)
+    val pendingReportType = MutableStateFlow("")  // "data" / "ai"
 
     // ⑤ AI模型设置（大语言模型提供方/模型 + 视觉OCR模型）
     val llmProvider = MutableStateFlow("deepseek")
@@ -1987,6 +2004,20 @@ fun MainScreen(
             GeoGebraScreen(
                 url = geogebraUrl,
                 onBack = { viewModel.showGeoGebraScreen.value = false }
+            )
+        }
+
+        // ② 报告时间范围弹窗（生成报告前先询问）
+        val showReportRange by viewModel.showReportRangeDialog.collectAsState()
+        if (showReportRange) {
+            ReportRangeDialog(
+                    onSelect = { days ->
+                        viewModel.showReportRangeDialog.value = false
+                        viewModel.reportDays.value = days
+                        if (viewModel.pendingReportType.value == "data") viewModel.loadDataReport(days)
+                        else viewModel.loadAiReport(days)
+                    },
+                    onDismiss = { viewModel.showReportRangeDialog.value = false }
             )
         }
     }
@@ -4037,6 +4068,27 @@ fun MainMenuScreen(
                     onCheckedChange = { viewModel.cameraPreviewEnabled.value = it },
                     colors = SwitchDefaults.colors(checkedThumbColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
             )
+        }
+
+        // ③ 相机预览取景框（开启对准时显示，用于对准题目）
+        if (cameraPreviewEnabled) {
+            Box(
+                    modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                            .height(150.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0x00000000))
+                            .border(2.dp, tC(Color(0xFF00D2FF), Color(0xFF0086B3)), RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+            ) {
+                Text(
+                        "✨ 将题目对准此框\n（相机画面）",
+                        color = tC(Color.White.copy(alpha = 0.7f), Color(0xFF16181D).copy(alpha = 0.7f)),
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                )
+            }
         }
 
         // 相机不可用时：醒目提示改用相册选图
@@ -6594,4 +6646,29 @@ fun ExportActions(
                 colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
         ) { Text("📝 Word", fontSize = 12.sp) }
     }
+}
+
+// ==================== ② 报告时间范围选择弹窗 ====================
+@Composable
+fun ReportRangeDialog(onSelect: (Int) -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("📅 选择统计时间范围", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(7 to "最近 7 天", 30 to "最近 30 天", 90 to "最近 90 天", 0 to "全部历史").forEach { (days, label) ->
+                        Button(
+                                onClick = { onSelect(days) },
+                                modifier = Modifier.fillMaxWidth().height(48.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                        ) { Text(label, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text("取消", color = tC(Color.Gray, Color(0xFF5C6470))) }
+            },
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
 }
