@@ -145,8 +145,9 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         addHeader("X-Style", answerStyle)
         if (thinkingEnabled) addHeader("X-Thinking", "1")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
-        if (answerStyle == "dialect" && dialect.isNotEmpty()) addHeader("X-Dialect", dialect)
-        if (grade.isNotEmpty()) addHeader("X-Grade", grade)
+        // 中文值需 URL 编码，否则 OkHttp 报 "Unexpected char"（HTTP 头仅允许 ASCII）
+        if (answerStyle == "dialect" && dialect.isNotEmpty()) addHeader("X-Dialect", java.net.URLEncoder.encode(dialect, "UTF-8"))
+        if (grade.isNotEmpty()) addHeader("X-Grade", java.net.URLEncoder.encode(grade, "UTF-8"))
         return this
     }
 
@@ -793,6 +794,29 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val out = java.io.File(dir, fname)
             out.writeBytes(bytes)
             out.absolutePath
+        }
+    }
+
+    data class PomodoroRecommend(val status: String, val durationMinutes: Int = 30, val reason: String = "", val message: String = "")
+
+    /** 番茄钟 AI 推荐做题时长 */
+    suspend fun recommendPomodoro(ocrText: String, summary: String = "", imageBase64: String = ""): PomodoroRecommend {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().apply {
+                put("ocr_text", ocrText)
+                put("summary", summary)
+                if (imageBase64.isNotEmpty()) put("image_base64", imageBase64)
+            }
+            val requestBody = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder().url("$BASE_URL/pomodoro/recommend").post(requestBody).withAuth().build()
+            val response = client.newCall(request).execute()
+            val respJson = JSONObject(response.body?.string() ?: "{}")
+            PomodoroRecommend(
+                    status = respJson.optString("status", "error"),
+                    durationMinutes = respJson.optInt("duration_minutes", 30),
+                    reason = respJson.optString("reason", ""),
+                    message = respJson.optString("message", "")
+            )
         }
     }
 }

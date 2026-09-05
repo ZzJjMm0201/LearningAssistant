@@ -148,6 +148,11 @@ class ExportRequest(BaseModel):
     content: str = ""
     format: str = "pdf"  # pdf / word
 
+class PomodoroRecommendRequest(BaseModel):
+    ocr_text: str = ""
+    summary: str = ""  # 学情摘要（可选）
+    image_base64: str = ""  # 题目图片（可选，视觉模型直接看图推荐）
+
 
 class TrackingData(BaseModel):
     session_id: str
@@ -209,13 +214,17 @@ def get_answer_style(request: Request) -> Optional[str]:
 
 
 def get_dialect(request: Request) -> str:
-    """③ 方言名称（X-Dialect头，style=dialect 时生效）"""
-    return (request.headers.get("X-Dialect") or "").strip()
+    """③ 方言名称（X-Dialect头，style=dialect 时生效；客户端URL编码，这里解码）"""
+    import urllib.parse
+    v = (request.headers.get("X-Dialect") or "").strip()
+    return urllib.parse.unquote(v)
 
 
 def get_grade(request: Request) -> str:
-    """④ 年级（X-Grade头，如 高中）"""
-    return (request.headers.get("X-Grade") or "").strip()
+    """④ 年级（X-Grade头，如 高中；客户端URL编码，这里解码）"""
+    import urllib.parse
+    v = (request.headers.get("X-Grade") or "").strip()
+    return urllib.parse.unquote(v)
 
 
 def get_thinking_enabled(request: Request) -> bool:
@@ -586,6 +595,55 @@ async def get_export_file(filename: str):
         return {"detail": "Not Found"}
     mt = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if filename.endswith(".docx") else "application/pdf"
     return FileResponse(file_path, media_type=mt, filename=filename)
+
+@app.post("/pomodoro/recommend")
+async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
+    """番茄钟 AI 推荐做题时长：基于题目图片/文字+学情，返回 {duration_minutes, reason}"""
+    import re as _re
+    try:
+        ocr_text = body.ocr_text
+        # 优先级：有图片 base64 → 用视觉模型直接看题描述
+        if body.image_base64:
+            try:
+                import base64 as _b64
+                import tempfile
+                img_bytes = _b64.b64decode(body.image_base64)
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                    tf.write(img_bytes)
+                    tmp_path = tf.name
+                desc, _ = ai_service.recognize_image_with_vision(tmp_path)
+                if desc and not desc.startswith("OCR"):
+                    ocr_text = desc
+            except Exception as e:
+                print(f"[Pomodoro] 图片识别失败，回退文字: {e}")
+        prompt = (
+            "你是学习规划助手。请根据学生当前要做的题目和学情，推荐一个合适的番茄钟专注时长（分钟，取 25/30/35/40/45/50 之一），"
+            "并给出简短理由。\n\n"
+            f"题目内容：{ocr_text[:800]}\n"
+            f"学情摘要：{body.summary[:500] or '暂无学情数据'}\n\n"
+            "只输出 JSON：{\"duration_minutes\": 建议时长(整数), \"reason\": \"推荐理由(一句话)\"}"
+        )
+        resp = ai_service.generate_response(prompt, engine=get_engine(request), model=get_llm_model(request)) or ""
+        m = _re.search(r'\{[^{}]*\}', resp, _re.DOTALL)
+        data = {}
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = {}
+        dur = data.get("duration_minutes", 30)
+        if not isinstance(dur, int):
+            try:
+                dur = int(dur)
+            except Exception:
+                dur = 30
+        dur = min(50, max(25, dur))
+        reason = str(data.get("reason", "建议保持常规专注时长"))
+        return {"status": "ok", "duration_minutes": dur, "reason": reason}
+    except Exception as e:
+        print(f"[Pomodoro] 推荐失败: {e}")
+        return {"status": "error", "message": f"推荐失败: {e}"}
+
 
 
 @app.get("/static/{filename:path}")

@@ -2070,6 +2070,7 @@ fun CameraPreviewView(
 
     val imageCaptureRef = remember { mutableStateOf<ImageCapture?>(null) }
     val isBound = remember { mutableStateOf(false) }
+    val previewView = remember { PreviewView(context) }
 
     LaunchedEffect(Unit) {
         var retryCount = 0
@@ -2125,6 +2126,7 @@ fun CameraPreviewView(
         isBound.value = false
 
         val preview = Preview.Builder().build()
+        preview.setSurfaceProvider(previewView.surfaceProvider)
 
         val imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
@@ -2178,6 +2180,7 @@ fun CameraPreviewView(
         cameraProvider.unbindAll()
         
         val preview = Preview.Builder().build()
+        preview.setSurfaceProvider(previewView.surfaceProvider)
         val imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .build()
@@ -2227,7 +2230,10 @@ fun CameraPreviewView(
         }
     }
 
-    Box(modifier = modifier)
+    AndroidView(
+            factory = { previewView },
+            modifier = modifier
+    )
 }
 
 
@@ -6167,6 +6173,37 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
 
     var workInput by remember(work) { mutableStateOf(work.toString()) }
     var restInput by remember(rest) { mutableStateOf(rest.toString()) }
+    // 番茄钟 AI 推荐时长
+    var recommendReason by remember { mutableStateOf("") }
+    var recommending by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val pickImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            recommending = true
+            recommendReason = ""
+            viewModel.viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val bytes = context.contentResolver.openInputStream(uri)?.readBytes()
+                    val b64 = if (bytes != null) android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP) else ""
+                    val r = viewModel.apiService.recommendPomodoro("", "", b64)
+                    withContext(Dispatchers.Main) {
+                        recommending = false
+                        if (r.status == "ok") {
+                            workInput = r.durationMinutes.toString()
+                            recommendReason = "推荐 ${r.durationMinutes} 分钟：${r.reason}"
+                        } else {
+                            recommendReason = "推荐失败：${r.message}"
+                        }
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        recommending = false
+                        recommendReason = "推荐失败：${e.message}"
+                    }
+                }
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -6215,6 +6252,24 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                 Text("${min}分", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp)
                             }
                         }
+                    }
+
+                    // 拍照上传 AI 推荐做题时长
+                    Button(
+                            onClick = { pickImageLauncher.launch("image/*") },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !recommending,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7B2FBE))
+                    ) {
+                        Text(if (recommending) "🤖 正在推荐..." else "🤖 拍照上传，AI 推荐时长", color = Color.White, fontSize = 13.sp)
+                    }
+                    if (recommendReason.isNotEmpty()) {
+                        Text(
+                                recommendReason,
+                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp
+                        )
                     }
 
                     Text("休息时长（分钟，可输入）", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp)
@@ -6545,11 +6600,22 @@ fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
 fun captureScreenToGallery(context: android.content.Context): String? {
     try {
         val activity = context as? android.app.Activity ?: return null
-        val view = activity.window.decorView
-        view.isDrawingCacheEnabled = true
-        view.buildDrawingCache(true)
-        val bitmap = android.graphics.Bitmap.createBitmap(view.drawingCache ?: return null)
-        view.isDrawingCacheEnabled = false
+        val window = activity.window
+        val bitmap = android.graphics.Bitmap.createBitmap(window.decorView.width, window.decorView.height, android.graphics.Bitmap.Config.ARGB_8888)
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            // PixelCopy 截取当前可见窗口（不含滚动区外的内容）
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var ok = false
+            android.view.PixelCopy.request(window, bitmap, { copyResult ->
+                ok = copyResult == android.view.PixelCopy.SUCCESS
+                latch.countDown()
+            }, android.os.Handler(android.os.Looper.getMainLooper()))
+            latch.await(3, java.util.concurrent.TimeUnit.SECONDS)
+            if (!ok) return null
+        } else {
+            val canvas = android.graphics.Canvas(bitmap)
+            window.decorView.draw(canvas)
+        }
         val name = "learntogether_${System.currentTimeMillis()}.png"
         return saveBitmapToGallery(context, bitmap, name, "image/png")
     } catch (e: Exception) {
