@@ -511,11 +511,25 @@ async def data_report(request: Request, body: ReportRequest):
 
 @app.post("/report/ai")
 async def ai_report(request: Request, body: ReportRequest):
-    """生成AI版学情报告（非流式，兼容旧客户端）"""
+    """生成AI版学情报告（非流式，兼容旧客户端）；⑦ 规定时段题目 <5 题则不生成"""
     db = SessionLocal()
     try:
+        from sqlalchemy import or_
+        from datetime import timedelta
+        user_id = get_current_user(request)
+        q = db.query(SubmissionRecord)
+        if body.days and body.days > 0:
+            q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
+        if user_id is not None:
+            q = q.filter(or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None)))
+        else:
+            q = q.filter(SubmissionRecord.user_id.is_(None))
+        record_count = q.count()
+        if record_count < 5:
+            return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
+
         generator = ReportGenerator(db)
-        summary = generator.get_report_summary(body.days, user_id=get_current_user(request))
+        summary = generator.get_report_summary(body.days, user_id=user_id)
         
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
@@ -532,11 +546,25 @@ async def ai_report(request: Request, body: ReportRequest):
 
 @app.post("/report/ai/stream")
 async def ai_report_stream(request: Request, body: ReportRequest):
-    """生成AI版学情报告（SSE流式）"""
+    """生成AI版学情报告（SSE流式）；⑦ 规定时段题目 <5 题则不生成"""
     db = SessionLocal()
     try:
+        from sqlalchemy import or_
+        from datetime import timedelta
+        user_id = get_current_user(request)
+        q = db.query(SubmissionRecord)
+        if body.days and body.days > 0:
+            q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
+        if user_id is not None:
+            q = q.filter(or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None)))
+        else:
+            q = q.filter(SubmissionRecord.user_id.is_(None))
+        record_count = q.count()
+        if record_count < 5:
+            return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
+
         generator = ReportGenerator(db)
-        summary = await asyncio.to_thread(generator.get_report_summary, body.days, user_id=get_current_user(request))
+        summary = await asyncio.to_thread(generator.get_report_summary, body.days, user_id=user_id)
         
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}

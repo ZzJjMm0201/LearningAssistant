@@ -131,6 +131,13 @@ class SolvePipeline:
                 self._emit_event(request_id, "complete", None)
                 return
 
+            # ⑥ 图片模糊：视觉模型返回 ---end---，直接终止并提示重新拍摄
+            if "---end---" in ocr_text:
+                print(f"[{request_id}] OCR判为模糊，终止解题")
+                self._emit_event(request_id, "blurred", "图片模糊或无法辨认，请重新拍摄")
+                self._emit_event(request_id, "complete", None)
+                return
+
             # ========== 等待用户确认OCR结果 ==========
             self._emit_event(request_id, "waiting_confirm", {"text": ocr_text})
             confirm_event = threading.Event()

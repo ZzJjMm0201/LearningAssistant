@@ -947,6 +947,12 @@ class MainViewModel : ViewModel() {
                                     }
                                     "error" ->
                                             _statusText.value = "错误: ${json.optString("content")}"
+                                    "blurred" -> {
+                                        // ⑥ 图片模糊，提示重拍并回到主页
+                                        _statusText.value = json.optString("content", "图片模糊，请重新拍摄")
+                                        showOcrConfirmDialog.value = false
+                                        _appState.value = AppState.Tracking
+                                    }
                                 }
                             } catch (e: Exception) {
                                 Log.e("MainViewModel", "解析SSE事件失败: $data", e)
@@ -1359,7 +1365,7 @@ class MainViewModel : ViewModel() {
     val voiceEnabled = MutableStateFlow(false)
     val tomatoEnabled = MutableStateFlow(false)
     val serverAddress = MutableStateFlow("10.100.55.231:8000")
-    val themeColor = MutableStateFlow(tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+    val themeColor = MutableStateFlow(Color(0xFF00D2FF))
     val fontSize = MutableStateFlow(16f)
 
     val showModules =
@@ -2339,7 +2345,7 @@ fun LoginScreen(
             ) {
                 Text(
                     text = "📎 学习助手",
-                    color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                    color = Color(0xFF00D2FF),
                     fontSize = 28.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -2362,9 +2368,9 @@ fun LoginScreen(
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = tC(Color.White, Color(0xFF16181D)),
                         unfocusedTextColor = tC(Color.White, Color(0xFF16181D)),
-                        focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        focusedBorderColor = Color(0xFF00D2FF),
                         unfocusedBorderColor = tC(Color.Gray, Color(0xFF5C6470)),
-                        cursorColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        cursorColor = Color(0xFF00D2FF),
                     )
                 )
 
@@ -2381,9 +2387,9 @@ fun LoginScreen(
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = tC(Color.White, Color(0xFF16181D)),
                         unfocusedTextColor = tC(Color.White, Color(0xFF16181D)),
-                        focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        focusedBorderColor = Color(0xFF00D2FF),
                         unfocusedBorderColor = tC(Color.Gray, Color(0xFF5C6470)),
-                        cursorColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        cursorColor = Color(0xFF00D2FF),
                     )
                 )
 
@@ -2410,7 +2416,7 @@ fun LoginScreen(
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     enabled = !isLoading && username.isNotBlank() && password.isNotBlank(),
-                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3))),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF)),
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     if (isLoading) {
@@ -2438,7 +2444,7 @@ fun LoginScreen(
                         } else {
                             "没有账号？点击注册"
                         },
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = 14.sp
                     )
                 }
@@ -2492,7 +2498,7 @@ fun SolvingScreen(
                 // ① 右上角阶段进度提示（LaTeX生成/渲染时用户能看到AI正在做什么）
                 Text(
                         text = solveProgress,
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
                 )
@@ -2519,7 +2525,7 @@ fun SolvingScreen(
                                 },
                                 label = { Text("题目 ${idx + 1}", fontSize = 12.sp) },
                                 colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3))
+                                        selectedContainerColor = Color(0xFF00D2FF)
                                 )
                         )
                     }
@@ -2541,7 +2547,7 @@ fun SolvingScreen(
                         modifier = Modifier.fillMaxWidth().height(100.dp),
                         contentAlignment = Alignment.Center
                 ) {
-                    CircularProgressIndicator(color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                    CircularProgressIndicator(color = Color(0xFF00D2FF))
                     Text(
                             text = "正在分析题目...",
                             color = tC(Color.White, Color(0xFF16181D)),
@@ -2560,7 +2566,7 @@ fun SolvingScreen(
                 SolutionCard(
                         title = "💡 解题思路",
                         content = solveState.solutionSteps,
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = solvingFontSize,
                         initiallyCollapsed = !showModules.getOrDefault("solution_steps", true),
                         streaming = solveState.stepsStreaming
@@ -2596,7 +2602,7 @@ fun SolvingScreen(
                             )
                             Text(
                                     if (showThinking) "▲ 收起" else "▼ 展开",
-                                    color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                    color = Color(0xFF00D2FF),
                                     fontSize = 12.sp
                             )
                         }
@@ -2663,7 +2669,7 @@ fun SolvingScreen(
                             )
                             Text(
                                     if (showSearch) "▲ 收起" else "▼ 展开",
-                                    color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                    color = Color(0xFF00D2FF),
                                     fontSize = 12.sp
                             )
                         }
@@ -2728,7 +2734,7 @@ fun SolvingScreen(
                                         )
                                         Text(
                                                 if (expanded) "▲" else "▼",
-                                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                                color = Color(0xFF00D2FF),
                                                 fontSize = 12.sp
                                         )
                                     }
@@ -2743,7 +2749,7 @@ fun SolvingScreen(
                                                 onClick = { onAskQuestion(item.question) },
                                                 enabled = !isAskingQuestion
                                         ) {
-                                            Text("追问", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                                            Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
                                         }
                                     }
                                 }
@@ -2848,9 +2854,9 @@ fun SolvingScreen(
                             placeholder = { Text("输入你的问题，与AI继续对话...", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp) },
                             textStyle = TextStyle(color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp),
                             colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                    focusedBorderColor = Color(0xFF00D2FF),
                                     unfocusedBorderColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)),
-                                    cursorColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3))
+                                    cursorColor = Color(0xFF00D2FF)
                             ),
                             singleLine = true,
                             enabled = !isAskingQuestion
@@ -2865,7 +2871,7 @@ fun SolvingScreen(
                                 }
                             },
                             enabled = !isAskingQuestion,
-                            colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                     ) { Text("发送", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                 }
 
@@ -3014,7 +3020,7 @@ fun QuestionInfoTags(qInfo: Map<String, String>) {
             if (kpV.isNotEmpty()) {
                 Text(
                         text = "🔖 知识点：$kpV",
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = 12.sp
                 )
             }
@@ -3125,7 +3131,7 @@ fun ReportScreen(
                             onClick = { onSelectDays(days) },
                             label = { Text(label, fontSize = 12.sp) },
                             colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                    selectedContainerColor = Color(0xFF00D2FF),
                                     selectedLabelColor = Color.Black
                             )
                     )
@@ -3217,7 +3223,7 @@ fun KnowledgeScreen(
                 SolutionCard(
                         title = "📝 知识点总结",
                         content = state.summary,
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = knowledgeFontSize,
                         initiallyCollapsed = !showModules.getOrDefault("solution_steps", true),
                         streaming = state.summaryStreaming
@@ -3259,7 +3265,7 @@ fun KnowledgeScreen(
                                     verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(item.question, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                Text(if (expanded) "▲" else "▼", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                                Text(if (expanded) "▲" else "▼", color = Color(0xFF00D2FF), fontSize = 12.sp)
                             }
                             if (expanded && item.answer.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(6.dp))
@@ -3294,7 +3300,7 @@ fun KnowledgeScreen(
                                     verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text("❓ ${item.question}", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                Text(if (expanded) "▲" else "▼", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                                Text(if (expanded) "▲" else "▼", color = Color(0xFF00D2FF), fontSize = 12.sp)
                             }
                             if (expanded) {
                                 if (item.answer.isNotEmpty()) {
@@ -3304,7 +3310,7 @@ fun KnowledgeScreen(
                                 TextButton(
                                         onClick = { onAskQuestion(item.question) }
                                 ) {
-                                    Text("追问", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 12.sp)
+                                    Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
                                 }
                             }
                         }
@@ -3426,7 +3432,7 @@ fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
                     webViewRef?.evaluateJavascript("document.body.style.zoom = '1';", null)
                     webViewRef?.reload()
                 }) {
-                    Text("🔄 适应", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp)
+                    Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
                 }
             }
         }
@@ -3534,7 +3540,8 @@ fun MarkdownView(
     val context = LocalContext.current
     // ⑦ 主题自适应：暗色背景白字 / 亮色背景深字
     val dark = AppDarkTheme
-    val viewBg = if (dark) "#1A1A2E" else "#FFFFFF"
+    // ④ 底色与卡片一致：深色卡片 #16213E，浅色卡片 #FFFFFF
+    val viewBg = if (dark) "#16213E" else "#FFFFFF"
     val viewText = if (dark) android.graphics.Color.WHITE else 0xFF16181D.toInt()
     val viewDivider = if (dark) "#2D2D44" else "#E0E0E0"
 
@@ -3825,7 +3832,7 @@ fun LearningAssistantTheme(dark: Boolean = true, content: @Composable () -> Unit
             colorScheme =
                     if (dark)
                         darkColorScheme(
-                                primary = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                primary = Color(0xFF00D2FF),
                                 secondary = Color(0xFF7B2FBE),
                                 background = tC(Color(0xFF1A1A2E), Color(0xFFF2F4F8)),
                                 surface = tC(Color(0xFF16213E), Color(0xFFFFFFFF)),
@@ -3948,7 +3955,7 @@ fun VoiceFloatingActionButton(
             }
         },
         modifier = modifier,
-        containerColor = if (isListening) tC(Color(0xFF00D2FF), Color(0xFF0086B3)) else Color(0xFF2196F3)
+        containerColor = if (isListening) Color(0xFF00D2FF) else Color(0xFF2196F3)
     ) {
         Text(if (isListening) "listening" else "mic", fontSize = 24.sp)
     }
@@ -3980,7 +3987,7 @@ fun AskDialog(
                         ) {
                             Text(
                                 question,
-                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                color = Color(0xFF00D2FF),
                                 fontSize = 14.sp,
                                 textAlign = TextAlign.Start,
                                 modifier = Modifier.fillMaxWidth()
@@ -4004,7 +4011,7 @@ fun AskDialog(
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = tC(Color.White, Color(0xFF16181D)),
                             unfocusedTextColor = tC(Color.White, Color(0xFF16181D)),
-                            focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                            focusedBorderColor = Color(0xFF00D2FF),
                             unfocusedBorderColor = tC(Color.Gray, Color(0xFF5C6470)),
                         )
                     )
@@ -4015,7 +4022,7 @@ fun AskDialog(
                                 inputText = ""
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                     ) {
                         Text("发送", color = Color.White)
                     }
@@ -4072,7 +4079,7 @@ fun MainMenuScreen(
             Switch(
                     checked = cameraPreviewEnabled,
                     onCheckedChange = { viewModel.cameraPreviewEnabled.value = it },
-                    colors = SwitchDefaults.colors(checkedThumbColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                    colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF00D2FF))
             )
         }
 
@@ -4085,7 +4092,7 @@ fun MainMenuScreen(
                             .height(150.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(Color(0x00000000))
-                            .border(2.dp, tC(Color(0xFF00D2FF), Color(0xFF0086B3)), RoundedCornerShape(12.dp)),
+                            .border(2.dp, Color(0xFF00D2FF), RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -4163,7 +4170,7 @@ fun MainMenuScreen(
                     onClick = { showPickDialog = true },
                     modifier = Modifier.fillMaxWidth().height(52.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isCameraReady) tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)) else tC(Color(0xFF00D2FF), Color(0xFF0086B3))
+                        containerColor = if (isCameraReady) tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)) else Color(0xFF00D2FF)
                     ),
                     shape = RoundedCornerShape(12.dp)
                 ) {
@@ -4341,7 +4348,7 @@ fun LoadingOverlay(message: String = "处理中...") {
             contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+            CircularProgressIndicator(color = Color(0xFF00D2FF))
             Spacer(modifier = Modifier.height(16.dp))
             Text(message, color = Color.White, fontSize = 16.sp)
         }
@@ -4390,7 +4397,7 @@ fun WelcomeDialog(onDismiss: () -> Unit, viewModel: MainViewModel) {
                         Checkbox(
                                 checked = dontShowAgain,
                                 onCheckedChange = { dontShowAgain = it },
-                                colors = CheckboxDefaults.colors(checkedColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                                colors = CheckboxDefaults.colors(checkedColor = Color(0xFF00D2FF))
                         )
                         Text("不再提醒", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
                     }
@@ -4542,7 +4549,7 @@ fun HistoryViewScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
                 ) { Text("取消", color = Color.White) }
                 
-                Text("已选 ${selectedIds.size} 项", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("已选 ${selectedIds.size} 项", color = Color(0xFF00D2FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 
                 Button(
                     onClick = { batchDelete() },
@@ -4591,7 +4598,7 @@ fun HistoryViewScreen(
             if (activeFilters.isNotEmpty()) {
                 Text(
                         "已选：${activeFilters.joinToString(" / ")}",
-                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        color = Color(0xFF00D2FF),
                         fontSize = 12.sp,
                         modifier = Modifier.weight(1f)
                 )
@@ -4633,7 +4640,7 @@ fun HistoryViewScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                        CircularProgressIndicator(color = Color(0xFF00D2FF))
                         Spacer(modifier = Modifier.height(12.dp))
                         Text("加载中...", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp)
                     }
@@ -4738,7 +4745,7 @@ fun HistoryViewScreen(
                     if (isSelectMode) {
                         Text(
                                 "已选 ${selectedIds.size} 项",
-                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                color = Color(0xFF00D2FF),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier
@@ -4769,7 +4776,7 @@ fun HistoryViewScreen(
                                 if (!isSelectMode) selectedIds = emptySet()
                             },
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isSelectMode) tC(Color(0xFF00D2FF), Color(0xFF0086B3)) else tC(Color(0xFF2D2D44), Color(0xFFE9EDF4))
+                                containerColor = if (isSelectMode) Color(0xFF00D2FF) else tC(Color(0xFF2D2D44), Color(0xFFE9EDF4))
                             )
                         ) {
                             Text(
@@ -4838,7 +4845,7 @@ fun HistoryViewScreen(
                                 modifier = Modifier.verticalScroll(rememberScrollState()),
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text("📅 日期范围", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("📅 日期范围", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedTextField(
                                         value = historyStartDate,
@@ -4866,7 +4873,7 @@ fun HistoryViewScreen(
                                 Text(dateError, color = Color(0xFFF44336), fontSize = 12.sp)
                             }
                             
-                            Text("📚 学科", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("📚 学科", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             Row(
                                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -4876,7 +4883,7 @@ fun HistoryViewScreen(
                                         onClick = { subjectFilter = emptySet() },
                                         label = { Text("全部", fontSize = 12.sp) },
                                         colors = FilterChipDefaults.filterChipColors(
-                                                selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                                selectedContainerColor = Color(0xFF00D2FF),
                                                 selectedLabelColor = tC(Color.White, Color(0xFF16181D)),
                                                 labelColor = tC(Color.White, Color(0xFF16181D)),
                                                 containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4))
@@ -4891,7 +4898,7 @@ fun HistoryViewScreen(
                                             },
                                             label = { Text(subj, fontSize = 12.sp) },
                                             colors = FilterChipDefaults.filterChipColors(
-                                                    selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                                    selectedContainerColor = Color(0xFF00D2FF),
                                                     selectedLabelColor = tC(Color.White, Color(0xFF16181D)),
                                                     labelColor = tC(Color.White, Color(0xFF16181D)),
                                                     containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4))
@@ -4900,7 +4907,7 @@ fun HistoryViewScreen(
                                 }
                             }
                             
-                            Text("🎓 年级", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("🎓 年级", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             Row(
                                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -4934,7 +4941,7 @@ fun HistoryViewScreen(
                                 }
                             }
                             
-                            Text("📊 难度", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("📊 难度", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             Row(
                                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -4968,7 +4975,7 @@ fun HistoryViewScreen(
                                 }
                             }
 
-                            Text("📊 掌握程度", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("📊 掌握程度", color = Color(0xFF00D2FF), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             Row(
                                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -5010,7 +5017,7 @@ fun HistoryViewScreen(
                                     showFilterDialog = false
                                     loadHistory()
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                         ) { Text("应用", color = Color.Black, fontWeight = FontWeight.Bold) }
                     },
                     dismissButton = {
@@ -5046,7 +5053,7 @@ fun HistoryRecordCard(
                     checked = isSelected,
                     onCheckedChange = { onClick() },
                     colors = CheckboxDefaults.colors(
-                        checkedColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                        checkedColor = Color(0xFF00D2FF),
                         uncheckedColor = tC(Color.Gray, Color(0xFF5C6470))
                     ),
                     modifier = Modifier.padding(end = 8.dp)
@@ -5137,7 +5144,7 @@ fun HistoryRecordCard(
                             }
                         }
                     }
-                    Text("#$displayIndex", color = tC(Color(0xFF00D2FF).copy(alpha = 0.5f), Color(0xFF0086B3).copy(alpha = 0.5f)), fontSize = 11.sp)
+                    Text("#$displayIndex", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 11.sp)
                 }
                 
                 Spacer(modifier = Modifier.height(6.dp))
@@ -5151,12 +5158,12 @@ fun HistoryRecordCard(
                     ) {
                         record.knowledgePoints.take(3).forEach { kp ->
                             Surface(
-                                color = tC(Color(0xFF00D2FF).copy(alpha = 0.15f), Color(0xFF0086B3).copy(alpha = 0.15f)),
+                                color = Color(0xFF00D2FF).copy(alpha = 0.15f),
                                 shape = RoundedCornerShape(4.dp)
                             ) {
                                 Text(
                                     kp,
-                                    color = tC(Color(0xFF00D2FF).copy(alpha = 0.8f), Color(0xFF0086B3).copy(alpha = 0.8f)),
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.8f),
                                     fontSize = 9.sp,
                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                                 )
@@ -5205,7 +5212,7 @@ fun HistoryRecordCard(
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = plainPreview(record.solutionSteps, 30),
-                        color = tC(Color(0xFF00D2FF).copy(alpha = 0.8f), Color(0xFF0086B3).copy(alpha = 0.8f)),
+                        color = Color(0xFF00D2FF).copy(alpha = 0.8f),
                         fontSize = 12.sp,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
@@ -5215,7 +5222,7 @@ fun HistoryRecordCard(
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     if (isSelectMode) "点击切换选择" else "点击查看详情 ▶",
-                    color = tC(Color(0xFF00D2FF).copy(alpha = 0.6f), Color(0xFF0086B3).copy(alpha = 0.6f)),
+                    color = Color(0xFF00D2FF).copy(alpha = 0.6f),
                     fontSize = 11.sp
                 )
             }
@@ -5361,7 +5368,7 @@ fun HistoryDetailScreen(
                     fontWeight = FontWeight.Bold
                 )
                 
-                Text("#${record.id}", color = tC(Color(0xFF00D2FF).copy(alpha = 0.5f), Color(0xFF0086B3).copy(alpha = 0.5f)), fontSize = 12.sp)
+                Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 12.sp)
             }
         }
         
@@ -5417,12 +5424,12 @@ fun HistoryDetailScreen(
                         ) {
                             record.knowledgePoints.forEach { kp ->
                                 Surface(
-                                    color = tC(Color(0xFF00D2FF).copy(alpha = 0.15f), Color(0xFF0086B3).copy(alpha = 0.15f)),
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.15f),
                                     shape = RoundedCornerShape(4.dp)
                                 ) {
                                     Text(
                                         kp,
-                                        color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                        color = Color(0xFF00D2FF),
                                         fontSize = 12.sp,
                                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                                     )
@@ -5439,7 +5446,7 @@ fun HistoryDetailScreen(
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("📥 原题图片", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text("📥 原题图片", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(6.dp))
                         // 显示原始题目图片（如可用）
                         if (record.imageUrl.isNotEmpty()) {
@@ -5471,7 +5478,7 @@ fun HistoryDetailScreen(
                             Text("📝 识别文本", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
                             Text(
                                     if (showOcrText) "▲ 收起" else "▼ 展开",
-                                    color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                    color = Color(0xFF00D2FF),
                                     fontSize = 12.sp
                             )
                         }
@@ -5494,7 +5501,7 @@ fun HistoryDetailScreen(
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("💡 解题思路", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text("💡 解题思路", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(6.dp))
                         
                         if (showSolutionSteps) {
@@ -5509,7 +5516,7 @@ fun HistoryDetailScreen(
                         ) {
                             Text(
                                 if (showSolutionSteps) "▲ 收起解题思路" else "▼ 展开解题思路",
-                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                color = Color(0xFF00D2FF),
                                 fontSize = 13.sp
                             )
                         }
@@ -5615,7 +5622,7 @@ fun HistoryDetailScreen(
                         shape = RoundedCornerShape(8.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("💬 追问本题", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Text("💬 追问本题", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                         
                         historyQa.forEach { item ->
                             Spacer(modifier = Modifier.height(8.dp))
@@ -5693,9 +5700,9 @@ fun HistoryDetailScreen(
                                     placeholder = { Text("输入你的问题...", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp) },
                                     textStyle = TextStyle(color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp),
                                     colors = OutlinedTextFieldDefaults.colors(
-                                            focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                            focusedBorderColor = Color(0xFF00D2FF),
                                             unfocusedBorderColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)),
-                                            cursorColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3))
+                                            cursorColor = Color(0xFF00D2FF)
                                     ),
                                     singleLine = true,
                                     enabled = !isAsking
@@ -5704,7 +5711,7 @@ fun HistoryDetailScreen(
                             Button(
                                     onClick = { sendHistoryAsk() },
                                     enabled = askInput.isNotBlank() && !isAsking,
-                                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                             ) { Text("发送", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                         }
                     }
@@ -5747,7 +5754,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text("⚙️ 设置", color = tC(Color.White, Color(0xFF16181D)))
-                    TextButton(onClick = onDismiss) { Text("关闭", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3))) }
+                    TextButton(onClick = onDismiss) { Text("关闭", color = Color(0xFF00D2FF)) }
                 }
             },
             text = {
@@ -5924,7 +5931,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                 onValueChange = { viewModel.fontSize.value = it },
                                 valueRange = 12f..28f,
                                 modifier = Modifier.weight(1f),
-                                colors = SliderDefaults.colors(thumbColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                                colors = SliderDefaults.colors(thumbColor = Color(0xFF00D2FF))
                         )
                         Text("大", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 28.sp)
                     }
@@ -6147,7 +6154,7 @@ fun SettingSwitch(
                 checked = checked,
                 onCheckedChange = onCheckedChange,
                 enabled = enabled,
-                colors = SwitchDefaults.colors(checkedThumbColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF00D2FF))
         )
     }
 }
@@ -6157,7 +6164,7 @@ fun darkTextFieldColors() =
         OutlinedTextFieldDefaults.colors(
                 focusedTextColor = tC(Color.White, Color(0xFF16181D)),
                 unfocusedTextColor = tC(Color.White, Color(0xFF16181D)),
-                focusedBorderColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                focusedBorderColor = Color(0xFF00D2FF),
                 unfocusedBorderColor = tC(Color.Gray, Color(0xFF5C6470)),
         )
 
@@ -6232,7 +6239,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         selected = mode,
                         onClick = { viewModel.setPomodoroMode(true) },
                         label = { Text("⏱ 正计时", fontSize = 13.sp) },
-                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF00D2FF))
                     )
                 }
 
@@ -6249,7 +6256,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(15, 25, 45, 60, 90).forEach { min ->
                             TextButton(onClick = { workInput = min.toString() }) {
-                                Text("${min}分", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp)
+                                Text("${min}分", color = Color(0xFF00D2FF), fontSize = 13.sp)
                             }
                         }
                     }
@@ -6266,7 +6273,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     if (recommendReason.isNotEmpty()) {
                         Text(
                                 recommendReason,
-                                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                                color = Color(0xFF00D2FF),
                                 fontSize = 12.sp,
                                 lineHeight = 16.sp
                         )
@@ -6301,7 +6308,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     TextButton(onClick = { viewModel.togglePomodoro() }) {
-                        Text(if (running) "⏸ 暂停" else "▶ 继续", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 14.sp)
+                        Text(if (running) "⏸ 暂停" else "▶ 继续", color = Color(0xFF00D2FF), fontSize = 14.sp)
                     }
                     TextButton(onClick = { viewModel.resetPomodoro() }) {
                         Text("🔄 重置", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp)
@@ -6317,7 +6324,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     viewModel.applyPomodoroSettings(w, r, mode)
                     onDismiss()
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
             ) {
                 Text("✅ 应用", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
             }
@@ -6348,7 +6355,7 @@ fun PomodoroRestScreen(viewModel: MainViewModel) {
             Spacer(modifier = Modifier.height(24.dp))
             Text(
                 formatTime(restTime),
-                color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)),
+                color = Color(0xFF00D2FF),
                 fontSize = 72.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -6361,7 +6368,7 @@ fun PomodoroRestScreen(viewModel: MainViewModel) {
             Spacer(modifier = Modifier.height(32.dp))
             Button(
                 onClick = { viewModel.skipRest() },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
             ) {
                 Text("跳过休息", color = Color.White, fontSize = 16.sp)
             }
@@ -6476,7 +6483,7 @@ fun CountdownConfirmDialog(
                     isCounting = false
                     onConfirm()
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
             ) {
                 Text(
                     if (countdown > 0) "确认(${countdown})" else "确认",
@@ -6521,7 +6528,7 @@ fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
         if (url.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)))
+                    CircularProgressIndicator(color = Color(0xFF00D2FF))
                     Spacer(modifier = Modifier.height(12.dp))
                     Text("正在生成数学图形...", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
                 }
@@ -6587,7 +6594,7 @@ fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
                     webViewRef?.evaluateJavascript("document.body.style.zoom = '1';", null)
                     webViewRef?.reload()
                 }) {
-                    Text("🔄 适应", color = tC(Color(0xFF00D2FF), Color(0xFF0086B3)), fontSize = 13.sp)
+                    Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
                 }
             }
         }
