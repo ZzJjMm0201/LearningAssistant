@@ -184,15 +184,19 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         visionModel = sharedPreferences?.getString(KEY_VISION_MODEL, "") ?: ""
         answerStyle = sharedPreferences?.getString(KEY_ANSWER_STYLE, "formal") ?: "formal"
         searchEnabled = sharedPreferences?.getBoolean(KEY_SEARCH_ENABLED, true) ?: true
-        // 十一 思考模式：新版存字符串 off/on/auto；兼容旧版 bool
-        val tm = sharedPreferences?.getString(KEY_THINKING_ENABLED, null)
-        thinkingMode = when {
-            tm == "on" || tm == "auto" -> tm
-            else -> {
-                val legacyOn = try { sharedPreferences?.getBoolean(KEY_THINKING_ENABLED, false) ?: false } catch (e: Exception) { false }
-                if (legacyOn) "on" else "off"
+        // 十一 思考模式：新版存字符串 off/on/auto；兼容旧版 bool（直接按原始类型取，避免 getString 转换抛 ClassCastException）
+        var tm: String? = null
+        try {
+            sharedPreferences?.let { sp ->
+                val raw = sp.all[KEY_THINKING_ENABLED]
+                tm = when (raw) {
+                    is Boolean -> if (raw) "on" else "off"
+                    is String -> raw
+                    else -> null
+                }
             }
-        }
+        } catch (e: Exception) { tm = null }
+        thinkingMode = if (tm == "on" || tm == "auto") tm else "off"
         themeMode = sharedPreferences?.getString(KEY_THEME_MODE, "system") ?: "system"
         dialect = sharedPreferences?.getString(KEY_DIALECT, "普通话") ?: "普通话"
         grade = sharedPreferences?.getString(KEY_GRADE, "") ?: ""
