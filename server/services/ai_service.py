@@ -173,6 +173,25 @@ class AIService:
         self.qwen_model = APIConfig.QWEN_DEFAULT_LLM
         self.temperature = AI_MODEL["temperature"]
         self.max_tokens = AI_MODEL["max_tokens"]
+        # ⑫ Token 用量累积（每次 solve 流程前 reset，complete 时下发）
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.active_engine = "deepseek"
+        self.active_model = self.model
+
+    def reset_usage(self, engine: Optional[str] = None, model: Optional[str] = None):
+        """⑫ 开始一次解题/追问前清空用量，并记录本次引擎/模型"""
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.active_engine = engine or "deepseek"
+        _, m = self._get_client(engine, model)
+        self.active_model = m
+
+    def get_usage(self) -> Dict:
+        """⑫ 返回当前累积用量 + 引擎/模型名"""
+        return {
+            "engine": self.active_engine,
+            "model": self.active_model,
+            **self.usage,
+        }
     
     def _get_client(self, engine: Optional[str] = None, model: Optional[str] = None):
         """按提供方选择客户端与模型（deepseek / qwen），默认deepseek
@@ -205,6 +224,7 @@ class AIService:
         weak_count: 薄弱知识点数（⑨，detail=auto 时用于决定详细度）
         """
         start_time = time.time()
+        self.reset_usage(engine, model)
         st_ins = style_instruction(style, dialect)
         g_ins = grade_instruction(grade)
         if g_ins:
@@ -397,7 +417,7 @@ class AIService:
         
         # 记录总时间
         elapsed = time.time() - start_time
-        yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages}}
+        yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages, "usage": self.get_usage()}}
     
     def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
                            style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
@@ -637,6 +657,15 @@ class AIService:
                     stream=False,
                 )
                 content = response.choices[0].message.content
+                # ⑫ 累积 token 用量
+                try:
+                    u = response.usage
+                    if u:
+                        self.usage["prompt_tokens"] += getattr(u, "prompt_tokens", 0) or 0
+                        self.usage["completion_tokens"] += getattr(u, "completion_tokens", 0) or 0
+                        self.usage["total_tokens"] += getattr(u, "total_tokens", 0) or 0
+                except Exception:
+                    pass
                 print(f"[AI] 调用成功，返回长度={len(content) if content else 0}")
                 return content if content is not None else ""
             except Exception as e:
@@ -675,6 +704,7 @@ class AIService:
                     temperature=temp,
                     max_tokens=max_tokens or self.max_tokens,
                     stream=True,
+                    stream_options={"include_usage": True},
                 )
                 if thinking_on:
                     kwargs["reasoning_effort"] = "high"
@@ -684,6 +714,15 @@ class AIService:
                 content = ""
                 thinking_done = False
                 for chunk in response:
+                    # ⑫ 流式最后一个 chunk 带 usage
+                    if getattr(chunk, "usage", None):
+                        u = chunk.usage
+                        try:
+                            self.usage["prompt_tokens"] += getattr(u, "prompt_tokens", 0) or 0
+                            self.usage["completion_tokens"] += getattr(u, "completion_tokens", 0) or 0
+                            self.usage["total_tokens"] += getattr(u, "total_tokens", 0) or 0
+                        except Exception:
+                            pass
                     if chunk.choices and chunk.choices[0].delta:
                         delta = chunk.choices[0].delta
                         if hasattr(delta, 'reasoning_content') and delta.reasoning_content:

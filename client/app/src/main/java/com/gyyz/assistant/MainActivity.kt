@@ -114,6 +114,7 @@ sealed class AppState {
             val stepsStreaming: Boolean = false,
             val solutionStreaming: Boolean = false,
             val mindmapStreaming: Boolean = false,
+            val aiUsage: Map<String, String> = emptyMap(),
     ) : AppState()
 
     data class Report(val reportText: String = "", val isLoading: Boolean = true, val streaming: Boolean = false) : AppState()
@@ -582,6 +583,7 @@ class MainViewModel : ViewModel() {
         solveQuestionInfo.value = emptyMap()
         solveThinkingText.value = ""
         solvingThinkingVisible.value = false
+        aiUsage.value = emptyMap()
         // ① 重置多题状态
         multiQuestionCount.value = 0
         multiQuestionTexts.value = emptyList()
@@ -955,6 +957,21 @@ class MainViewModel : ViewModel() {
                                         _statusText.value = json.optString("content", "图片模糊，请重新拍摄")
                                         showOcrConfirmDialog.value = false
                                         _appState.value = AppState.Tracking
+                                    }
+                                    "ai_usage" -> {
+                                        // ⑫ 记录本次AI引擎与token用量
+                                        val engine = json.optString("engine", "")
+                                        val model = json.optString("model", "")
+                                        val pt = json.optLong("prompt_tokens", 0)
+                                        val ct = json.optLong("completion_tokens", 0)
+                                        val tt = json.optLong("total_tokens", 0)
+                                        aiUsage.value = mapOf(
+                                                "engine" to engine,
+                                                "model" to model,
+                                                "prompt_tokens" to pt.toString(),
+                                                "completion_tokens" to ct.toString(),
+                                                "total_tokens" to tt.toString(),
+                                        )
                                     }
                                 }
                             } catch (e: Exception) {
@@ -1407,6 +1424,8 @@ class MainViewModel : ViewModel() {
     // 十一 思考模式：完整解析生成前的思维链文本（显示在完整解析上方）
     val solveThinkingText = MutableStateFlow("")
     val solvingThinkingVisible = MutableStateFlow(false)
+    // ⑫ AI引擎与Token用量（在解题完成时下发，显示在页面）
+    val aiUsage = MutableStateFlow<Map<String, String>>(emptyMap())
     // ②④⑦十一⑧ 设置项（持久化到 ApiService）
     val answerStyle = MutableStateFlow("formal")
     val searchEnabled = MutableStateFlow(true)
@@ -2573,6 +2592,12 @@ fun SolvingScreen(
                 QuestionInfoTags(qInfo)
             }
 
+            // ⑫ AI引擎/Token用量/AI生成标识（题目完成后显示）
+            val usageInfo by (viewModel?.aiUsage ?: MutableStateFlow(emptyMap())).collectAsState()
+            if (usageInfo.isNotEmpty()) {
+                AiUsageFooter(usageInfo)
+            }
+
             if (solveState.solutionSteps.isNotEmpty()) {
                 SolutionCard(
                         title = "💡 解题思路",
@@ -3049,6 +3074,59 @@ fun QuestionInfoTags(qInfo: Map<String, String>) {
                         fontSize = 12.sp
                 )
             }
+        }
+    }
+}
+
+// ==================== ⑫ AI引擎与Token用量 + AI生成标识 ====================
+@Composable
+fun AiUsageFooter(usage: Map<String, String>) {
+    if (usage.isEmpty()) return
+    val engine = usage["engine"].orEmpty()
+    val model = usage["model"].orEmpty()
+    val total = usage["total_tokens"].orEmpty()
+    val prompt = usage["prompt_tokens"].orEmpty()
+    val completion = usage["completion_tokens"].orEmpty()
+    val engineLabel = if (engine == "qwen") "千问(Qwen)" else "DeepSeek"
+    Card(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+            colors = CardDefaults.cardColors(
+                    containerColor = tC(Color(0xFF16213E), Color(0xFFF2F4F8))
+            ),
+            shape = RoundedCornerShape(10.dp)
+    ) {
+        Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                        "⚙️ AI引擎：$engineLabel",
+                        color = tC(Color.White, Color(0xFF16181D)),
+                        fontSize = 12.sp
+                )
+                if (model.isNotEmpty()) {
+                    Text(
+                            model,
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 10.sp
+                    )
+                }
+            }
+            Text(
+                    "Tokens：输入 $prompt · 输出 $completion · 总计 $total",
+                    color = tC(Color.Gray, Color(0xFF5C6470)),
+                    fontSize = 11.sp
+            )
+            Text(
+                    "⚠️ 内容由AI生成，请仔细甄别",
+                    color = tC(Color(0xFFFB8C00), Color(0xFFE65100)),
+                    fontSize = 11.sp
+            )
         }
     }
 }

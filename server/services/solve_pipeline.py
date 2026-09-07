@@ -247,7 +247,11 @@ class SolvePipeline:
             elif stage == "complete":
                 total_time = content.get("total_time", 0)
                 messages = content.get("messages", [])
+                usage = content.get("usage", {})
                 self._emit_event(request_id, "info", f"AI分析完成，耗时{total_time:.1f}s", qi)
+                # ⑫ 转发 AI引擎 + token 用量给客户端
+                if usage:
+                    self._emit_event(request_id, "ai_usage", usage, qi)
 
                 # ========== 阶段4: LaTeX图形渲染 ==========
                 final_solution = ""
