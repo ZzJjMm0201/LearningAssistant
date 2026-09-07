@@ -2754,13 +2754,14 @@ fun SolvingScreen(
             }
 
             if (solveState.mindMap.isNotEmpty()) {
-                SolutionCard(
+                // ② UI 思维导图渲染（层级色点 + 连线）
+                MindMapCard(
+                        mindMap = solveState.mindMap,
                         title = "🗺️ 思维导图",
-                        content = solveState.mindMap,
                         color = Color(0xFF00C853),
-                        fontSize = solvingFontSize,
                         initiallyCollapsed = !showModules.getOrDefault("mind_map", true),
-                        streaming = solveState.mindmapStreaming
+                        streaming = solveState.mindmapStreaming,
+                        fontSize = solvingFontSize
                 )
             }
 
@@ -3261,6 +3262,133 @@ fun SolutionCard(
                     )
                 } else {
                     MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
+                }
+            }
+        }
+    }
+}
+
+// ==================== ② 思维导图 UI 渲染 ====================
+// 层级色板（随深度循环）
+private val MIND_COLORS = listOf(
+    Color(0xFFFFD54F),  // 根：金黄
+    Color(0xFF00E5FF),  // 层1：青
+    Color(0xFF69F0AE),  // 层2：绿
+    Color(0xFFFF8A80),  // 层3：红
+    Color(0xFFB388FF),  // 层4：紫
+    Color(0xFFFFD740),  // 层5：黄
+)
+
+// 解析思维导图缩进树：每行 -> (level, 正文)
+private fun parseMindTree(text: String): List<Pair<Int, String>> {
+    val out = mutableListOf<Pair<Int, String>>()
+    if (text.isBlank()) return out
+    // 若 AI 包了 ``` 围栏，先去掉首尾
+    var t = text.replace("```", "")
+    val lines = t.split("\n")
+    for (raw in lines) {
+        val line = raw.trimEnd()
+        if (line.isBlank()) { continue }
+        // 计算缩进层级：以每 2 个空格为一档，树符号也算前级并抹掉
+        var level = 0
+        var idx = 0
+        while (idx < line.length && (line[idx] == ' ')) { level += (if (line[idx] == ' ') 1 else 0); idx++ }
+        // 树形连字符前缀（├ └ │ ─）不占内容，但它们出现在最前（缩进后）——把整体缩进统一成“空格数/2 向上取整”档
+        level = (idx / 2).coerceAtLeast(0)
+        var body = line.substring(idx).trimStart('│', '├', '└', '━', '─', '┌', '┐', '│', ' ')
+        body = body.trim().trim('─').trimStart('─').trim()
+        if (body.isEmpty()) continue
+        out.add(Pair(level, body))
+    }
+    if (out.isEmpty()) return out
+    // 让最小层级归零
+    val minLv = out.minOf { it.first }
+    return out.map { Pair(it.first - minLv, it.second) }
+}
+
+// 把文本行内 ### / ** 等 markdown 残留去掉，便于标签显示
+private fun cleanMindText(s: String): String {
+    return s.trimStart('#', '*', '-', ' ').trim().replace(Regex("^[-*_]+"), "").trim()
+}
+
+private fun colorForLv(lv: Int): Color = MIND_COLORS[lv % MIND_COLORS.size]
+
+@Composable
+fun MindMapView(content: String, fontSize: Float = 17f) {
+    val nodes = remember(content) { parseMindTree(content) }
+    if (nodes.isEmpty()) {
+        // 失败则退回纯文本
+        Text(content, color = tC(Color.White, Color(0xFF16181D)), fontSize = fontSize.sp)
+        return
+    }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        nodes.forEach { (lv, body) ->
+            val bg = if (lv == 0) tC(Color(0xFF26324A), Color(0xFFF0F3F7)) else Color.Transparent
+            Surface(
+                color = bg,
+                shape = if (lv == 0) RoundedCornerShape(10.dp) else RoundedCornerShape(0.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = (if (lv == 0) 8 else 6 + lv * 14).dp, vertical = (if (lv == 0) 8 else 3).dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (lv > 0) {
+                        // 竖向连接条
+                        Box(
+                            Modifier
+                                .width(2.dp)
+                                .height(16.dp)
+                                .background(colorForLv(lv))
+                                .padding(end = 4.dp)
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .size(if (lv == 0) 12.dp else 8.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(colorForLv(lv))
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        cleanMindText(body),
+                        color = if (lv == 0) tC(Color.White, Color(0xFF16181D)) else colorForLv(lv),
+                        fontSize = if (lv == 0) (fontSize + 3).sp else fontSize.sp,
+                        fontWeight = if (lv == 0) FontWeight.Bold else FontWeight.Normal
+                    )
+                }
+            }
+        }
+    }
+}
+
+// 思维导图卡片（用 UI 树形渲染，而非纯文本）
+@Composable
+fun MindMapCard(mindMap: String, title: String = "🗺️ 思维导图", color: Color = Color(0xFF00C853), initiallyCollapsed: Boolean = false, streaming: Boolean = false, fontSize: Float = 17f) {
+    var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF)))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(title, color = color, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                if (!streaming) {
+                    Text(text = if (expanded) "▲" else "▼", color = color.copy(alpha = 0.7f), fontSize = 14.sp)
+                }
+            }
+            if (expanded) {
+                Spacer(Modifier.height(10.dp))
+                if (streaming) {
+                    Text(mindMap, color = tC(Color.White, Color(0xFF16181D)), fontSize = fontSize.sp, lineHeight = (fontSize * 1.35f).sp)
+                } else {
+                    MindMapView(mindMap, fontSize = fontSize)
                 }
             }
         }
