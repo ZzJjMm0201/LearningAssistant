@@ -57,6 +57,7 @@ from server.services.solve_pipeline import solve_pipeline
 from server.services.animation_service import generate_animation
 from server.services.ocr_service import ocr_service
 from server.services.auth_service import register, login, get_user_by_token, verify_token
+from server.services.permission_service import can_use_ai, RESTRICTED_MSG
 
 # ==================== MiKTeX 环境设置 ====================
 
@@ -283,6 +284,11 @@ def get_weak_count(user_id: Optional[int]) -> int:
 
 @app.post("/solve")
 async def solve_problem(request: Request, file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     request_id = str(uuid.uuid4())
     
     image_path = HISTORY_DIR / f"{request_id}.jpg"
@@ -325,6 +331,11 @@ class SolveTextRequest(BaseModel):
 
 @app.post("/solve/text")
 async def solve_text(request: Request, body: SolveTextRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """⑧ 文字输入解题：跳过OCR与分题，直接解题"""
     request_id = str(uuid.uuid4())
     text = (body.text or "").strip()
@@ -419,6 +430,11 @@ async def get_svg(rest_of_path: str):
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """多轮对话 - 继续提问（从数据库加载该会话的历史上下文）"""
     db = SessionLocal()
     try:
@@ -448,6 +464,11 @@ async def ask_question(request: AskRequest):
 
 @app.post("/ask/stream")
 async def ask_question_stream(request: Request, body: AskRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        raise HTTPException(status_code=403, detail=_perm_err.get("message", "AI使用受限"))
+
     """多轮对话 - 继续提问（SSE流式，回答与AI解题同样式）"""
     db = SessionLocal()
     try:
@@ -526,6 +547,11 @@ async def ask_question_stream(request: Request, body: AskRequest):
 
 @app.post("/animation")
 async def create_animation(file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """生成AI动画"""
     request_id = str(uuid.uuid4())
     # 保存图片（最长边压缩至1000像素以下，便于后续OCR）
@@ -600,6 +626,11 @@ async def data_report(request: Request, body: ReportRequest):
 
 @app.post("/report/ai")
 async def ai_report(request: Request, body: ReportRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """生成AI版学情报告（非流式，兼容旧客户端）；⑦ 规定时段题目 <5 题则不生成"""
     db = SessionLocal()
     try:
@@ -635,6 +666,11 @@ async def ai_report(request: Request, body: ReportRequest):
 
 @app.post("/report/ai/stream")
 async def ai_report_stream(request: Request, body: ReportRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        raise HTTPException(status_code=403, detail=_perm_err.get("message", "AI使用受限"))
+
     """生成AI版学情报告（SSE流式）；⑦ 规定时段题目 <5 题则不生成"""
     db = SessionLocal()
     try:
@@ -715,6 +751,11 @@ async def get_export_file(filename: str):
 
 @app.post("/pomodoro/recommend")
 async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """番茄钟 AI 推荐做题时长：基于题目图片/文字+学情，返回 {duration_minutes, reason}"""
     import re as _re
     try:
@@ -774,6 +815,11 @@ async def get_history_image(filename: str):
 
 @app.post("/extend")
 async def knowledge_extension(request: Request, file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """知识延伸"""
     request_id = str(uuid.uuid4())
     image_path = HISTORY_DIR / f"{request_id}.jpg"
@@ -1189,6 +1235,49 @@ async def health_check():
 
 # ==================== 用户认证辅助 ====================
 
+def _resolve_user(request: Request):
+    """解析 token -> (user_id, username, is_admin)，未登录返回 (None,None,False)"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            uid = verify_token(token)
+            if uid is not None:
+                try:
+                    db = SessionLocal()
+                    try:
+                        user = db.query(User).filter(User.id == uid).first()
+                        if user:
+                            return uid, user.username, bool(user.is_admin)
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+                return uid, None, False
+        except Exception:
+            return None, None, False
+    return None, None, False
+
+
+def _ai_denied_response(username: str, is_admin: bool):
+    """返回 (error 字典, None) / (None, allowed_bool) 结构"""
+    if can_use_ai(username, is_admin):
+        return None, False
+    return ({"status": "error", "code": 403,
+             "message": RESTRICTED_MSG}, True)
+
+
+# ⑮ AI类端点：受限则拒（新账号默认False；管理员/白名单放行）
+def check_ai_permission(request: Request):
+    """受限时返回 {"status":"error","code":403,"message":...}，否则返回 None"""
+    _, username, is_admin = _resolve_user(request)
+    err, denied = _ai_denied_response(username, is_admin) if username is not None else (None, False)
+    if username is None:
+        # 未登录仍沿用旧行为（透传受服务端登录保护），不额外拦截
+        return None
+    return err if denied else None
+
+
 def get_current_user(request: Request) -> Optional[int]:
     """从 Authorization: Bearer <token> 解析当前用户ID；未登录返回 None"""
     auth = request.headers.get("Authorization", "")
@@ -1235,6 +1324,11 @@ class GeoGebraRequest(BaseModel):
 
 @app.post("/geogebra")
 async def generate_geogebra(request: Request, body: GeoGebraRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
     """Feature 20: 生成GeoGebra图形（AI生成命令 + 官方GeoGebra Applet页面）"""
     try:
         prompt = f"""请根据以下数学题目内容，生成可以在GeoGebra中输入的命令。
