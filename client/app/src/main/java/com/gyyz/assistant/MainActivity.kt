@@ -38,6 +38,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 
 import androidx.compose.runtime.*
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -1739,7 +1743,18 @@ class MainActivity : ComponentActivity() {
                 val gestureRecognizer by gestureRecognizerState.collectAsState()
                 val cameraRebind by cameraRebindTrigger.collectAsState()
                 val cameraReady by isCameraReady.collectAsState()
+                // ⑬ 全局字体倍率：以 fontScale 全局放大所有 .sp 文字（含按钮/标题）
+                val _sysFontScale = LocalDensity.current.fontScale
+                val _fontSizeState by themeVm.fontSize.collectAsState()
+                val _extraScale = (_fontSizeState / 16f).coerceAtLeast(0.6f)
 
+                CompositionLocalProvider(
+                        LocalExtraFontScale provides _extraScale,
+                        LocalDensity provides Density(
+                                density = LocalDensity.current.density,
+                                fontScale = _sysFontScale * _extraScale
+                        )
+                ) {
                 MainScreen(
                     hasCameraPermission = hasCameraPerm,
                     gestureRecognizer = gestureRecognizer,
@@ -1756,6 +1771,7 @@ class MainActivity : ComponentActivity() {
                     },
                     isCameraReady = cameraReady
                 )
+                }
             }
         }
     }
@@ -3227,6 +3243,7 @@ fun SolutionCard(
     initiallyCollapsed: Boolean = false,
     streaming: Boolean = false,
 ) {
+    val m = LocalExtraFontScale.current
     var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
     Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -3257,8 +3274,8 @@ fun SolutionCard(
                     ColorText(
                             text = content,
                             color = tC(Color.White, Color(0xFF16181D)),
-                            fontSize = fontSize.sp,
-                            lineHeight = (fontSize * 1.4f).sp
+                            fontSize = (fontSize / m).sp,
+                            lineHeight = ((fontSize * 1.4f) / m).sp
                     )
                 } else {
                     MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
@@ -3270,6 +3287,9 @@ fun SolutionCard(
 
 // ==================== ② 思维导图 UI 渲染 ====================
 // 层级色板（随深度循环）
+// 全局字体倍率：用于抵消内容卡片内部 float->.sp 的二次缩放
+val LocalExtraFontScale = staticCompositionLocalOf { 1f }
+
 private val MIND_COLORS = listOf(
     Color(0xFFFFD54F),  // 根：金黄
     Color(0xFF00E5FF),  // 层1：青
@@ -3315,10 +3335,11 @@ private fun colorForLv(lv: Int): Color = MIND_COLORS[lv % MIND_COLORS.size]
 
 @Composable
 fun MindMapView(content: String, fontSize: Float = 17f) {
+    val m = LocalExtraFontScale.current
     val nodes = remember(content) { parseMindTree(content) }
     if (nodes.isEmpty()) {
         // 失败则退回纯文本
-        Text(content, color = tC(Color.White, Color(0xFF16181D)), fontSize = fontSize.sp)
+        Text(content, color = tC(Color.White, Color(0xFF16181D)), fontSize = (fontSize / m).sp)
         return
     }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -3355,7 +3376,7 @@ fun MindMapView(content: String, fontSize: Float = 17f) {
                     Text(
                         cleanMindText(body),
                         color = if (lv == 0) tC(Color.White, Color(0xFF16181D)) else colorForLv(lv),
-                        fontSize = if (lv == 0) (fontSize + 3).sp else fontSize.sp,
+                        fontSize = if (lv == 0) ((fontSize + 3) / m).sp else (fontSize / m).sp,
                         fontWeight = if (lv == 0) FontWeight.Bold else FontWeight.Normal
                     )
                 }
@@ -3367,6 +3388,7 @@ fun MindMapView(content: String, fontSize: Float = 17f) {
 // 思维导图卡片（用 UI 树形渲染，而非纯文本）
 @Composable
 fun MindMapCard(mindMap: String, title: String = "🗺️ 思维导图", color: Color = Color(0xFF00C853), initiallyCollapsed: Boolean = false, streaming: Boolean = false, fontSize: Float = 17f) {
+    val m = LocalExtraFontScale.current
     var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -3386,7 +3408,7 @@ fun MindMapCard(mindMap: String, title: String = "🗺️ 思维导图", color: 
             if (expanded) {
                 Spacer(Modifier.height(10.dp))
                 if (streaming) {
-                    Text(mindMap, color = tC(Color.White, Color(0xFF16181D)), fontSize = fontSize.sp, lineHeight = (fontSize * 1.35f).sp)
+                    Text(mindMap, color = tC(Color.White, Color(0xFF16181D)), fontSize = (fontSize / m).sp, lineHeight = ((fontSize * 1.35f) / m).sp)
                 } else {
                     MindMapView(mindMap, fontSize = fontSize)
                 }
@@ -6415,7 +6437,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     }
 
                     Text(
-                            "📝 字体大小: ${fontSize.toInt()}sp",
+                            "📝 全局字号 ×${(fontSize / 16f).toString().take(4)}（整App文字）",
                             color = tC(Color.White, Color(0xFF16181D)),
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
@@ -6438,7 +6460,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                     Text(
                         "预览文字 ABC 123 学习助手",
                         color = tC(Color.White, Color(0xFF16181D)),
-                        fontSize = fontSize.sp,
+                        fontSize = (fontSize / LocalExtraFontScale.current).sp,
                         modifier = Modifier.padding(vertical = 4.dp)
                     )
 
