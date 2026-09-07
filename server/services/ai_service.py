@@ -37,10 +37,45 @@ ANSWER_STYLES: Dict[str, Dict] = {
 DEFAULT_STYLE = "formal"
 
 # ④ 可选择的方言名称（③ 风格选“方言”后二级选择）
-DIALECTS = ["四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话"]
+DIALECTS = ["普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话"]
+DEFAULT_DIALECT = "普通话"
 
 # ④ 年级候选（设置中选，投给AI时可影响讲解深度）
 GRADES = ["小学", "初中", "高中", "考研"]
+
+# ==================== ⑨ 人格（MBTI 16 型老师风格） ====================
+PERSONALITIES: Dict[str, str] = {
+    "INTJ": "像一位缜密渊博的学者：逻辑严密、提纲挈领，先给出底层原理再推导结论，善用结构化框架。",
+    "INTP": "像一位爱追根问底的理论家：喜欢从第一性原理出发，指出多种开放的思路，鼓励学生自己再深入。",
+    "ENTJ": "像一位雷厉风行的教练：目标导向、直击要害，善用总结和下一步行动建议推动学生前进。",
+    "ENTP": "像一位脑洞大开的辩手：不断抛出反例和类比，多角度思辨，让学生看到问题的另一面。",
+    "INFJ": "像一位温柔坚定的导师：循循善诱，关注学生的情绪和信心，善于启发式提问。",
+    "INFP": "像一位理想主义的诗人：用故事和隐喻讲透概念，重视价值观和内在意义。",
+    "ENFJ": "像一位热情的组织者：感染力强，擅长激励和带动学习氛围，把复杂问题拆解得很有节奏。",
+    "ENFP": "像一位好奇的探险家：热情洋溢，用新鲜的角度激发兴趣，让学习变得有趣。",
+    "ISTJ": "像一位严谨负责的教务主任：重规矩和步骤，强调规范、公式和必背要点。",
+    "ISFJ": "像一位细心耐心的辅导员：温和稳重，反复强调基础，宁可多举例也要确保学生懂。",
+    "ESTJ": "像一位循规蹈矩的管理者：强调纪律、流程和标准答案，把步骤列为清晰的清单。",
+    "ESFJ": "像一位贴心的班主任：亲和力强，关心学生的掌握情况，及时鼓励和纠正。",
+    "ISTP": "像一位动手派的工程师：喜欢用实际操作和具体例子，从“怎么用”切入。",
+    "ISFP": "像一位安静的体验派老师：温柔随和，重视直观感受和图形化的理解。",
+    "ESTP": "像一位果断的行动家：直截了当，喜欢用“试试看”的方式，强调快速上手。",
+    "ESFP": "像一位活泼的表演者：生动热情，用肢体语言一样的描述让抽象概念变得鲜活。",
+}
+
+# ⑨ 各学科推荐的 MBTI 老师风格（auto 时按学科选择）
+SUBJECT_PERSONALITY: Dict[str, str] = {
+    "数学": "INTP", "物理": "INTP", "化学": "ISTJ", "生物": "ISFJ",
+    "语文": "INFJ", "英语": "ENFJ", "历史": "ISTJ", "地理": "ISFP",
+    "政治": "ESTJ", "通用": "ENTJ",
+}
+
+# ⑨ 详细度三档 + 自动
+DETAIL_LEVELS = {
+    "very_detailed": {"label": "非常细", "instruction": "详细度：非常细。逐步骤展开推导，关键步骤都给出理由和中间结果，适当时补充易错提醒和多种解法。"},
+    "detailed": {"label": "较细", "instruction": "详细度：较细。步骤完整但不过分展开，关键结论说明依据，保留必要推导。"},
+    "brief": {"label": "简略", "instruction": "详细度：简略。只保留核心思路、关键公式和结论，不展开琐碎推导。"},
+}
 
 # ==================== 重点颜色标记（⑥：[[#RRGGBB]]…[[#RRGGBB]]，深浅背景均可读） ====================
 COLOR_RULES = """【重点颜色标记（重要）】
@@ -67,8 +102,42 @@ def style_instruction(style: Optional[str], dialect: str = "") -> str:
     if style == "dialect" and dialect:
         instr = instr.replace("{方言}", dialect)
     elif style == "dialect":
-        instr = instr.replace("{方言}", "四川话")
+        instr = instr.replace("{方言}", "普通话")
     return instr
+
+
+def personality_instruction(personality: Optional[str], subject: str = "") -> str:
+    """⑨ 人格：MBTI 16型或 auto（自动按学科推荐）。返回附加 instruction"""
+    p = (personality or "").strip()
+    if not p or p == "none":
+        return ""
+    if p == "auto":
+        subj = (subject or "通用").strip()
+        for key, mbti in SUBJECT_PERSONALITY.items():
+            if key in subj:
+                p = mbti
+                break
+        else:
+            p = SUBJECT_PERSONALITY["通用"]
+    desc = PERSONALITIES.get(p.upper())
+    if not desc:
+        return ""
+    return f"（讲师人格：{desc}请以这种老师的口吻和方式讲解，但内容必须准确、严谨。）"
+
+
+def detail_instruction(detail: Optional[str], weak_count: int = 0) -> str:
+    """⑨ 详细度：very_detailed/detailed/brief/auto（auto 按薄弱知识点数，1~2个→较细，>2个→非常细）"""
+    d = (detail or "auto").strip()
+    if d == "auto":
+        # 不完全匹配比较薄弱知识点（weak_count 由外部传入）
+        if weak_count > 2:
+            d = "very_detailed"
+        elif weak_count >= 1:
+            d = "detailed"
+        else:
+            return ""  # 无薄弱知识点时用默认
+    lv = DETAIL_LEVELS.get(d)
+    return lv["instruction"] if lv else ""
 
 
 def style_temperature(style: Optional[str]) -> Optional[float]:
@@ -119,7 +188,8 @@ class AIService:
         return (engine or "deepseek") != "qwen"
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
-                             style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "") -> Generator[Dict, None, None]:
+                             style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "",
+                             personality: Optional[str] = None, subject: str = "", detail: Optional[str] = None, weak_count: int = 0) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
@@ -129,14 +199,25 @@ class AIService:
         dialect: 方言名称（③，style=dialect 时生效）
         grade: 年级（④，影响讲解深度）
         thinking: 是否开启思考模式（十一，仅作用于“完整解析”阶段，思考内容经 thinking_chunk 下发）
+        personality: 人格MBTI类型或auto（⑨）
+        subject: 学科（⑧，personality=auto 时用于推荐）
+        detail: 详细度 very_detailed/detailed/brief/auto（⑨）
+        weak_count: 薄弱知识点数（⑨，detail=auto 时用于决定详细度）
         """
         start_time = time.time()
         st_ins = style_instruction(style, dialect)
         g_ins = grade_instruction(grade)
         if g_ins:
             st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
+        p_ins = personality_instruction(personality, subject)
+        if p_ins:
+            st_ins = (st_ins + "\n" + p_ins) if st_ins else p_ins
+        d_ins = detail_instruction(detail, weak_count)
+        if d_ins:
+            st_ins = (st_ins + "\n" + d_ins) if st_ins else d_ins
         st_temp = style_temperature(style)
-        use_thinking = thinking and self._thinking_supported(engine)
+        thinking_auto = (thinking == "auto")
+        use_thinking = (thinking is True) and self._thinking_supported(engine)
         
         # 构建系统提示（含风格 + 颜色标记规则）
         system_prompt = self._build_system_prompt(ocr_text, search_result)
@@ -163,7 +244,30 @@ class AIService:
         messages.append({"role": "user", "content": info_prompt})
         info_response = self._call_api(messages, engine=engine, model=model)
         question_info = self._parse_json_response(info_response)
-        
+
+        # ⑨ 从 question_info 提取学科与难度，用于 auto 判定
+        info_subject = (question_info or {}).get("subject", "") if isinstance(question_info, dict) else ""
+        info_difficulty = (question_info or {}).get("difficulty", "") if isinstance(question_info, dict) else ""
+
+        # ⑨ 人格 auto：用题目实际学科重算（info_subject 优先）
+        if (personality or "").strip() == "auto":
+            eff_subj = info_subject or subject or ""
+            p_ins = personality_instruction("auto", eff_subj)
+            # 重建 st_ins（去旧 p_ins，加新 p_ins）
+            st_ins = style_instruction(style, dialect)
+            if g_ins:
+                st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
+            if p_ins:
+                st_ins = (st_ins + "\n" + p_ins) if st_ins else p_ins
+            if d_ins:
+                st_ins = (st_ins + "\n" + d_ins) if st_ins else d_ins
+
+        # ⑨ 详细度 auto：需薄弱知识点数（weak_count 已由外部传入）——d_ins 在 info 前已按 weak_count 算好，无需重算
+
+        # ⑨ 思考 auto：难度为“较难/难”时开启
+        if thinking_auto:
+            use_thinking = (info_difficulty in ("较难", "难")) and self._thinking_supported(engine)
+
         yield {"stage": "info", "content": question_info}
         
         # === 第二阶段：解题思路 ===

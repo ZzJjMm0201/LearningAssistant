@@ -213,11 +213,32 @@ def get_answer_style(request: Request) -> Optional[str]:
     return s if s in ("formal", "plain", "concise", "lively", "dialect") else None
 
 
+def get_personality(request: Request) -> Optional[str]:
+    """⑨ 人格（X-Personality头：MBTI类型如INTJ，或auto）"""
+    import urllib.parse
+    v = (request.headers.get("X-Personality") or "").strip()
+    return urllib.parse.unquote(v) or None
+
+
+def get_detail(request: Request) -> Optional[str]:
+    """⑨ 详细度（X-Detail头：very_detailed/detailed/brief/auto）"""
+    v = (request.headers.get("X-Detail") or "").strip().lower()
+    return v if v in ("very_detailed", "detailed", "brief", "auto") else None
+
+
+def get_subject(request: Request) -> str:
+    """⑨ 学科（X-Subject头，用于personality=auto时推荐老师人格）"""
+    import urllib.parse
+    v = (request.headers.get("X-Subject") or "").strip()
+    return urllib.parse.unquote(v)
+
+
 def get_dialect(request: Request) -> str:
     """③ 方言名称（X-Dialect头，style=dialect 时生效；客户端URL编码，这里解码）"""
     import urllib.parse
     v = (request.headers.get("X-Dialect") or "").strip()
-    return urllib.parse.unquote(v)
+    v = urllib.parse.unquote(v)
+    return v or "普通话"
 
 
 def get_grade(request: Request) -> str:
@@ -227,9 +248,12 @@ def get_grade(request: Request) -> str:
     return urllib.parse.unquote(v)
 
 
-def get_thinking_enabled(request: Request) -> bool:
-    """十一 思考模式（X-Thinking头：1/true/on 开启；仅DeepSeek链路生效）"""
+def get_thinking_enabled(request: Request):
+    """十一 思考模式（X-Thinking头：1/true/on 开启；auto 自动按难度；仅DeepSeek链路生效）
+    返回 True / False / "auto"""
     v = (request.headers.get("X-Thinking") or "").strip().lower()
+    if v == "auto":
+        return "auto"
     return v in ("1", "true", "yes", "on")
 
 
@@ -237,6 +261,25 @@ def get_search_enabled(request: Request) -> bool:
     """④ 搜题开关（X-Search-Enabled头：0/false/off 关闭；默认开启）"""
     v = (request.headers.get("X-Search-Enabled") or "").strip().lower()
     return v not in ("0", "false", "off", "no")
+
+
+def get_weak_count(user_id: Optional[int]) -> int:
+    """⑨ 薄弱知识点数（mastery_records 中未完全掌握的数量，用于 detail=auto 时决定详细度）"""
+    try:
+        mastery_dir = HISTORY_DIR / "mastery_records"
+        if not mastery_dir.exists():
+            return 0
+        weak = 0
+        for f in mastery_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("user_id") == user_id and data.get("mastery_level") in ("not_mastered", "partially_mastered"):
+                    weak += 1
+            except Exception:
+                continue
+        return weak
+    except Exception:
+        return 0
 
 @app.post("/solve")
 async def solve_problem(request: Request, file: UploadFile = File(...)):
@@ -248,11 +291,12 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
     save_uploaded_image(content, image_path)
     
     # 用同一个 request_id 启动流程；传入请求Host用于构造LaTeX图片URL，user_id用于数据隔离
+    _user_id = get_current_user(request)
     solve_pipeline.start_solve(
         image_path=image_path,
         session_id=request_id,  # ← 传入相同ID
         base_host=request.headers.get("host") or None,
-        user_id=get_current_user(request),
+        user_id=_user_id,
         engine=get_engine(request),
         ocr_mode=get_ocr_mode(request),
         vision_model=get_vision_model(request),
@@ -262,6 +306,10 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         search_enabled=get_search_enabled(request),
         dialect=get_dialect(request),
         grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
     )
     
     return {

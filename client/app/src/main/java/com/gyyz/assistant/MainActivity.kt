@@ -287,10 +287,13 @@ class MainViewModel : ViewModel() {
         // ②④⑦十一 扩展设置同步
         answerStyle.value = apiService.answerStyle
         searchEnabled.value = apiService.searchEnabled
-        thinkingEnabled.value = apiService.thinkingEnabled
+        thinkingMode.value = apiService.thinkingMode
         themeMode.value = apiService.themeMode
         dialect.value = apiService.dialect
         grade.value = apiService.grade
+        personality.value = apiService.personality
+        detail.value = apiService.detail
+        subject.value = apiService.subject
         if (apiService.isLoggedIn()) {
             _isLoggedIn.value = true
             _loggedInUsername.value = apiService.getUsername() ?: ""
@@ -1404,24 +1407,32 @@ class MainViewModel : ViewModel() {
     // 十一 思考模式：完整解析生成前的思维链文本（显示在完整解析上方）
     val solveThinkingText = MutableStateFlow("")
     val solvingThinkingVisible = MutableStateFlow(false)
-    // ②④⑦十一 设置项（持久化到 ApiService）
+    // ②④⑦十一⑧ 设置项（持久化到 ApiService）
     val answerStyle = MutableStateFlow("formal")
     val searchEnabled = MutableStateFlow(true)
-    val thinkingEnabled = MutableStateFlow(false)
+    val thinkingMode = MutableStateFlow("off")   // off / on / auto
     val themeMode = MutableStateFlow("system")   // system / light / dark
     // ③ 方言 / ④ 年级
-    val dialect = MutableStateFlow("四川话")
+    val dialect = MutableStateFlow("普通话")
     val grade = MutableStateFlow("")
+    // ⑧ 人格 / 详细度 / 学科
+    val personality = MutableStateFlow("auto")
+    val detail = MutableStateFlow("auto")
+    val subject = MutableStateFlow("")
 
     fun saveExtraSettings() {
         apiService.saveExtraSettings(
             answerStyle.value, searchEnabled.value,
-            thinkingEnabled.value, themeMode.value
+            thinkingMode.value, themeMode.value
         )
     }
 
     fun saveDialectGrade() {
         apiService.saveDialectGrade(dialect.value, grade.value)
+    }
+
+    fun savePersonalityDetail() {
+        apiService.savePersonalityDetail(personality.value, detail.value, subject.value)
     }
 
     // ① 多题切换：切换到指定题目页
@@ -5741,10 +5752,13 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     // ②④十一⑦ 扩展设置
     val answerStyle by viewModel.answerStyle.collectAsState()
     val searchEnabled by viewModel.searchEnabled.collectAsState()
-    val thinkingEnabled by viewModel.thinkingEnabled.collectAsState()
+    val thinkingMode by viewModel.thinkingMode.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
     val dialect by viewModel.dialect.collectAsState()
     val grade by viewModel.grade.collectAsState()
+    val personality by viewModel.personality.collectAsState()
+    val detail by viewModel.detail.collectAsState()
+    val subject by viewModel.subject.collectAsState()
 
     AlertDialog(
             onDismissRequest = onDismiss,
@@ -5824,7 +5838,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            listOf("四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话").forEach { d ->
+                            listOf("普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话").forEach { d ->
                                 FilterChip(
                                         selected = dialect == d,
                                         onClick = {
@@ -5868,6 +5882,114 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         }
                     }
 
+                    // ⑧ 人格（MBTI 16 型老师风格，自动按学科推荐）
+                    Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
+                    Text(
+                            "👤 老师人格（MBTI）",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    // “自动” + 当前选中的 MBTI 类型（由一个一键“自动”与其他四个字母轴决定）
+                    Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        FilterChip(
+                                selected = personality == "auto",
+                                onClick = {
+                                    viewModel.personality.value = "auto"
+                                    viewModel.savePersonalityDetail()
+                                },
+                                label = { Text("自动（按学科）", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF00ACC1)
+                                )
+                        )
+                        FilterChip(
+                                selected = personality != "auto",
+                                onClick = {
+                                    // 从默认 INTJ 开始手动选择
+                                    if (viewModel.personality.value == "auto") viewModel.personality.value = "INTJ"
+                                    viewModel.savePersonalityDetail()
+                                },
+                                label = { Text(if (personality == "auto") "手动选择…" else personality, fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF7B2FBE)
+                                )
+                        )
+                    }
+                    // 四个维度二选一（仅手动模式下显示）
+                    if (personality != "auto") {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(
+                                    "外向E / 内向I" to listOf("E", "I"),
+                                    "实感S / 直觉N" to listOf("S", "N"),
+                                    "理智T / 情感F" to listOf("T", "F"),
+                                    "计划J / 灵活P" to listOf("J", "P"),
+                            ).forEach { (title, pair) ->
+                                Column {
+                                    Text(title, color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 11.sp)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        pair.forEach { letter ->
+                                            FilterChip(
+                                                    selected = personality.contains(letter),
+                                                    onClick = {
+                                                        // 替换对应维度字母
+                                                        val cur = viewModel.personality.value.ifEmpty { "XXXX" }
+                                                        val idx = when (pair[0]) {
+                                                            "E" -> 0; "S" -> 1; "T" -> 2; else -> 3
+                                                        }
+                                                        val arr = cur.toCharArray()
+                                                        if (arr.size > idx) arr[idx] = letter[0]
+                                                        viewModel.personality.value = String(arr)
+                                                        viewModel.savePersonalityDetail()
+                                                    },
+                                                    label = { Text(letter, fontSize = 12.sp) },
+                                                    colors = FilterChipDefaults.filterChipColors(
+                                                            selectedContainerColor = Color(0xFF7B2FBE)
+                                                    )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text(
+                            "自动将按学科推荐合适类型的老师风格（如数学→INTP、语文→INFJ）",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
+                    )
+
+                    // ⑧ 详细度（自动按薄弱知识点数决定）
+                    Text(
+                            "📐 详细度",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("auto" to "自动", "very_detailed" to "非常细", "detailed" to "较细", "brief" to "简略").forEach { (id, label) ->
+                            FilterChip(
+                                    selected = detail == id,
+                                    onClick = {
+                                        viewModel.detail.value = id
+                                        viewModel.savePersonalityDetail()
+                                    },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF4CAF50)
+                                    )
+                            )
+                        }
+                    }
+                    Text(
+                            "自动：涉及1~2个薄弱知识点用“较细”，2个以上用“非常细”",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
+                    )
+
                     // ④ 搜题开关
                     SettingSwitch(
                             title = "🔍 题库搜索",
@@ -5879,15 +6001,32 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                             }
                     )
 
-                    // 十一 思考模式开关（仅作用于完整解析，DeepSeek链路）
-                    SettingSwitch(
-                            title = "🧠 思考模式",
-                            subtitle = "生成完整解析前先输出思考过程（显示在完整解析上方）",
-                            checked = thinkingEnabled,
-                            onCheckedChange = {
-                                viewModel.thinkingEnabled.value = it
-                                viewModel.saveExtraSettings()
-                            }
+                    // 十一 思考模式（off/on/auto；auto 按难度“较难/难”自动开启）
+                    Text(
+                            "🧠 思考模式",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("off" to "关闭", "on" to "开启", "auto" to "自动").forEach { (id, label) ->
+                            FilterChip(
+                                    selected = thinkingMode == id,
+                                    onClick = {
+                                        viewModel.thinkingMode.value = id
+                                        viewModel.saveExtraSettings()
+                                    },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF00D2FF)
+                                    )
+                            )
+                        }
+                    }
+                    Text(
+                            "自动：难度为“较难”或“难”时自动开启思考过程",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
                     )
 
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))

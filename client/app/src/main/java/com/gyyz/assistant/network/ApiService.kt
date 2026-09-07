@@ -32,6 +32,9 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_DIALECT = "dialect"
         private const val KEY_GRADE = "grade"
+        private const val KEY_PERSONALITY = "personality"
+        private const val KEY_DETAIL = "detail"
+        private const val KEY_SUBJECT = "subject"
     }
 
     private var sharedPreferences: SharedPreferences? = null
@@ -127,10 +130,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     // ② 回答风格 formal/plain/concise/lively/dialect（④⑦十一 相关请求头）
     var answerStyle: String = "formal"
     var searchEnabled: Boolean = true
-    var thinkingEnabled: Boolean = false
+    var thinkingMode: String = "off"        // 十一 思考模式：off / on / auto（auto按难度）
     var themeMode: String = "system"       // system / light / dark（纯客户端，不发服务器）
-    var dialect: String = "四川话"         // ③ 方言名称（style=dialect 时）
+    var dialect: String = "普通话"         // ③ 方言名称（style=dialect 时；默认普通话）
     var grade: String = ""                 // ④ 年级（小学/初中/高中/考研）
+    var personality: String = "auto"       // ⑧ 人格：MBTI16型 或 auto
+    var detail: String = "auto"            // ⑧ 详细度：very_detailed/detailed/brief/auto
+    var subject: String = ""               // ⑧ 学科（用于personality=auto推荐）
 
     /**
      * 为任意请求追加认证头 + AI模型头（统一入口）
@@ -141,13 +147,17 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
         addHeader("X-OCR-Mode", ocrMode)
         if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
-        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级
+        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度
         addHeader("X-Style", answerStyle)
-        if (thinkingEnabled) addHeader("X-Thinking", "1")
+        if (thinkingMode == "on") addHeader("X-Thinking", "1")
+        else if (thinkingMode == "auto") addHeader("X-Thinking", "auto")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
         // 中文值需 URL 编码，否则 OkHttp 报 "Unexpected char"（HTTP 头仅允许 ASCII）
         if (answerStyle == "dialect" && dialect.isNotEmpty()) addHeader("X-Dialect", java.net.URLEncoder.encode(dialect, "UTF-8"))
         if (grade.isNotEmpty()) addHeader("X-Grade", java.net.URLEncoder.encode(grade, "UTF-8"))
+        if (personality.isNotEmpty()) addHeader("X-Personality", java.net.URLEncoder.encode(personality, "UTF-8"))
+        if (detail.isNotEmpty()) addHeader("X-Detail", detail)
+        if (subject.isNotEmpty()) addHeader("X-Subject", java.net.URLEncoder.encode(subject, "UTF-8"))
         return this
     }
 
@@ -174,26 +184,49 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         visionModel = sharedPreferences?.getString(KEY_VISION_MODEL, "") ?: ""
         answerStyle = sharedPreferences?.getString(KEY_ANSWER_STYLE, "formal") ?: "formal"
         searchEnabled = sharedPreferences?.getBoolean(KEY_SEARCH_ENABLED, true) ?: true
-        thinkingEnabled = sharedPreferences?.getBoolean(KEY_THINKING_ENABLED, false) ?: false
+        // 十一 思考模式：新版存字符串 off/on/auto；兼容旧版 bool
+        val tm = sharedPreferences?.getString(KEY_THINKING_ENABLED, null)
+        thinkingMode = when {
+            tm == "on" || tm == "auto" -> tm
+            else -> {
+                val legacyOn = try { sharedPreferences?.getBoolean(KEY_THINKING_ENABLED, false) ?: false } catch (e: Exception) { false }
+                if (legacyOn) "on" else "off"
+            }
+        }
         themeMode = sharedPreferences?.getString(KEY_THEME_MODE, "system") ?: "system"
-        dialect = sharedPreferences?.getString(KEY_DIALECT, "四川话") ?: "四川话"
+        dialect = sharedPreferences?.getString(KEY_DIALECT, "普通话") ?: "普通话"
         grade = sharedPreferences?.getString(KEY_GRADE, "") ?: ""
+        personality = sharedPreferences?.getString(KEY_PERSONALITY, "auto") ?: "auto"
+        detail = sharedPreferences?.getString(KEY_DETAIL, "auto") ?: "auto"
+        subject = sharedPreferences?.getString(KEY_SUBJECT, "") ?: ""
     }
 
     /**
      * 持久化 ②④⑦十一 扩展设置（风格/搜题/思考模式/主题）
      */
-    fun saveExtraSettings(style: String, search: Boolean, thinking: Boolean, theme: String) {
+    fun saveExtraSettings(style: String, search: Boolean, thinking: String, theme: String) {
         sharedPreferences?.edit()
             ?.putString(KEY_ANSWER_STYLE, style)
             ?.putBoolean(KEY_SEARCH_ENABLED, search)
-            ?.putBoolean(KEY_THINKING_ENABLED, thinking)
+            ?.putString(KEY_THINKING_ENABLED, thinking)
             ?.putString(KEY_THEME_MODE, theme)
             ?.apply()
         answerStyle = style
         searchEnabled = search
-        thinkingEnabled = thinking
+        thinkingMode = thinking
         themeMode = theme
+    }
+
+    /** 持久化 ⑧ 人格/详细度/学科 */
+    fun savePersonalityDetail(personality: String, detail: String, subject: String) {
+        sharedPreferences?.edit()
+            ?.putString(KEY_PERSONALITY, personality)
+            ?.putString(KEY_DETAIL, detail)
+            ?.putString(KEY_SUBJECT, subject)
+            ?.apply()
+        this.personality = personality
+        this.detail = detail
+        this.subject = subject
     }
 
     /** 持久化 ③④ 方言/年级 */
