@@ -762,16 +762,21 @@ async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
         ocr_text = body.ocr_text
         # 优先级：有图片 base64 → 用视觉模型直接看题描述
         if body.image_base64:
+            # E: 与“AI解答”一致，用设置面板所选 OCR 模型(X-OCR-Mode / X-Vision-Model)
+            # 而非写死千问视觉，避免误用慢模型导致 30s+ 等待
+            import base64 as _b64
+            import tempfile
             try:
-                import base64 as _b64
-                import tempfile
                 img_bytes = _b64.b64decode(body.image_base64)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
                     tf.write(img_bytes)
                     tmp_path = tf.name
-                desc, _ = ai_service.recognize_image_with_vision(tmp_path)
+                desc, _, _ = ocr_service.recognize(
+                    tmp_path, mode=get_ocr_mode(request), vision_model=get_vision_model(request))
                 if desc and not desc.startswith("OCR"):
                     ocr_text = desc
+                else:
+                    print("[Pomodoro] 图片OCR为空/失败，改用传入文本")
             except Exception as e:
                 print(f"[Pomodoro] 图片识别失败，回退文字: {e}")
         prompt = (
