@@ -3686,9 +3686,9 @@ fun MarkdownView(
                 TextView(ctx).apply {
                     setTextColor(viewText)
                     textSize = fontSize
-                    setPadding(30, 20, 30, 20)
-                    // 行间距随字体大小缩放，避免放大文字时行距变窄
-                    setLineSpacing(fontSize * 0.2f, 1.2f)
+                    setPadding(30, 10, 30, 10)
+                    // 行间距随字体大小缩放，避免放大文字时行距变窄（图片行也受行距影响，保持紧凑）
+                    setLineSpacing(fontSize * 0.1f, 1.1f)
                     setTextIsSelectable(true)
                     setBackgroundColor(android.graphics.Color.parseColor(viewBg))
                     // 允许长内容在固定高度容器内滚动（弹窗/详情页）
@@ -3903,6 +3903,9 @@ private fun prepareMarkdownContent(content: String): String {
     }
     // 5. Fix orphan newlines before headers/lists (ensure blank line before block elements)
     processed = processed.replace(Regex("([^\n])\n(#{1,6}\\s|>\\s|\\*\\s|\\d+\\.\\s)"), "$1\n\n$2")
+    // 6. ⑬ 图片周围空行压缩：最多保留一个空行，避免图片上下留白过大
+    processed = processed.replace(Regex("\\n{3,}"), "\n\n")
+    processed = processed.replace(Regex("\\n{2,}(!\\[[^\\]]*\\]\\([^)]*\\))"), "\n\n$1")
 
     return processed
 }
