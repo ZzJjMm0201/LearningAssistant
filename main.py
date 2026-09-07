@@ -318,6 +318,47 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         "message": "解题已启动"
     }
 
+
+class SolveTextRequest(BaseModel):
+    text: str
+
+
+@app.post("/solve/text")
+async def solve_text(request: Request, body: SolveTextRequest):
+    """⑧ 文字输入解题：跳过OCR与分题，直接解题"""
+    request_id = str(uuid.uuid4())
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    _user_id = get_current_user(request)
+    # 用占位图片路径（无需真实图片）
+    image_path = HISTORY_DIR / f"{request_id}.txt.jpg"
+    solve_pipeline.start_solve(
+        image_path=image_path,
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        text_input=text,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "message": "文字解题已启动"
+    }
+
 @app.get("/solve/stream/{request_id}")
 async def solve_stream(request_id: str):
     """SSE流式推送解题结果（异步轮询，不阻塞事件循环）"""

@@ -265,6 +265,25 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             json.getString("request_id")
         }
     }
+
+    /** ⑧ 文字输入解题：跳过OCR与分题 */
+    suspend fun startSolveText(text: String): String {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().put("text", text)
+            val requestBody = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("$BASE_URL/solve/text")
+                .post(requestBody)
+                .withAuth()
+                .build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: throw Exception("Empty response")
+            val respJson = JSONObject(body)
+            val status = respJson.optString("status", "")
+            if (status == "error") throw Exception(respJson.optString("message", "文字解题失败"))
+            respJson.getString("request_id")
+        }
+    }
     
     /**
      * 确认OCR结果，让解题流水线立即继续（不确认则服务端等30秒超时）

@@ -42,7 +42,7 @@ class SolvePipeline:
         pass
     
     def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                    style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0) -> str:
+                    style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, text_input: Optional[str] = None) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -51,7 +51,7 @@ class SolvePipeline:
         thread = threading.Thread(
             target=self._solve_worker,
             args=(request_id, image_path, session_id, base_host, user_id, engine, ocr_mode, vision_model, model,
-                  style, thinking, search_enabled, dialect, grade, personality, subject, detail, weak_count)
+                  style, thinking, search_enabled, dialect, grade, personality, subject, detail, weak_count, text_input)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -106,25 +106,36 @@ class SolvePipeline:
         self._cleanup(request_id)
     
     def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                      style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0):
+                      style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, text_input: Optional[str] = None):
         """后台解题工作线程（① 支持多题：OCR后分题，逐题走完整流程）"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
         print(f"[{request_id}] 图片存在: {image_path.exists()}, 大小: {image_path.stat().st_size} bytes")
         try:
-            # ========== 阶段1: OCR识别 ==========
-            print(f"[{request_id}] 开始OCR识别...")
-            self._emit_event(request_id, "info", "正在识别题目文字...")
+            # ========== 阶段1: OCR识别（⑧ 文字输入模式跳过OCR） ==========
+            if text_input and text_input.strip():
+                ocr_text = text_input.strip()
+                ocr_time = 0.0
+                ocr_source = "text"
+                print(f"[{request_id}] 文字输入模式，跳过OCR，长度: {len(ocr_text)}")
+                self._emit_event(request_id, "ocr_complete", {
+                    "text": ocr_text,
+                    "time": 0.0,
+                    "source": "text"
+                })
+            else:
+                print(f"[{request_id}] 开始OCR识别...")
+                self._emit_event(request_id, "info", "正在识别题目文字...")
 
-            ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
-            print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
-            print(f"[{request_id}] OCR内容预览: {ocr_text[:200]}...")
+                ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
+                print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
+                print(f"[{request_id}] OCR内容预览: {ocr_text[:200]}...")
 
-            self._emit_event(request_id, "ocr_complete", {
-                "text": ocr_text,
-                "time": ocr_time,
-                "source": ocr_source
-            })
+                self._emit_event(request_id, "ocr_complete", {
+                    "text": ocr_text,
+                    "time": ocr_time,
+                    "source": ocr_source
+                })
 
             if not ocr_text or ocr_text.startswith("OCR"):
                 self._emit_event(request_id, "error", "OCR识别失败，请重试")
@@ -148,13 +159,17 @@ class SolvePipeline:
                 print(f"[{request_id}] 用户已确认OCR结果")
             _pending_confirm.pop(request_id, None)
 
-            # ========== ① 多题分题 ==========
-            from server.utils.split_service import split_questions
-            questions = split_questions(ocr_text, ocr_source, ai_service=ai_service, engine=engine, model=model)
-            questions = [q for q in questions if q and q.strip()]
-            if len(questions) == 0:
+            # ========== ① 多题分题（⑧ 文字输入模式免分题） ==========
+            if ocr_source == "text":
                 questions = [ocr_text]
-            print(f"[{request_id}] 分题结果: {len(questions)} 道题")
+                print(f"[{request_id}] 文字输入模式，免分题")
+            else:
+                from server.utils.split_service import split_questions
+                questions = split_questions(ocr_text, ocr_source, ai_service=ai_service, engine=engine, model=model)
+                questions = [q for q in questions if q and q.strip()]
+                if len(questions) == 0:
+                    questions = [ocr_text]
+                print(f"[{request_id}] 分题结果: {len(questions)} 道题")
 
             if len(questions) > 1:
                 self._emit_event(request_id, "question_split", {"count": len(questions), "questions": questions})

@@ -626,6 +626,48 @@ class MainViewModel : ViewModel() {
         _appState.value = AppState.Tracking
     }
 
+    // ⑧ 文字输入解题：跳过OCR与分题，直接提交文本解题
+    fun solveByText(text: String) {
+        if (text.isBlank()) return
+        // 与拍照流程一致的状态重置
+        cancelCurrentSSE = false
+        masteryVisible.value = false
+        masterySaved.value = false
+        masteryLevel.value = ""
+        solveSearchResults.value = emptyList()
+        solveQuestionInfo.value = emptyMap()
+        solveThinkingText.value = ""
+        solvingThinkingVisible.value = false
+        aiUsage.value = emptyMap()
+        multiQuestionCount.value = 0
+        multiQuestionTexts.value = emptyList()
+        currentQuestionIndex.value = 0
+        multiSolveStates.value = emptyList()
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+                    _statusText.value = "正在提交题目..."
+                }
+                val requestId = apiService.startSolveText(text)
+                Log.d("MainViewModel", "文字提交成功，requestId=$requestId")
+                currentSolvingRequestId.value = requestId
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.ANALYZING)
+                    _statusText.value = "正在分析题目..."
+                }
+                connectAndReceiveSSE(requestId)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "文字解题失败: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "解题失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
     private suspend fun connectAndReceiveSSE(requestId: String) {
         val client =
                 OkHttpClient.Builder()
@@ -4190,6 +4232,7 @@ fun MainMenuScreen(
     // ⑩ 主页面相机对准预览
     val cameraPreviewEnabled by viewModel.cameraPreviewEnabled.collectAsState()
     var showPickDialog by remember { mutableStateOf(false) }
+    var showTextInputDialog by remember { mutableStateOf(false) }
     
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -4300,7 +4343,7 @@ fun MainMenuScreen(
                 }
             }
 
-            // 相册选图：无可用相机（如虚拟机/模拟器）时也能体验完整功能
+            // ⑧ 其他上传方式：图库选择 / 文字输入（无可用相机时也能体验完整功能）
             if (onPickImage != null) {
                 Button(
                     onClick = { showPickDialog = true },
@@ -4311,7 +4354,7 @@ fun MainMenuScreen(
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Text(
-                        "🖼️ 从相册选图${if (isCameraReady) "（相机不可用时使用）" else "（当前推荐）"}",
+                        "📤 其他上传方式...",
                         color = if (isCameraReady) tC(Color.White, Color(0xFF16181D)) else Color.Black,
                         fontSize = 14.sp
                     )
@@ -4335,7 +4378,7 @@ fun MainMenuScreen(
     if (showPickDialog) {
         AlertDialog(
             onDismissRequest = { showPickDialog = false },
-            title = { Text("🖼️ 从相册选图", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            title = { Text("📤 其他上传方式", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("选择图片后将用于：", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
@@ -4353,9 +4396,73 @@ fun MainMenuScreen(
                             colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
                         ) { Text(label, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
                     }
+                    // ⑧ 文字输入（免OCR、免分题）
+                    Button(
+                        onClick = {
+                            showPickDialog = false
+                            showTextInputDialog = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                    ) {
+                        Text("⌨️ 文字输入题目（免OCR）", color = Color.Black, fontSize = 14.sp)
+                    }
                 }
             },
             confirmButton = {},
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+        )
+    }
+
+    // ⑧ 文字输入弹窗：输入题目文本直接解题（跳过OCR和分题）
+    if (showTextInputDialog) {
+        var textInput by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showTextInputDialog = false },
+            title = { Text("⌨️ 文字输入题目", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "粘贴或输入题目文字，将直接进行AI解题（免OCR识别、免分题，更快）",
+                        color = tC(Color.Gray, Color(0xFF5C6470)),
+                        fontSize = 12.sp
+                    )
+                    OutlinedTextField(
+                        value = textInput,
+                        onValueChange = { textInput = it },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 260.dp),
+                        placeholder = { Text("在此输入题目…", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp) },
+                        textStyle = androidx.compose.ui.text.TextStyle(
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 13.sp
+                        ),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFF00D2FF),
+                            unfocusedBorderColor = tC(Color(0xFF2D2D44), Color(0xFFB0BEC5)),
+                            cursorColor = Color(0xFF00D2FF)
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val t = textInput.trim()
+                        if (t.isNotEmpty()) {
+                            showTextInputDialog = false
+                            viewModel.solveByText(t)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                ) {
+                    Text("开始解题", color = Color.Black, fontSize = 14.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTextInputDialog = false }) {
+                    Text("取消", color = Color(0xFFF44336), fontSize = 14.sp)
+                }
+            },
             containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
         )
     }
