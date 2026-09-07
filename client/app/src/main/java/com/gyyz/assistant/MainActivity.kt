@@ -1384,6 +1384,10 @@ class MainViewModel : ViewModel() {
     val gestureEnabled = MutableStateFlow(false)
     val voiceEnabled = MutableStateFlow(false)
     val tomatoEnabled = MutableStateFlow(false)
+    // 十一 手势识别成功后的收手提示（3秒倒计时，结束后执行动作）
+    val showGestureCountdown = MutableStateFlow(false)
+    val gesturePendingAction = MutableStateFlow("")   // solve/animation/extend/3/2
+    private var gestureDebounceUntil = 0L
     val serverAddress = MutableStateFlow("10.100.55.231:8000")
     val themeColor = MutableStateFlow(Color(0xFF00D2FF))
     val fontSize = MutableStateFlow(16f)
@@ -1516,6 +1520,37 @@ class MainViewModel : ViewModel() {
     fun onButtonExtend() {
         _statusText.value = "正在准备知识延伸..."
         onButtonExtend?.invoke()
+    }
+
+    // 十一 手势触发：先弹收手提示倒计时（3秒），结束后执行；倒计时期间防抖忽略新手势
+    fun onGestureTriggered(action: String) {
+        val now = System.currentTimeMillis()
+        if (now < gestureDebounceUntil) {
+            Log.d("MainViewModel", "手势防抖中，忽略: $action")
+            return
+        }
+        gesturePendingAction.value = action
+        showGestureCountdown.value = true
+        gestureDebounceUntil = now + 4000  // 倒计时3秒 + 1秒余量
+    }
+
+    fun executeGestureAction() {
+        val action = gesturePendingAction.value
+        showGestureCountdown.value = false
+        gesturePendingAction.value = ""
+        when (action) {
+            "solve" -> onButtonSolve()
+            "animation" -> onButtonAnimation()
+            "extend" -> onButtonExtend()
+            "3" -> onGestureDetected(3)
+            "2" -> onGestureDetected(2)
+            else -> {}
+        }
+    }
+
+    fun cancelGestureAction() {
+        showGestureCountdown.value = false
+        gesturePendingAction.value = ""
     }
 
     override fun onCleared() {
@@ -1766,12 +1801,12 @@ class MainActivity : ComponentActivity() {
                             runOnUiThread {
                                 when (fingerCount) {
                                     // ⑦ 统一拍照链路：手势与按钮走同一方法（避免相机状态不一致导致 “Camera is closed”）；
-                                    // 不再手动调用 startSolving()（onPhotoReady 会负责状态切换），避免拍照前相机被解绑
-                                    5 -> mainViewModel.onButtonSolve()
-                                    4 -> mainViewModel.onButtonAnimation()
-                                    3 -> mainViewModel.onGestureDetected(3)
-                                    2 -> mainViewModel.onGestureDetected(2)
-                                    1 -> mainViewModel.onButtonExtend()
+                                    // 十一 手势成功后先弹收手提示倒计时（3秒），结束后执行动作
+                                    5 -> mainViewModel.onGestureTriggered("solve")
+                                    4 -> mainViewModel.onGestureTriggered("animation")
+                                    3 -> mainViewModel.onGestureTriggered("3")
+                                    2 -> mainViewModel.onGestureTriggered("2")
+                                    1 -> mainViewModel.onGestureTriggered("extend")
                                 }
                             }
                         },
@@ -2032,6 +2067,15 @@ fun MainScreen(
                     viewModel.confirmOcr()
                     viewModel.backToTracking()
                 }
+            )
+        }
+
+        // 十一 手势收手提示（3秒倒计时，结束后执行对应动作）
+        val showGestureCountdown by viewModel.showGestureCountdown.collectAsState()
+        if (showGestureCountdown) {
+            GestureCountdownDialog(
+                onExecute = { viewModel.executeGestureAction() },
+                onCancel = { viewModel.cancelGestureAction() }
             )
         }
 
@@ -6707,6 +6751,72 @@ fun CountdownConfirmDialog(
             ) {
                 Text(
                     if (countdown > 0) "确认(${countdown})" else "确认",
+                    color = tC(Color.White, Color(0xFF16181D)),
+                    fontSize = 14.sp
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                isCounting = false
+                onCancel()
+            }) {
+                Text("取消", color = Color(0xFFF44336), fontSize = 14.sp)
+            }
+        },
+        containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
+}
+
+// ==================== 十一 手势收手提示（3秒倒计时） ====================
+@Composable
+fun GestureCountdownDialog(
+    onExecute: () -> Unit,
+    onCancel: () -> Unit
+) {
+    var countdown by remember { mutableStateOf(3) }
+    var isCounting by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        while (isCounting && countdown > 0) {
+            delay(1000)
+            countdown--
+        }
+        if (isCounting && countdown == 0) {
+            isCounting = false
+            onExecute()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("✋ 手势已识别", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    "请收手，即将自动执行…",
+                    color = tC(Color.White, Color(0xFF16181D)),
+                    fontSize = 14.sp
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    if (countdown > 0) "⏳ ${countdown} 秒后执行" else "正在执行...",
+                    color = Color(0xFF00D2FF),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    isCounting = false
+                    onExecute()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+            ) {
+                Text(
+                    if (countdown > 0) "立即执行(${countdown})" else "执行",
                     color = tC(Color.White, Color(0xFF16181D)),
                     fontSize = 14.sp
                 )
