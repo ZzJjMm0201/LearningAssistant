@@ -6816,16 +6816,23 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
             }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    val w = workInput.toIntOrNull() ?: 25
-                    val r = restInput.toIntOrNull() ?: 5
-                    viewModel.applyPomodoroSettings(w, r, mode)
-                    onDismiss()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
-            ) {
-                Text("✅ 应用", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                // 取消：仅关闭弹窗，不改动/不重置正在进行的番茄钟
+                TextButton(onClick = { onDismiss() }) {
+                    Text("✕ 取消", color = Color(0xFFF44336), fontSize = 14.sp)
+                }
+                // 应用：采纳当前改动（含重置为输入的时间）
+                Button(
+                    onClick = {
+                        val w = workInput.toIntOrNull() ?: 25
+                        val r = restInput.toIntOrNull() ?: 5
+                        viewModel.applyPomodoroSettings(w, r, mode)
+                        onDismiss()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                ) {
+                    Text("✅ 应用", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
+                }
             }
         },
         containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
