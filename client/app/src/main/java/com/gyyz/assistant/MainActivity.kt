@@ -2263,10 +2263,13 @@ fun CameraPreviewView(
         cameraProvider.unbindAll()
         isBound.value = false
 
-        val preview = Preview.Builder().build()
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .build()
         preview.setSurfaceProvider(previewView.surfaceProvider)
 
         val imageCapture = ImageCapture.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .build()
 
@@ -2317,9 +2320,12 @@ fun CameraPreviewView(
         
         cameraProvider.unbindAll()
         
-        val preview = Preview.Builder().build()
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .build()
         preview.setSurfaceProvider(previewView.surfaceProvider)
         val imageCapture = ImageCapture.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .build()
         
@@ -4428,22 +4434,19 @@ fun MainMenuScreen(
             )
         }
 
-        // ③ 相机预览取景框（开启对准时显示，用于对准题目）
+        // ③ 相机对准提示（开启时居中提示，不再画取景框）
         if (cameraPreviewEnabled) {
             Box(
                     modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 4.dp)
-                            .height(150.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0x00000000))
-                            .border(2.dp, Color(0xFF00D2FF), RoundedCornerShape(12.dp)),
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
             ) {
                 Text(
-                        "✨ 将题目对准此框\n（相机画面）",
-                        color = tC(Color.White.copy(alpha = 0.7f), Color(0xFF16181D).copy(alpha = 0.7f)),
-                        fontSize = 12.sp,
+                        "请将页面对准屏幕",
+                        color = tC(Color.White.copy(alpha = 0.9f), Color(0xFF16181D).copy(alpha = 0.9f)),
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center
                 )
             }
@@ -4777,7 +4780,7 @@ FontScaleScope {
                             """📗 使用说明：
 
 📷 拍题解题流程：
-  1. 将题目放入取景框（手离开摄像头）拍照
+  1. 将题目对准屏幕中央（手离开摄像头）拍照
   2. 自动OCR识别 → 确认/修改识别结果
   3. AI 分步解题（思路/解析/图解/导图）
   4. 可追问、查看GeoGebra图形、记录掌握程度
@@ -6140,7 +6143,6 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val ocrMode by viewModel.ocrMode.collectAsState()
     val visionModel by viewModel.visionModel.collectAsState()
     // ②④十一⑦ 扩展设置
-    val answerStyle by viewModel.answerStyle.collectAsState()
     val searchEnabled by viewModel.searchEnabled.collectAsState()
     val thinkingMode by viewModel.thinkingMode.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
@@ -6184,64 +6186,34 @@ FontScaleScope {
 
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
 
-                    // ② 回答风格（各风格对应不同temperature）
+                    // ② 回答风格已移除：仅保留方言口吻（人格在下方单独设置）
                     Text(
-                            "🎨 回答风格",
+                            "🗣️ 讲解口吻（方言）",
                             color = tC(Color.White, Color(0xFF16181D)),
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                            "用家乡话口吻讲解，普通话为标准",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
                     )
                     Row(
                             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(
-                                "formal" to "严谨规范",
-                                "plain" to "通俗易懂",
-                                "concise" to "简洁精炼",
-                                "lively" to "活泼有趣",
-                                "dialect" to "方言",
-                        ).forEach { (id, label) ->
+                        listOf("普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话").forEach { d ->
                             FilterChip(
-                                    selected = answerStyle == id,
+                                    selected = dialect == d,
                                     onClick = {
-                                        viewModel.answerStyle.value = id
-                                        viewModel.saveExtraSettings()
+                                        viewModel.dialect.value = d
+                                        viewModel.saveDialectGrade()
                                     },
-                                    label = { Text(label, fontSize = 12.sp) },
+                                    label = { Text(d, fontSize = 12.sp) },
                                     colors = FilterChipDefaults.filterChipColors(
-                                            selectedContainerColor = Color(0xFF7B2FBE)
+                                            selectedContainerColor = Color(0xFF00ACC1)
                                     )
                             )
-                        }
-                    }
-
-                    // ③ 方言二级选择（风格选“方言”时显示）
-                    if (answerStyle == "dialect") {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                                "🗣️ 方言名称",
-                                color = tC(Color.White, Color(0xFF16181D)),
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
-                        )
-                        Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            listOf("普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话").forEach { d ->
-                                FilterChip(
-                                        selected = dialect == d,
-                                        onClick = {
-                                            viewModel.dialect.value = d
-                                            viewModel.saveDialectGrade()
-                                        },
-                                        label = { Text(d, fontSize = 12.sp) },
-                                        colors = FilterChipDefaults.filterChipColors(
-                                                selectedContainerColor = Color(0xFF00ACC1)
-                                        )
-                                )
-                            }
                         }
                     }
 
