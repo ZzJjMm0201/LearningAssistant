@@ -6,37 +6,7 @@ from openai import OpenAI
 from server.config import APIConfig, AI_MODEL
 from openai.types.chat import ChatCompletionMessageParam
 
-# ==================== 回答风格（②：可自定义，含各自temperature） ====================
-ANSWER_STYLES: Dict[str, Dict] = {
-    "formal": {
-        "label": "严谨规范",
-        "temperature": 0.3,
-        "instruction": "回答风格：严谨规范。用词准确、条理清晰、术语规范，像标准教辅解析。",
-    },
-    "plain": {
-        "label": "通俗易懂",
-        "temperature": 0.7,
-        "instruction": "回答风格：通俗易懂。像老师面对面讲解，多用比喻和生活化例子把概念讲明白，可适当口语化。",
-    },
-    "concise": {
-        "label": "简洁精炼",
-        "temperature": 0.4,
-        "instruction": "回答风格：简洁精炼。直奔重点，只保留关键步骤和结论，不铺垫、不啰嗦。",
-    },
-    "lively": {
-        "label": "活泼有趣",
-        "temperature": 0.9,
-        "instruction": "回答风格：活泼亲切。语气轻松自然，可少量使用emoji和鼓励性话语，但内容必须保持准确。",
-    },
-    "dialect": {
-        "label": "方言",
-        "temperature": 0.85,
-        "instruction": "回答风格：用地道的{方言}口吻讲解（语气、用词、口头禅都贴近{方言}本地说话方式），但专业术语、公式、数字必须保持准确，不要因为方言影响正确性。",
-    },
-}
-DEFAULT_STYLE = "formal"
-
-# ④ 可选择的方言名称（③ 风格选“方言”后二级选择）
+# ==================== 方言（原“回答风格”已移除，仅保留方言设置） ====================
 DIALECTS = ["普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话"]
 DEFAULT_DIALECT = "普通话"
 
@@ -61,6 +31,14 @@ PERSONALITIES: Dict[str, str] = {
     "ISFP": "像一位安静的体验派老师：温柔随和，重视直观感受和图形化的理解。",
     "ESTP": "像一位果断的行动家：直截了当，喜欢用“试试看”的方式，强调快速上手。",
     "ESFP": "像一位活泼的表演者：生动热情，用肢体语言一样的描述让抽象概念变得鲜活。",
+}
+
+# ⑨ 16型人格的 temperature（原“回答风格temperature”已删除，改为按人格）
+PERSONALITY_TEMPERATURE: Dict[str, float] = {
+    "INTJ": 0.4, "INTP": 0.5, "ENTJ": 0.4, "ENTP": 0.7,
+    "INFJ": 0.6, "INFP": 0.7, "ENFJ": 0.7, "ENFP": 0.8,
+    "ISTJ": 0.3, "ISFJ": 0.5, "ESTJ": 0.3, "ESFJ": 0.6,
+    "ISTP": 0.4, "ISFP": 0.6, "ESTP": 0.5, "ESFP": 0.8,
 }
 
 # ⑨ 各学科推荐的 MBTI 老师风格（auto 时按学科选择）
@@ -96,34 +74,37 @@ ASK_DRAW_RULE = ("回答要求：直接回答学生最新问题本身，用自�
 
 
 def style_instruction(style: Optional[str], dialect: str = "") -> str:
-    s = ANSWER_STYLES.get(style or "")
-    if not s:
+    """原“回答风格”已移除；此处仅保留方言口吻（非普通话时生效）"""
+    d = (dialect or "").strip()
+    if not d or d == "普通话":
         return ""
-    instr = s["instruction"]
-    if style == "dialect" and dialect:
-        instr = instr.replace("{方言}", dialect)
-    elif style == "dialect":
-        instr = instr.replace("{方言}", "普通话")
-    return instr
+    return (f"（讲解口吻：用{d}的口吻讲解，语气、用词、口头禅都贴近{d}本地说话方式；"
+            f"但专业术语、公式、数字必须保持准确，不因口吻影响正确性。）")
 
 
-def personality_instruction(personality: Optional[str], subject: str = "") -> str:
-    """⑨ 人格：MBTI 16型或 auto（自动按学科推荐）。返回附加 instruction"""
+def _resolve_personality(personality: Optional[str], subject: str = "") -> Optional[str]:
+    """⑨ 把 personality(auto/16型/空)解析成具体 MBTI 大写代码；无法解析返回 None"""
     p = (personality or "").strip()
     if not p or p == "none":
-        return ""
+        return None
     if p == "auto":
         subj = (subject or "通用").strip()
         for key, mbti in SUBJECT_PERSONALITY.items():
             if key in subj:
-                p = mbti
-                break
-        else:
-            p = SUBJECT_PERSONALITY["通用"]
-    desc = PERSONALITIES.get(p.upper())
+                return mbti
+        return SUBJECT_PERSONALITY["通用"]
+    return p.upper() if p.upper() in PERSONALITIES else None
+
+
+def personality_instruction(personality: Optional[str], subject: str = "") -> str:
+    """⑨ 人格：MBTI 16型或 auto（自动按学科推荐）。返回附加 instruction"""
+    p = _resolve_personality(personality, subject)
+    if not p:
+        return ""
+    desc = PERSONALITIES.get(p)
     if not desc:
         return ""
-    return f"（讲师人格：{desc}请以这种老师的口吻和方式讲解，但内容必须准确、严谨。）"
+    return f"（讲师人格：{desc}请以这种老师的口吻和方式讲解，但内容必须准确、严谨，格式规范。）"
 
 
 def detail_instruction(detail: Optional[str], weak_count: int = 0) -> str:
@@ -142,8 +123,16 @@ def detail_instruction(detail: Optional[str], weak_count: int = 0) -> str:
 
 
 def style_temperature(style: Optional[str]) -> Optional[float]:
-    s = ANSWER_STYLES.get(style or "")
-    return s["temperature"] if s else None
+    """旧回答风格已删除：不再有风格温度"""
+    return None
+
+
+def personality_temperature(personality: Optional[str], subject: str = "") -> Optional[float]:
+    """⑨ 人格 temperature：按解析出的 MBTI 取温；无则 None(用模型默认)"""
+    p = _resolve_personality(personality, subject)
+    if not p:
+        return None
+    return PERSONALITY_TEMPERATURE.get(p)
 
 
 def grade_instruction(grade: Optional[str]) -> str:
@@ -236,7 +225,6 @@ class AIService:
         d_ins = detail_instruction(detail, weak_count)
         if d_ins:
             st_ins = (st_ins + "\n" + d_ins) if st_ins else d_ins
-        st_temp = style_temperature(style)
         thinking_auto = (thinking == "auto")
         use_thinking = (thinking is True) and self._thinking_supported(engine)
         
@@ -270,9 +258,9 @@ class AIService:
         info_subject = (question_info or {}).get("subject", "") if isinstance(question_info, dict) else ""
         info_difficulty = (question_info or {}).get("difficulty", "") if isinstance(question_info, dict) else ""
 
-        # ⑨ 人格 auto：用题目实际学科重算（info_subject 优先）
+        # ⑨ 人格 auto：用题目实际学科重算（info_subject 优先）；温度也按解析后人格取
+        eff_subj = info_subject or subject or ""
         if (personality or "").strip() == "auto":
-            eff_subj = info_subject or subject or ""
             p_ins = personality_instruction("auto", eff_subj)
             # 重建 st_ins（去旧 p_ins，加新 p_ins）
             st_ins = style_instruction(style, dialect)
@@ -282,6 +270,7 @@ class AIService:
                 st_ins = (st_ins + "\n" + p_ins) if st_ins else p_ins
             if d_ins:
                 st_ins = (st_ins + "\n" + d_ins) if st_ins else d_ins
+        p_temp = personality_temperature(personality, eff_subj)
 
         # ⑨ 详细度 auto：需薄弱知识点数（weak_count 已由外部传入）——d_ins 在 info 前已按 weak_count 算好，无需重算
 
@@ -307,7 +296,7 @@ class AIService:
         # 流式输出解题思路
         accumulated_steps = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                           temperature=st_temp):
+                                           temperature=p_temp):
             if evt["stage"] == "content":
                 accumulated_steps = evt["content"]
                 yield {"stage": "steps_chunk", "content": accumulated_steps}
@@ -340,7 +329,7 @@ class AIService:
             yield {"stage": "thinking_chunk", "content": accum}
         
         for evt in self._call_api_streaming(messages, max_tokens=8000, engine=engine, model=model,
-                                            temperature=st_temp, thinking=use_thinking,
+                                            temperature=p_temp, thinking=use_thinking,
                                             on_reasoning=_on_reasoning):
             if evt["stage"] == "thinking_chunk":
                 yield evt
@@ -366,7 +355,7 @@ class AIService:
         # ② LaTeX图形生成改为流式（客户端显示“图形正在生成”占位）
         latex_accumulated = ""
         for evt in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model,
-                                            temperature=st_temp):
+                                            temperature=p_temp):
             if evt["stage"] == "content":
                 latex_accumulated = evt["content"]
                 yield {"stage": "latex_chunk", "content": latex_accumulated}
@@ -391,7 +380,7 @@ class AIService:
         # 流式输出思维导图
         accumulated_mindmap = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=st_temp):
+                                            temperature=p_temp):
             if evt["stage"] == "content":
                 accumulated_mindmap = evt["content"]
                 yield {"stage": "mindmap_chunk", "content": accumulated_mindmap}
@@ -523,7 +512,7 @@ class AIService:
         messages.append({"role": "user", "content": summary_expand_prompt})
         accumulated_summary = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=st_temp):
+                                            temperature=p_temp):
             if evt["stage"] == "content":
                 accumulated_summary = evt["content"]
                 yield {"stage": "summary_chunk", "content": accumulated_summary}
@@ -554,7 +543,7 @@ class AIService:
         messages.append({"role": "user", "content": extension_prompt})
         accumulated_extension = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=st_temp):
+                                            temperature=p_temp):
             if evt["stage"] == "content":
                 accumulated_extension = evt["content"]
                 yield {"stage": "extension_chunk", "content": accumulated_extension}
