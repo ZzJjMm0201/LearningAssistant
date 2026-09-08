@@ -215,6 +215,12 @@ class MainViewModel : ViewModel() {
 
     val apiService = ApiService()
 
+    // 番茄钟 AI 推荐结果（设置弹窗监听）
+    data class PomodoroOutcome(val ok: Boolean, val duration: Int, val message: String)
+    val pomodoroOutcome = MutableStateFlow<PomodoroOutcome?>(null)
+    // 番茄钟“拍照上传 AI 推荐”回调（由 Activity 注入，走相机直拍）
+    var onPomodoroCapture: (() -> Unit)? = null
+
     private val _isLoggedIn = MutableStateFlow(false)
     val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
 
@@ -1290,6 +1296,82 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    // ⑧ 文字输入直接生成 AI 动画（免OCR）
+    fun animateByText(text: String) {
+        if (text.isBlank()) return
+        cancelCurrentSSE = false
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Animation
+                    _statusText.value = "正在生成动画..."
+                }
+                val response = apiService.animateText(text)
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        _statusText.value = "动画已生成"
+                        _animationUrl.value = "${apiService.getBaseUrl()}${response.url}"
+                    } else {
+                        _statusText.value = "动画生成失败: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "动画请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    // ⑧ 文字输入直接知识延伸（免OCR）
+    fun extendByText(text: String) {
+        if (text.isBlank()) return
+        cancelCurrentSSE = false
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Knowledge()
+                    _statusText.value = "正在分析..."
+                }
+                val requestId = apiService.startExtendText(text)
+                connectExtendSSE(requestId)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "请求失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    // 番茄钟：拍照(字节)/相册(b64) → AI 推荐时长（统一结果通道 pomodoroOutcome）
+    fun requestPomodoroFromBytes(bytes: ByteArray) {
+        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        requestPomodoroFromB64(b64)
+    }
+
+    fun requestPomodoroFromB64(b64: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val r = apiService.recommendPomodoro("", "", b64)
+                withContext(Dispatchers.Main) {
+                    pomodoroOutcome.value = if (r.status == "ok")
+                        PomodoroOutcome(true, r.durationMinutes, r.reason)
+                    else
+                        PomodoroOutcome(false, 0, r.message ?: "推荐失败")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    pomodoroOutcome.value = PomodoroOutcome(false, 0, e.message ?: "推荐失败")
+                }
+            }
+        }
+    }
+
+    fun clearPomodoroOutcome() { pomodoroOutcome.value = null }
+
     private suspend fun connectExtendSSE(requestId: String) {
         val client =
                 OkHttpClient.Builder()
@@ -1727,6 +1809,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // 番茄钟“📷 拍照上传 AI 推荐时长”：相机直拍（不走相册）
+                viewModel.onPomodoroCapture = {
+                    requireCamera("pomodoroAi") { capture ->
+                        takePhotoForPomodoro(this@MainActivity, capture, viewModel)
+                    }
+                }
+
                 // 相册选图（模拟器无可用相机时的替代方案）
                 var pendingGalleryAction by remember { mutableStateOf<String?>(null) }
                 val galleryLauncher = rememberLauncherForActivityResult(
@@ -1965,6 +2054,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// 番茄钟“拍照上传 AI 推荐”：相机直拍 → 字节 → 走 VM 推荐通道
+private fun takePhotoForPomodoro(context: android.content.Context, capture: ImageCapture, viewModel: MainViewModel) {
+    try {
+        val dir = context.cacheDir
+        val file = java.io.File(dir, "pomodoro_rec_${System.currentTimeMillis()}.jpg")
+        val opts = ImageCapture.OutputFileOptions.Builder(file).build()
+        capture.takePicture(opts, androidx.core.content.ContextCompat.getMainExecutor(context),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    try {
+                        val bytes = java.io.FileInputStream(file).readBytes()
+                        viewModel.requestPomodoroFromBytes(bytes)
+                    } catch (e: Exception) {
+                        viewModel.pomodoroOutcome.value = MainViewModel.PomodoroOutcome(false, 0, "读取照片失败: ${e.message}")
+                    }
+                }
+                override fun onError(e: ImageCaptureException) {
+                    viewModel.pomodoroOutcome.value = MainViewModel.PomodoroOutcome(false, 0, "拍照失败: ${e.message}")
+                }
+            })
+    } catch (e: Exception) {
+        viewModel.pomodoroOutcome.value = MainViewModel.PomodoroOutcome(false, 0, "拍照失败: ${e.message}")
+    }
+}
+
 @Composable
 fun MainScreen(
     hasCameraPermission: Boolean = false,
@@ -2004,6 +2118,7 @@ fun MainScreen(
             CameraPreviewView(
                 modifier = if (isMainScreen) Modifier.fillMaxSize() else Modifier.fillMaxSize().alpha(0f),
                 gestureRecognizer = if (gestureEnabled && isMainScreen) gestureRecognizer else null,
+                active = isMainScreen,
                 onImageCaptureReady = onImageCaptureReady,
                 onCameraReady = {
                     Log.d("MainScreen", "相机已就绪")
@@ -2186,6 +2301,7 @@ private fun resolveCameraSelector(provider: ProcessCameraProvider): CameraSelect
 fun CameraPreviewView(
     modifier: Modifier = Modifier,
     gestureRecognizer: HandGestureRecognizer? = null,
+    active: Boolean = true,
     onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
     onCameraReady: (() -> Unit)? = null,
     rebindKey: Int = 0,
@@ -2256,9 +2372,16 @@ fun CameraPreviewView(
         }
     }
 
-    LaunchedEffect(cameraState.value, lifecycleOwner, rebindKey) {
+    LaunchedEffect(cameraState.value, lifecycleOwner, rebindKey, active) {
         val cameraProvider = cameraState.value ?: return@LaunchedEffect
         val currentLifecycle = lifecycleOwner
+        if (!active) {
+            // 非主页面：解绑相机（关闭“小绿点”）
+            try { cameraProvider.unbindAll() } catch (e: Exception) {}
+            isBound.value = false
+            imageCaptureRef.value = null
+            return@LaunchedEffect
+        }
 
         cameraProvider.unbindAll()
         isBound.value = false
@@ -2314,10 +2437,11 @@ fun CameraPreviewView(
         }
     }
 
-    LaunchedEffect(gestureRecognizer) {
+    LaunchedEffect(gestureRecognizer, active) {
         val cameraProvider = cameraState.value ?: return@LaunchedEffect
+        if (!active) return@LaunchedEffect
         if (!isBound.value) return@LaunchedEffect
-        
+
         cameraProvider.unbindAll()
         
         val preview = Preview.Builder()
@@ -4405,6 +4529,9 @@ fun MainMenuScreen(
     val cameraPreviewEnabled by viewModel.cameraPreviewEnabled.collectAsState()
     var showPickDialog by remember { mutableStateOf(false) }
     var showTextInputDialog by remember { mutableStateOf(false) }
+    // 上传两步式：1=已选图片、2=已选文本（0=无）
+    var pickStage by remember { mutableStateOf(0) }
+    var textAction by remember { mutableStateOf("solve") }
     
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -4416,7 +4543,7 @@ fun MainMenuScreen(
                         else tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8))
                 )
         ) {
-        TopStatusBar(statusText = statusText, viewModel = viewModel, showSettingsButton = true, showHelpButton = true)
+        TopStatusBar(statusText = statusText, viewModel = viewModel, showSettingsButton = true, showHelpButton = true, transparent = cameraPreviewEnabled)
 
         // ⑩ 相机对准预览开关
         Row(
@@ -4545,12 +4672,37 @@ fun MainMenuScreen(
 }
 
     if (showPickDialog) {
+        // 第一步：选择“图片上传”还是“文本输入”
         AlertDialog(
             onDismissRequest = { showPickDialog = false },
-            title = { Text("📤 其他上传方式", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            title = { Text("📤 上传方式", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("选择图片后将用于：", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
+                    Text("请先选择输入方式：", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
+                    Button(
+                        onClick = { showPickDialog = false; pickStage = 1 },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7B2FBE))
+                    ) { Text("🖼️ 图片上传（相册选图）", color = Color.White, fontSize = 14.sp) }
+                    Button(
+                        onClick = { showPickDialog = false; pickStage = 2 },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                    ) { Text("⌨️ 文本输入（免OCR更快）", color = Color.Black, fontSize = 14.sp) }
+                }
+            },
+            confirmButton = {},
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+        )
+    }
+
+    // 第二步：图片 → 用于哪个功能
+    if (pickStage == 1) {
+        AlertDialog(
+            onDismissRequest = { pickStage = 0 },
+            title = { Text("🖼️ 图片将用于", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(
                         "🤔 AI解题" to "solve",
                         "🎬 AI动画" to "animation",
@@ -4558,23 +4710,12 @@ fun MainMenuScreen(
                     ).forEach { (label, action) ->
                         Button(
                             onClick = {
-                                showPickDialog = false
+                                pickStage = 0
                                 onPickImage?.invoke(action)
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
                         ) { Text(label, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
-                    }
-                    // ⑧ 文字输入（免OCR、免分题）
-                    Button(
-                        onClick = {
-                            showPickDialog = false
-                            showTextInputDialog = true
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
-                    ) {
-                        Text("⌨️ 文字输入题目（免OCR）", color = Color.Black, fontSize = 14.sp)
                     }
                 }
             },
@@ -4583,16 +4724,49 @@ fun MainMenuScreen(
         )
     }
 
-    // ⑧ 文字输入弹窗：输入题目文本直接解题（跳过OCR和分题）
+    // 第二步：文本 → 用于哪个功能
+    if (pickStage == 2) {
+        AlertDialog(
+            onDismissRequest = { pickStage = 0 },
+            title = { Text("⌨️ 文本将用于", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(
+                        "🤔 AI解题" to "solve",
+                        "🎬 AI动画" to "animation",
+                        "📎 知识延伸" to "extend",
+                    ).forEach { (label, action) ->
+                        Button(
+                            onClick = {
+                                pickStage = 0
+                                textAction = action
+                                showTextInputDialog = true
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                        ) { Text(label, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
+                    }
+                }
+            },
+            confirmButton = {},
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+        )
+    }
+
+    // ⑧ 文字输入弹窗：按 textAction 决定去向（解题/动画/知识延伸）
     if (showTextInputDialog) {
         var textInput by remember { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { showTextInputDialog = false },
-            title = { Text("⌨️ 文字输入题目", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            title = { Text("⌨️ 文字输入", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "粘贴或输入题目文字，将直接进行AI解题（免OCR识别、免分题，更快）",
+                        when (textAction) {
+                            "animation" -> "输入文字后将直接生成 AI 动画（免OCR）"
+                            "extend" -> "输入文字后将直接进行知识延伸（免OCR）"
+                            else -> "输入文字后将直接进行AI解题（免OCR识别、免分题，更快）"
+                        },
                         color = tC(Color.Gray, Color(0xFF5C6470)),
                         fontSize = 12.sp
                     )
@@ -4600,7 +4774,7 @@ fun MainMenuScreen(
                         value = textInput,
                         onValueChange = { textInput = it },
                         modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 260.dp),
-                        placeholder = { Text("在此输入题目…", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp) },
+                        placeholder = { Text("在此输入内容…", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp) },
                         textStyle = androidx.compose.ui.text.TextStyle(
                             color = tC(Color.White, Color(0xFF16181D)),
                             fontSize = 13.sp
@@ -4619,12 +4793,23 @@ fun MainMenuScreen(
                         val t = textInput.trim()
                         if (t.isNotEmpty()) {
                             showTextInputDialog = false
-                            viewModel.solveByText(t)
+                            when (textAction) {
+                                "animation" -> viewModel.animateByText(t)
+                                "extend" -> viewModel.extendByText(t)
+                                else -> viewModel.solveByText(t)
+                            }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                 ) {
-                    Text("开始解题", color = Color.Black, fontSize = 14.sp)
+                    Text(
+                        when (textAction) {
+                            "animation" -> "生成动画"
+                            "extend" -> "开始延伸"
+                            else -> "开始解题"
+                        },
+                        color = Color.Black, fontSize = 14.sp
+                    )
                 }
             },
             dismissButton = {
@@ -4638,14 +4823,14 @@ fun MainMenuScreen(
 }
 
 @Composable
-fun TopStatusBar(statusText: String, viewModel: MainViewModel, showSettingsButton: Boolean = false, showHelpButton: Boolean = false) {
+fun TopStatusBar(statusText: String, viewModel: MainViewModel, showSettingsButton: Boolean = false, showHelpButton: Boolean = false, transparent: Boolean = false) {
     val pomodoroTime by viewModel.pomodoroTime.collectAsState()
     val pomodoroMode by viewModel.pomodoroMode.collectAsState()
     val elapsedTime by viewModel.elapsedTime.collectAsState()
     Row(
             modifier =
                     Modifier.fillMaxWidth()
-                            .background(tC(Color(0xFF16213E), Color(0xFFFFFFFF)), RoundedCornerShape(12.dp))
+                            .background(if (transparent) Color.Transparent else tC(Color(0xFF16213E), Color(0xFFFFFFFF)), RoundedCornerShape(12.dp))
                             .padding(12.dp),
             horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -4843,6 +5028,8 @@ fun HistoryViewScreen(
     var errorMessage by remember { mutableStateOf("") }
     var selectedRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
     var selectedRecordIndex by remember { mutableStateOf(1) }
+    // AI动画 / 知识延伸 等其它模块记录（record_type != solve）
+    var auxRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
     // 服务端返回的真实总数/学科数（不受50条截断影响）
     var totalCount by remember { mutableStateOf(0) }
     var subjectCount by remember { mutableStateOf(0) }
@@ -4932,6 +5119,15 @@ fun HistoryViewScreen(
         loadHistory()
     }
     
+    if (auxRecord != null) {
+        AuxRecordScreen(
+            record = auxRecord!!,
+            baseUrl = viewModel.apiService.getBaseUrl(),
+            onBack = { auxRecord = null }
+        )
+        return
+    }
+
     if (selectedRecord != null) {
         HistoryDetailScreen(
             record = selectedRecord!!,
@@ -5123,7 +5319,8 @@ fun HistoryViewScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     itemsIndexed(filteredRecords, key = { _, it -> it.id }) { index, record ->
-                        HistoryRecordCard(
+                        if (record.recordType != "solve") AuxHistoryCard(record = record, onClick = { auxRecord = record })
+                        else HistoryRecordCard(
                             record = record,
                             serverAddress = serverAddress,
                             displayIndex = index + 1,
@@ -5428,6 +5625,88 @@ fun HistoryViewScreen(
                     },
                     containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
             )
+        }
+    }
+}
+
+@Composable
+fun AuxHistoryCard(record: ApiService.HistoryRecord, onClick: () -> Unit) {
+    val isAnimation = record.recordType == "animation"
+    val icon = if (isAnimation) "🎬" else "📎"
+    val typeLabel = if (isAnimation) "AI动画" else "知识延伸"
+    val preview = if (isAnimation) "点击查看动画" else (record.fullSolution.take(60) + if (record.fullSolution.length > 60) "…" else "")
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF)))
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(icon, fontSize = 22.sp)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (record.title.isNotEmpty()) "${typeLabel} · ${record.title}" else typeLabel,
+                    color = if (isAnimation) Color(0xFF7B2FBE) else Color(0xFF00BCD4),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    record.timestamp,
+                    color = tC(Color.Gray, Color(0xFF5C6470)),
+                    fontSize = 11.sp
+                )
+                Text(
+                    preview,
+                    color = tC(Color(0xFFB0BEC5), Color(0xFF546E7A)),
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+            }
+            Text("查看 ›", color = Color(0xFF00D2FF), fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+fun AuxRecordScreen(record: ApiService.HistoryRecord, baseUrl: String, onBack: () -> Unit) {
+    if (record.recordType == "animation") {
+        AnimationScreen(onBack = onBack, animationUrl = baseUrl + record.fullSolution)
+        return
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8)))
+    ) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("← 返回", color = Color(0xFF00D2FF), fontSize = 14.sp, modifier = Modifier.clickable(onClick = onBack))
+                Spacer(Modifier.weight(1f))
+                Text(
+                    if (record.title.isNotEmpty()) record.title else "📎 知识延伸",
+                    color = tC(Color.White, Color(0xFF16181D)),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.width(48.dp))
+            }
+            Divider(color = tC(Color.White.copy(alpha = 0.15f), Color(0xFF16181D).copy(alpha = 0.15f)))
+            if (record.fullSolution.isNotEmpty()) {
+                MarkdownView(
+                    content = record.fullSolution,
+                    modifier = Modifier.fillMaxSize().padding(4.dp),
+                    fontSize = 16f
+                )
+            } else {
+                Text("（无内容）", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+            }
         }
     }
 }
@@ -6689,6 +6968,19 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     // 番茄钟 AI 推荐时长
     var recommendReason by remember { mutableStateOf("") }
     var recommending by remember { mutableStateOf(false) }
+    // AI 推荐结果（相机直拍/相册共用）
+    val pomodoroOutcome by viewModel.pomodoroOutcome.collectAsState()
+    LaunchedEffect(pomodoroOutcome) {
+        val o = pomodoroOutcome ?: return@LaunchedEffect
+        recommending = false
+        if (o.ok) {
+            workInput = o.duration.toString()
+            recommendReason = "推荐 ${o.duration} 分钟：${o.message}"
+        } else {
+            recommendReason = "推荐失败：${o.message}"
+        }
+        viewModel.clearPomodoroOutcome()
+    }
     val context = LocalContext.current
     val pickImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
@@ -6697,15 +6989,12 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
             viewModel.viewModelScope.launch(Dispatchers.IO) {
                 try {
                     val bytes = context.contentResolver.openInputStream(uri)?.readBytes()
-                    val b64 = if (bytes != null) android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP) else ""
-                    val r = viewModel.apiService.recommendPomodoro("", "", b64)
-                    withContext(Dispatchers.Main) {
-                        recommending = false
-                        if (r.status == "ok") {
-                            workInput = r.durationMinutes.toString()
-                            recommendReason = "推荐 ${r.durationMinutes} 分钟：${r.reason}"
-                        } else {
-                            recommendReason = "推荐失败：${r.message}"
+                    if (bytes != null) {
+                        viewModel.requestPomodoroFromBytes(bytes)
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            recommending = false
+                            recommendReason = "读取图片失败"
                         }
                     }
                 } catch (e: Exception) {
@@ -6727,12 +7016,25 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
 FontScaleScope {
-                SettingSwitch(
-                    title = "启用番茄钟",
-                    subtitle = "关闭后不进行任何计时",
-                    checked = tomatoEnabled,
-                    onCheckedChange = { viewModel.tomatoEnabled.value = it }
-                )
+                // 大字显示当前剩余/已计时（倒计时=剩余，正计时=已累计）
+                val nowRemaining by viewModel.pomodoroTime.collectAsState()
+                val nowElapsed by viewModel.elapsedTime.collectAsState()
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        if (mode) "⏱ 已计时" else "⏳ 剩余时间",
+                        color = tC(Color.Gray, Color(0xFF5C6470)),
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        if (mode) formatStopwatch(nowElapsed) else formatTime(nowRemaining),
+                        color = if (mode) Color(0xFF00D2FF) else Color(0xFFFF5722),
+                        fontSize = 42.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
 
                 Text("⏱ 计时模式", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -6768,14 +7070,37 @@ FontScaleScope {
                         }
                     }
 
-                    // 拍照上传 AI 推荐做题时长
-                    Button(
-                            onClick = { pickImageLauncher.launch("image/*") },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !recommending,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7B2FBE))
-                    ) {
-                        Text(if (recommending) "🤖 正在推荐..." else "🤖 拍照上传，AI 推荐时长", color = Color.White, fontSize = 13.sp)
+                    // AI 推荐做题时长：相机直拍 + 相册选图 两种上传方式
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                                onClick = {
+                                    recommending = true
+                                    recommendReason = ""
+                                    val cb = viewModel.onPomodoroCapture
+                                    if (cb != null) cb()
+                                    else {
+                                        recommending = false
+                                        recommendReason = "相机未就绪，请稍后再试"
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                enabled = !recommending,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7B2FBE))
+                        ) {
+                            Text(if (recommending) "🤖 推荐中..." else "📷 拍照推荐", color = Color.White, fontSize = 13.sp)
+                        }
+                        Button(
+                                onClick = {
+                                    recommending = true
+                                    recommendReason = ""
+                                    pickImageLauncher.launch("image/*")
+                                },
+                                modifier = Modifier.weight(1f),
+                                enabled = !recommending,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00ACC1))
+                        ) {
+                            Text(if (recommending) "🤖 推荐中..." else "🖼️ 相册上传", color = Color.White, fontSize = 13.sp)
+                        }
                     }
                     if (recommendReason.isNotEmpty()) {
                         Text(

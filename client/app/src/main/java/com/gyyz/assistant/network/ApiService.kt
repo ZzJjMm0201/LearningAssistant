@@ -147,13 +147,13 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
         addHeader("X-OCR-Mode", ocrMode)
         if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
-        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度
-        addHeader("X-Style", answerStyle)
+        // 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度（回答风格已移除，不再发 X-Style）
         if (thinkingMode == "on") addHeader("X-Thinking", "1")
         else if (thinkingMode == "auto") addHeader("X-Thinking", "auto")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
         // 中文值需 URL 编码，否则 OkHttp 报 "Unexpected char"（HTTP 头仅允许 ASCII）
-        if (answerStyle == "dialect" && dialect.isNotEmpty()) addHeader("X-Dialect", java.net.URLEncoder.encode(dialect, "UTF-8"))
+        // 方言：非普通话才发送（以前要选“方言风格”才发，导致选了方言不生效）
+        if (dialect.isNotEmpty() && dialect != "普通话") addHeader("X-Dialect", java.net.URLEncoder.encode(dialect, "UTF-8"))
         if (grade.isNotEmpty()) addHeader("X-Grade", java.net.URLEncoder.encode(grade, "UTF-8"))
         if (personality.isNotEmpty()) addHeader("X-Personality", java.net.URLEncoder.encode(personality, "UTF-8"))
         if (detail.isNotEmpty()) addHeader("X-Detail", detail)
@@ -419,6 +419,33 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             )
         }
     }
+    suspend fun animateText(text: String): AnimationResponse {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().apply { put("text", text) }
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder().url("$BASE_URL/animation/text").post(body).withAuth().build()
+            val response = client.newCall(request).execute()
+            val respJson = JSONObject(response.body?.string() ?: "{}")
+            AnimationResponse(
+                status = respJson.optString("status"),
+                url = respJson.optString("url", ""),
+                message = respJson.optString("message", "")
+            )
+        }
+    }
+
+    suspend fun startExtendText(text: String): String {
+        return withContext(Dispatchers.IO) {
+            val json = JSONObject().apply { put("text", text) }
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder().url("$BASE_URL/extend/text").post(body).withAuth().build()
+            val response = client.newCall(request).execute()
+            val respJson = JSONObject(response.body?.string() ?: "{}")
+            if (respJson.optString("status") == "error") throw Exception(respJson.optString("message", "提交失败"))
+            respJson.optString("request_id")
+        }
+    }
+
     suspend fun requestAnimation(imageBytes: ByteArray): AnimationResponse {
         return withContext(Dispatchers.IO) {
             val requestBody = MultipartBody.Builder()
@@ -647,6 +674,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 HistoryRecord(
                     id = obj.optInt("id"),
                     sessionId = obj.optString("session_id", ""),
+                    recordType = obj.optString("record_type", "solve"),
+                    title = obj.optString("title", ""),
                     timestamp = obj.optString("timestamp"),
                     ocrText = obj.optString("ocr_text"),
                     questionInfoRaw = obj.optString("question_info_raw"),
@@ -671,6 +700,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     data class HistoryRecord(
         val id: Int,
         val sessionId: String = "",
+        val recordType: String = "solve",
+        val title: String = "",
         val timestamp: String,
         val ocrText: String = "",
         val questionInfoRaw: String = "",
