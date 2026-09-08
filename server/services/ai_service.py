@@ -514,7 +514,7 @@ class AIService:
         messages.append({"role": "user", "content": summary_expand_prompt})
         accumulated_summary = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=p_temp):
+                                            temperature=st_temp):
             if evt["stage"] == "content":
                 accumulated_summary = evt["content"]
                 yield {"stage": "summary_chunk", "content": accumulated_summary}
@@ -545,7 +545,7 @@ class AIService:
         messages.append({"role": "user", "content": extension_prompt})
         accumulated_extension = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=p_temp):
+                                            temperature=st_temp):
             if evt["stage"] == "content":
                 accumulated_extension = evt["content"]
                 yield {"stage": "extension_chunk", "content": accumulated_extension}
