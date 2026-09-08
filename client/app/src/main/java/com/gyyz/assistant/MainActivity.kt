@@ -2115,10 +2115,12 @@ fun MainScreen(
         }
 
         if (hasCameraPermission) {
+            // 非主页面或弹层（历史/设置/OCR确认/欢迎/GeoGebra）时关闭相机，避免右上角小绿点
+            val cameraActive = isMainScreen && !showHistory && !showSettings && !showWelcome && !showOcr && !showGeoGebra
             CameraPreviewView(
                 modifier = if (isMainScreen) Modifier.fillMaxSize() else Modifier.fillMaxSize().alpha(0f),
                 gestureRecognizer = if (gestureEnabled && isMainScreen) gestureRecognizer else null,
-                active = isMainScreen,
+                active = cameraActive,
                 onImageCaptureReady = onImageCaptureReady,
                 onCameraReady = {
                     Log.d("MainScreen", "相机已就绪")
@@ -3320,7 +3322,12 @@ fun AiUsageFooter(usage: Map<String, String>) {
     val total = usage["total_tokens"].orEmpty()
     val prompt = usage["prompt_tokens"].orEmpty()
     val completion = usage["completion_tokens"].orEmpty()
-    val engineLabel = if (engine == "qwen") "千问(Qwen)" else "DeepSeek"
+    val engineLabel = when (engine) {
+        "qwen" -> "千问(Qwen)"
+        "doubao" -> "豆包(Doubao)"
+        "hunyuan" -> "混元(Hunyuan)"
+        else -> "DeepSeek"
+    }
     Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
             colors = CardDefaults.cardColors(
@@ -6790,6 +6797,30 @@ FontScaleScope {
                                         selectedContainerColor = Color(0xFFFF9800)
                                 )
                         )
+                        FilterChip(
+                                selected = llmProvider == "doubao",
+                                onClick = {
+                                    viewModel.llmProvider.value = "doubao"
+                                    viewModel.llmModel.value = "Doubao-Seed-2.1-pro"
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("豆包 Doubao", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF7B2FBE)
+                                )
+                        )
+                        FilterChip(
+                                selected = llmProvider == "hunyuan",
+                                onClick = {
+                                    viewModel.llmProvider.value = "hunyuan"
+                                    viewModel.llmModel.value = "hy4-preview"
+                                    viewModel.saveAiSettings()
+                                },
+                                label = { Text("混元 Hunyuan", fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF00BCD4)
+                                )
+                        )
                     }
                     if (llmProvider == "qwen") {
                         Row(
@@ -6806,6 +6837,46 @@ FontScaleScope {
                                         label = { Text(m, fontSize = 10.sp) },
                                         colors = FilterChipDefaults.filterChipColors(
                                                 selectedContainerColor = Color(0xFFFF9800)
+                                        )
+                                )
+                            }
+                        }
+                    }
+                    if (llmProvider == "doubao") {
+                        Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("Doubao-Seed-2.1-pro", "Doubao-Seed-2.1-turbo", "Doubao-Seed-Evolving").forEach { m ->
+                                FilterChip(
+                                        selected = llmModel == m,
+                                        onClick = {
+                                            viewModel.llmModel.value = m
+                                            viewModel.saveAiSettings()
+                                        },
+                                        label = { Text(m, fontSize = 10.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF7B2FBE)
+                                        )
+                                )
+                            }
+                        }
+                    }
+                    if (llmProvider == "hunyuan") {
+                        Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("hy4-preview").forEach { m ->
+                                FilterChip(
+                                        selected = llmModel == m,
+                                        onClick = {
+                                            viewModel.llmModel.value = m
+                                            viewModel.saveAiSettings()
+                                        },
+                                        label = { Text(m, fontSize = 10.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF00BCD4)
                                         )
                                 )
                             }
@@ -6965,6 +7036,14 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
 
     var workInput by remember(work) { mutableStateOf(work.toString()) }
     var restInput by remember(rest) { mutableStateOf(rest.toString()) }
+    // 时长改动即时生效（无需再点“应用”）
+    val applyNow: () -> Unit = {
+        viewModel.applyPomodoroSettings(
+            workInput.toIntOrNull() ?: 25,
+            restInput.toIntOrNull() ?: 5,
+            mode
+        )
+    }
     // 番茄钟 AI 推荐时长
     var recommendReason by remember { mutableStateOf("") }
     var recommending by remember { mutableStateOf(false) }
@@ -6975,6 +7054,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
         recommending = false
         if (o.ok) {
             workInput = o.duration.toString()
+            applyNow()
             recommendReason = "推荐 ${o.duration} 分钟：${o.message}"
         } else {
             recommendReason = "推荐失败：${o.message}"
@@ -7056,7 +7136,7 @@ FontScaleScope {
                     Text("工作时长（分钟，可输入）", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp)
                     OutlinedTextField(
                         value = workInput,
-                        onValueChange = { workInput = it.filter { c -> c.isDigit() }.take(3) },
+                        onValueChange = { workInput = it.filter { c -> c.isDigit() }.take(3); applyNow() },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -7064,7 +7144,7 @@ FontScaleScope {
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(15, 25, 45, 60, 90).forEach { min ->
-                            TextButton(onClick = { workInput = min.toString() }) {
+                            TextButton(onClick = { workInput = min.toString(); applyNow() }) {
                                 Text("${min}分", color = Color(0xFF00D2FF), fontSize = 13.sp)
                             }
                         }
@@ -7114,7 +7194,7 @@ FontScaleScope {
                     Text("休息时长（分钟，可输入）", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp)
                     OutlinedTextField(
                         value = restInput,
-                        onValueChange = { restInput = it.filter { c -> c.isDigit() }.take(2) },
+                        onValueChange = { restInput = it.filter { c -> c.isDigit() }.take(2); applyNow() },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -7122,7 +7202,7 @@ FontScaleScope {
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(5, 10, 15, 30).forEach { min ->
-                            TextButton(onClick = { restInput = min.toString() }) {
+                            TextButton(onClick = { restInput = min.toString(); applyNow() }) {
                                 Text("${min}分", color = Color(0xFF4CAF50), fontSize = 13.sp)
                             }
                         }
@@ -7149,23 +7229,9 @@ FontScaleScope {
             }}
         },
         confirmButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                // 取消：仅关闭弹窗，不改动/不重置正在进行的番茄钟
-                TextButton(onClick = { onDismiss() }) {
-                    Text("✕ 取消", color = Color(0xFFF44336), fontSize = 14.sp)
-                }
-                // 应用：采纳当前改动（含重置为输入的时间）
-                Button(
-                    onClick = {
-                        val w = workInput.toIntOrNull() ?: 25
-                        val r = restInput.toIntOrNull() ?: 5
-                        viewModel.applyPomodoroSettings(w, r, mode)
-                        onDismiss()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
-                ) {
-                    Text("✅ 应用", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
-                }
+            // 时长改动即时生效，这里只留“取消”关闭弹窗
+            TextButton(onClick = { onDismiss() }) {
+                Text("✕ 取消", color = Color(0xFFF44336), fontSize = 14.sp)
             }
         },
         containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
@@ -7600,7 +7666,7 @@ fun ExportActions(
                     val saved = captureScreenToGallery(context)
                     Toast.makeText(context, if (saved != null) "截图已保存到相册" else "截图失败", Toast.LENGTH_SHORT).show()
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)), contentColor = tC(Color.White, Color(0xFF16181D)))
         ) { Text("📷 截图", fontSize = 12.sp) }
         if (allowPdf) {
             Button(
@@ -7612,7 +7678,7 @@ fun ExportActions(
                             }
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)), contentColor = tC(Color.White, Color(0xFF16181D)))
             ) { Text("📄 PDF", fontSize = 12.sp) }
         }
         Button(
@@ -7624,7 +7690,7 @@ fun ExportActions(
                         }
                     }
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)), contentColor = tC(Color.White, Color(0xFF16181D)))
         ) { Text("📝 Word", fontSize = 12.sp) }
     }
 }
