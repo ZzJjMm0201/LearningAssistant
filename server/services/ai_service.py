@@ -161,6 +161,22 @@ class AIService:
                 base_url=APIConfig.QWEN_BASE_URL
             )
         self.qwen_model = APIConfig.QWEN_DEFAULT_LLM
+        # 豆包（火山方舟）
+        self.doubao_client = None
+        if APIConfig.DOUBAO_API_KEY:
+            self.doubao_client = OpenAI(
+                api_key=APIConfig.DOUBAO_API_KEY,
+                base_url=APIConfig.DOUBAO_BASE_URL
+            )
+        self.doubao_model = APIConfig.DOUBAO_DEFAULT_LLM
+        # 混元（腾讯）
+        self.hunyuan_client = None
+        if APIConfig.HUNYUAN_API_KEY:
+            self.hunyuan_client = OpenAI(
+                api_key=APIConfig.HUNYUAN_API_KEY,
+                base_url=APIConfig.HUNYUAN_BASE_URL
+            )
+        self.hunyuan_model = APIConfig.HUNYUAN_DEFAULT_LLM
         self.temperature = AI_MODEL["temperature"]
         self.max_tokens = AI_MODEL["max_tokens"]
         # ⑫ Token 用量累积（每次 solve 流程前 reset，complete 时下发）
@@ -252,17 +268,25 @@ class AIService:
         return cjk + (other // 4) + (1 if other % 4 else 0)
     
     def _get_client(self, engine: Optional[str] = None, model: Optional[str] = None):
-        """按提供方选择客户端与模型（deepseek / qwen），默认deepseek
+        """按提供方选择客户端与模型（deepseek / qwen / doubao / hunyuan），默认deepseek
         engine: 提供方；model: 具体模型名（未指定用默认）"""
         if engine == "qwen":
             if self.qwen_client is None:
                 raise RuntimeError("未配置千问API Key（请检查 .env 的 QWEN_API_KEY）")
             return self.qwen_client, model or self.qwen_model
+        if engine == "doubao":
+            if self.doubao_client is None:
+                raise RuntimeError("未配置豆包API Key（请检查 .env 的 DOUBAO_API_KEY）")
+            return self.doubao_client, model or self.doubao_model
+        if engine == "hunyuan":
+            if self.hunyuan_client is None:
+                raise RuntimeError("未配置混元API Key（请检查 .env 的 HUNYUAN_API_KEY）")
+            return self.hunyuan_client, model or self.hunyuan_model
         return self.client, model or self.model
     
     def _thinking_supported(self, engine: Optional[str]) -> bool:
-        """思考模式（十一）：仅DeepSeek链路支持（千问模型未知是否支持，跳过）"""
-        return (engine or "deepseek") != "qwen"
+        """思考模式（十一）：仅DeepSeek链路支持（其它引擎未知是否支持，跳过）"""
+        return (engine or "deepseek") == "deepseek"
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
                              style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "",

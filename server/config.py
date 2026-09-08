@@ -43,6 +43,16 @@ class APIConfig:
     # 千问默认模型（客户端可在设置中选择）
     QWEN_DEFAULT_LLM = "qwen3.8-max"
     QWEN_DEFAULT_VISION = "qwen3.8-max"
+
+    # 豆包（火山方舟，OpenAI 兼容 /api/v3）
+    DOUBAO_API_KEY = _env("DOUBAO_API_KEY", "")
+    DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+    DOUBAO_DEFAULT_LLM = "Doubao-Seed-2.1-pro"
+
+    # 混元（腾讯，OpenAI 兼容 /v1）
+    HUNYUAN_API_KEY = _env("HUNYUAN_API_KEY", "")
+    HUNYUAN_BASE_URL = "https://tokenhub-intl.tencentmaas.com/v1"
+    HUNYUAN_DEFAULT_LLM = "hy4-preview"
     
     # 好未来题库API
     SEARCH_ACCESS_KEY_ID = "1481449208266358784"
