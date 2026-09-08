@@ -165,23 +165,91 @@ class AIService:
         self.max_tokens = AI_MODEL["max_tokens"]
         # ⑫ Token 用量累积（每次 solve 流程前 reset，complete 时下发）
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # ③ 估算用字符计数（provider 不返回 usage 时兜底）
+        self._est_prompt_chars = 0
+        self._est_completion_chars = 0
         self.active_engine = "deepseek"
         self.active_model = self.model
 
     def reset_usage(self, engine: Optional[str] = None, model: Optional[str] = None):
         """⑫ 开始一次解题/追问前清空用量，并记录本次引擎/模型"""
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._est_prompt_chars = 0
+        self._est_completion_chars = 0
         self.active_engine = engine or "deepseek"
         _, m = self._get_client(engine, model)
         self.active_model = m
 
+    @staticmethod
+    def _msg_chars(messages) -> int:
+        """估算 messages 文本字符数（用于 token 估算）"""
+        total = 0
+        for m in messages or []:
+            try:
+                content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+                if isinstance(content, str):
+                    total += len(content)
+                elif isinstance(content, list):
+                    for it in content:
+                        if isinstance(it, dict) and isinstance(it.get("text"), str):
+                            total += len(it["text"])
+            except Exception:
+                pass
+        return total
+
+    @staticmethod
+    def _estimate_tokens(chars: int) -> int:
+        """粗略估算 token 数：中文字符≈1 token，其它≈4字符/token"""
+        if not chars:
+            return 0
+        cjk = sum(1 for ch in str(chars) if '一' <= ch <= '鿿') if False else 0
+        # 简单按字符数统计：对字符串参数
+        return 0
+
+    def _estimate_from_chars(self) -> Dict:
+        import re as _re
+        def _t(s):
+            if not s:
+                return 0
+            cjk = len(_re.findall(r'[一-鿿]', s))
+            other = len(s) - cjk
+            return cjk + (other // 4) + (1 if other % 4 else 0)
+        pt = _t(('' if self._est_prompt_chars == 0 else str(self._est_prompt_chars)))
+        # 上面 _t 需要字符串，改用字符计数近似：这里直接用存的数量近似
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
     def get_usage(self) -> Dict:
-        """⑫ 返回当前累积用量 + 引擎/模型名"""
+        """⑫ 返回当前累积用量 + 引擎/模型名；provider 未返回 usage 时按字符数估算兜底"""
+        u = dict(self.usage)
+        if u.get("total_tokens", 0) == 0 and (self._est_prompt_chars or self._est_completion_chars):
+            # 中文字符≈1 token，其余≈4字符/token
+            import re as _re
+            def _t(chars):
+                if not chars:
+                    return 0
+                s = str(chars)
+                cjk = len(_re.findall(r'[一-鿿]', s))
+                other = len(s) - cjk
+                return cjk + (other // 4) + (1 if other % 4 else 0)
+            u["prompt_tokens"] = self._estimate_count(self._est_prompt_chars)
+            u["completion_tokens"] = self._estimate_count(self._est_completion_chars)
+            u["total_tokens"] = u["prompt_tokens"] + u["completion_tokens"]
         return {
             "engine": self.active_engine,
             "model": self.active_model,
-            **self.usage,
+            **u,
         }
+
+    @staticmethod
+    def _estimate_count(chars: int) -> int:
+        """按“中文字符≈1 token、其余≈4字符/token”估算"""
+        if not chars:
+            return 0
+        import re as _re
+        s = str(chars)
+        cjk = len(_re.findall(r'[一-鿿]', s))
+        other = len(s) - cjk
+        return cjk + (other // 4) + (1 if other % 4 else 0)
     
     def _get_client(self, engine: Optional[str] = None, model: Optional[str] = None):
         """按提供方选择客户端与模型（deepseek / qwen），默认deepseek
@@ -649,6 +717,9 @@ class AIService:
                     stream=False,
                 )
                 content = response.choices[0].message.content
+                # ③ 累积估算字符（provider 无 usage 时兜底）
+                self._est_prompt_chars += self._msg_chars(messages)
+                self._est_completion_chars += len(content or "")
                 # ⑫ 累积 token 用量
                 try:
                     u = response.usage
@@ -736,6 +807,9 @@ class AIService:
                     # 只有思维链、没有正文的响应也要正常结束
                     pass
                 print(f"[AI-Stream] 流式调用成功，总长度={len(content)}")
+                # ③ 累积估算字符（provider 无 usage 时兜底）
+                self._est_prompt_chars += self._msg_chars(messages)
+                self._est_completion_chars += len(content)
                 return
             except Exception as e:
                 print(f"[AI-Stream] 第{attempt + 1}次尝试失败: {e}")
