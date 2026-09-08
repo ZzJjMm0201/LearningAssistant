@@ -3290,6 +3290,21 @@ fun SolutionCard(
 // 全局字体倍率：用于抵消内容卡片内部 float->.sp 的二次缩放
 val LocalExtraFontScale = staticCompositionLocalOf { 1f }
 
+/** 悬浮框/弹窗内容缩放作用域：弹窗是独立窗口，LocalDensity 会被窗口重置，
+ *  在此按全局倍率重新放大其内部文字 */
+@Composable
+fun FontScaleScope(content: @Composable () -> Unit) {
+    val s = LocalExtraFontScale.current
+    val d = LocalDensity.current
+    if (s != 1f) {
+        CompositionLocalProvider(LocalDensity provides Density(d.density, d.fontScale * s)) {
+            content()
+        }
+    } else {
+        content()
+    }
+}
+
 private val MIND_COLORS = listOf(
     Color(0xFFFFD54F),  // 根：金黄
     Color(0xFF00E5FF),  // 层1：青
@@ -4306,6 +4321,7 @@ fun AskDialog(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+FontScaleScope {
                 if (suggestedQuestions.isNotEmpty()) {
                     Text("推荐问题：", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
                     suggestedQuestions.forEach { question ->
@@ -4355,7 +4371,7 @@ fun AskDialog(
                         Text("发送", color = Color.White)
                     }
                 }
-            }
+            }}
         },
         confirmButton = {},
         containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
@@ -4737,13 +4753,13 @@ fun FunctionButton(
 @Composable
 fun LoadingOverlay(message: String = "处理中...") {
     Box(
-            modifier = Modifier.fillMaxSize().background(Color(0xCC0A0A1A)),
+            modifier = Modifier.fillMaxSize().background(tC(Color(0xCC0A0A1A), Color(0xE6FFFFFF))),
             contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator(color = Color(0xFF00D2FF))
             Spacer(modifier = Modifier.height(16.dp))
-            Text(message, color = Color.White, fontSize = 16.sp)
+            Text(message, color = tC(Color.White, Color(0xFF16181D)), fontSize = 16.sp)
         }
     }
 }
@@ -4756,6 +4772,7 @@ fun WelcomeDialog(onDismiss: () -> Unit, viewModel: MainViewModel) {
             title = { Text("👋 欢迎使用学习助手 2.1", color = tC(Color.White, Color(0xFF16181D))) },
             text = {
                 Column {
+FontScaleScope {
                     Text(
                             """📗 使用说明：
 
@@ -4794,7 +4811,7 @@ fun WelcomeDialog(onDismiss: () -> Unit, viewModel: MainViewModel) {
                         )
                         Text("不再提醒", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
                     }
-                }
+                }}
             },
             confirmButton = {
                 Button(onClick = {
@@ -4822,6 +4839,7 @@ fun HistoryViewScreen(
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf("") }
     var selectedRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
+    var selectedRecordIndex by remember { mutableStateOf(1) }
     // 服务端返回的真实总数/学科数（不受50条截断影响）
     var totalCount by remember { mutableStateOf(0) }
     var subjectCount by remember { mutableStateOf(0) }
@@ -4914,6 +4932,7 @@ fun HistoryViewScreen(
     if (selectedRecord != null) {
         HistoryDetailScreen(
             record = selectedRecord!!,
+            displayIndex = selectedRecordIndex,
             onBack = { selectedRecord = null },
             viewModel = viewModel,
             serverAddress = serverAddress
@@ -4961,7 +4980,7 @@ fun HistoryViewScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
                 ) { Text("返回", color = tC(Color.White, Color(0xFF16181D))) }
                 
-                Text("📋 历史记录", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("📋 历史记录", color = tC(Color.White, Color(0xFF16181D)), fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 
                 IconButton(onClick = { loadHistory() }) {
                     Text("🔄", color = tC(Color.White, Color(0xFF16181D)), fontSize = 20.sp)
@@ -5116,6 +5135,7 @@ fun HistoryViewScreen(
                                     }
                                 } else {
                                     selectedRecord = record
+                                    selectedRecordIndex = index + 1
                                 }
                             },
                             onLongClick = {
@@ -5146,20 +5166,7 @@ fun HistoryViewScreen(
                                         .padding(end = 8.dp)
                         )
                     } else {
-                    // 使用服务端返回的真实总数/学科数
-                    val displayTotal = if (totalCount > 0) totalCount else records.size
-                    val displaySubjects = if (subjectCount > 0) subjectCount
-                    else records.map { it.subject }.filter { it.isNotEmpty() }.distinct().size
-                    val filterNote =
-                            if (subjectFilter.isNotEmpty()) " | 当前筛选：${subjectFilter.joinToString("/")} ${filteredRecords.size} 条" else ""
-                    Text(
-                        "共${displayTotal} 条记录 \n ${displaySubjects} 门学科$filterNote",
-                        color = tC(Color.Gray, Color(0xFF5C6470)),
-                        fontSize = 12.sp,
-                        modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 8.dp)
-                    )
+                    Spacer(Modifier.weight(1f))
                     }
                     
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -5626,6 +5633,7 @@ fun HistoryRecordCard(
 @Composable
 fun HistoryDetailScreen(
     record: ApiService.HistoryRecord,
+    displayIndex: Int = 0,
     onBack: () -> Unit,
     viewModel: MainViewModel? = null,
     serverAddress: String = "10.100.55.231:8000",
@@ -5761,7 +5769,7 @@ fun HistoryDetailScreen(
                     fontWeight = FontWeight.Bold
                 )
                 
-                Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 12.sp)
+                Text("#$displayIndex", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 12.sp)
             }
         }
         
@@ -6149,9 +6157,10 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                 ) {
+FontScaleScope {
                     Text("⚙️ 设置", color = tC(Color.White, Color(0xFF16181D)))
                     TextButton(onClick = onDismiss) { Text("关闭", color = Color(0xFF00D2FF)) }
-                }
+                }}
             },
             text = {
                 Column(
@@ -6446,15 +6455,19 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("小", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp)
-                        Slider(
-                                value = fontSize,
-                                onValueChange = { viewModel.fontSize.value = it },
-                                valueRange = 12f..28f,
-                                modifier = Modifier.weight(1f),
-                                colors = SliderDefaults.colors(thumbColor = Color(0xFF00D2FF))
-                        )
-                        Text("大", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 28.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(12f to "小", 16f to "默认", 20f to "大", 24f to "特大").forEach { (v, label) ->
+                                FilterChip(
+                                        selected = fontSize == v,
+                                        onClick = { viewModel.fontSize.value = v },
+                                        label = { Text(label, fontSize = 12.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF00D2FF),
+                                                selectedLabelColor = Color.Black
+                                        )
+                                )
+                            }
+                        }
                     }
                     // 字体预览
                     Text(
@@ -6741,6 +6754,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                 modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+FontScaleScope {
                 SettingSwitch(
                     title = "启用番茄钟",
                     subtitle = "关闭后不进行任何计时",
@@ -6835,7 +6849,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
                         Text("🔄 重置", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp)
                     }
                 }
-            }
+            }}
         },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -6916,6 +6930,7 @@ fun MasteryDialog(onSelect: (String) -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
+FontScaleScope {
                 Text("你对这道题的掌握程度如何？", color = tC(Color.White.copy(alpha = 0.8f), Color(0xFF16181D).copy(alpha = 0.8f)), fontSize = 14.sp)
                 
                 Button(
@@ -6944,7 +6959,7 @@ fun MasteryDialog(onSelect: (String) -> Unit) {
                 ) {
                     Text("❌ 完全没掌握", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 }
-            }
+            }}
         },
         confirmButton = {},
         containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
@@ -6979,6 +6994,7 @@ fun CountdownConfirmDialog(
         title = { Text(title, color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column {
+FontScaleScope {
                 if (content.isNotEmpty()) {
                     Surface(
                         color = tC(Color(0xFF1A1A2E), Color(0xFFF2F4F8)),
@@ -7003,7 +7019,7 @@ fun CountdownConfirmDialog(
                     color = tC(Color.Gray, Color(0xFF5C6470)),
                     fontSize = 13.sp
                 )
-            }
+            }}
         },
         confirmButton = {
             Button(
@@ -7057,6 +7073,7 @@ fun GestureCountdownDialog(
         title = { Text("✋ 手势已识别", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column {
+FontScaleScope {
                 Text(
                     "请收手，即将自动执行…",
                     color = tC(Color.White, Color(0xFF16181D)),
@@ -7069,7 +7086,7 @@ fun GestureCountdownDialog(
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
-            }
+            }}
         },
         confirmButton = {
             Button(
@@ -7323,6 +7340,7 @@ fun ReportRangeDialog(onSelect: (Int) -> Unit, onDismiss: () -> Unit) {
             title = { Text("📅 选择统计时间范围", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+FontScaleScope {
                     listOf(7 to "最近 7 天", 30 to "最近 30 天", 90 to "最近 90 天", 0 to "全部历史").forEach { (days, label) ->
                         Button(
                                 onClick = { onSelect(days) },
@@ -7330,7 +7348,7 @@ fun ReportRangeDialog(onSelect: (Int) -> Unit, onDismiss: () -> Unit) {
                                 colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
                         ) { Text(label, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
                     }
-                }
+                }}
             },
             confirmButton = {},
             dismissButton = {
