@@ -35,37 +35,38 @@ def _segment_knowledge_points(all_kp):
     return sorted(counter.items(), key=lambda x: -x[1])
 
 def _wordcloud_trace(top_words):
-    """用 plotly scatter 生成词云数据（词 + 次数；字号/颜色随频率缩放，网格布局避免重叠）"""
+    """用 plotly scatter 生成词云（词+次数；行式标签布局：按文本估算宽度换行，避免相互挤压）"""
     if not top_words:
-        return None, []
-    words = [w for w, _ in top_words]
+        return None, [], 0.0, 0.0
+    n = len(top_words)
     counts = [c for _, c in top_words]
-    n = len(words)
-    # 金字塔式螺旋布局：按 (r, 角度) 放置，避免完全重叠
-    import math
-    positions = []
-    angle = 0.0
-    radius = 0.0
-    for i in range(n):
-        radius = 0.6 * math.sqrt(i + 1)
-        angle += 2.39996  # 黄金角
-        x = radius * math.cos(angle)
-        y = radius * math.sin(angle)
-        positions.append((x, y))
-    xs = [p[0] for p in positions]
-    ys = [p[1] for p in positions]
     maxc = max(counts) if counts else 1
-    sizes = [int(12 + 30 * (c / maxc)) for c in counts]
-    # 颜色：蓝-青-绿渐变色板
+    sizes = [int(13 + 24 * (c / maxc)) for c in counts]
+    labels = [f"{w}({c})" for w, c in top_words]
     palette = ['#2196F3', '#00BCD4', '#4CAF50', '#00D2FF', '#7B2FBE', '#8BC34A', '#03A9F4']
     colors = [palette[i % len(palette)] for i in range(n)]
-    labels = [f"{w}({c})" for w, c in top_words]
+    # 行式布局：x 累计，超宽换行；宽度按“字符数 × 字号 × 0.7”估算（中文≈字号宽）
+    max_w = 900.0
+    xs, ys = [], []
+    x, y, row_max = 10.0, 0.0, 0.0
+    for i in range(n):
+        size = sizes[i]
+        w_est = max(34.0, len(labels[i]) * size * 0.70)
+        if x > 10.0 and x + w_est > max_w:
+            y += row_max * 1.22
+            x = 10.0
+            row_max = 0.0
+        xs.append(x + w_est / 2)
+        ys.append(y)
+        x += w_est + 12
+        row_max = max(row_max, size)
+    total_h = y + row_max * 1.22 + 12.0
     trace = go.Scatter(
         x=xs, y=ys, mode='text', text=labels,
         textfont=dict(size=sizes, color=colors),
         hoverinfo='skip',
     )
-    return trace, top_words
+    return trace, top_words, max_w, total_h
 
 
 def ensure_plotly_local() -> str:
@@ -328,15 +329,15 @@ class ReportGenerator:
         fig3 = None
         if kp_word_freq:
             fig3 = go.Figure()
-            word_trace, _ = _wordcloud_trace(kp_word_freq)
+            word_trace, _, wc_w, wc_h = _wordcloud_trace(kp_word_freq)
             if word_trace is not None:
                 fig3.add_trace(word_trace)
                 fig3.update_layout(
                     title="高频知识点词云（词后为出现次数）",
                     margin=dict(l=10, r=10, t=50, b=10),
-                    height=420,
-                    xaxis=dict(visible=False, range=[-6, 6]),
-                    yaxis=dict(visible=False, range=[-6, 6], scaleanchor="x", scaleratio=1),
+                    height=460,
+                    xaxis=dict(visible=False, range=[0, wc_w]),
+                    yaxis=dict(visible=False, range=[-wc_h, 10]),
                     dragmode=False,
                     hovermode=False,
                 )

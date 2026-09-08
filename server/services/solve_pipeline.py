@@ -328,14 +328,14 @@ class SolvePipeline:
                 break
 
     def start_knowledge_extension(self, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                                  style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
-        """启动知识延伸流程"""
+                                  style: Optional[str] = None, dialect: str = "", grade: str = "", text_input: Optional[str] = None) -> str:
+        """启动知识延伸流程（⑧ text_input 时跳过OCR）"""
         request_id = session_id or str(uuid.uuid4())
         _event_queues[request_id] = deque()
         
         thread = threading.Thread(
             target=self._extension_worker,
-            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model, style, dialect, grade)
+            args=(request_id, image_path, session_id, user_id, engine, ocr_mode, vision_model, model, style, dialect, grade, text_input)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -343,17 +343,23 @@ class SolvePipeline:
         return request_id
 
     def _extension_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                          style: Optional[str] = None, dialect: str = "", grade: str = ""):
+                          style: Optional[str] = None, dialect: str = "", grade: str = "", text_input: Optional[str] = None):
         """知识延伸工作线程"""
         print(f"[{request_id}] ========== 知识延伸流程启动 ==========\n")
         
         try:
-            # OCR
-            self._emit_event(request_id, "info", "正在识别内容...")
-            ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
-            print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
-            
-            self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": ocr_time, "source": ocr_source})
+            # OCR（⑧ 文字输入模式跳过）
+            if text_input and text_input.strip():
+                ocr_text = text_input.strip()
+                ocr_time = 0.0
+                ocr_source = "text"
+                print(f"[{request_id}] 文字输入模式，跳过OCR，长度: {len(ocr_text)}")
+                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": 0.0, "source": "text"})
+            else:
+                self._emit_event(request_id, "info", "正在识别内容...")
+                ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
+                print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
+                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": ocr_time, "source": ocr_source})
             
             if not ocr_text or ocr_text.startswith("OCR"):
                 self._emit_event(request_id, "error", "OCR识别失败")

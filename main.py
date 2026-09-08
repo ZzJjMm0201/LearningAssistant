@@ -546,7 +546,7 @@ async def ask_question_stream(request: Request, body: AskRequest):
         db.close()
 
 @app.post("/animation")
-async def create_animation(file: UploadFile = File(...)):
+async def create_animation(request: Request, file: UploadFile = File(...)):
     # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
     _perm_err = check_ai_permission(request)
     if _perm_err is not None:
@@ -593,6 +593,45 @@ async def create_animation(file: UploadFile = File(...)):
             "url": url,
             "request_id": request_id
         }
+    else:
+        return {"status": "error", "message": "动画生成失败"}
+
+
+
+@app.post("/animation/text")
+async def create_animation_text(request: Request, body: SolveTextRequest):
+    """⑧ 文字输入直接生成AI动画（跳过OCR，复用动画生成）"""
+    # ⑮ 账号权限
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    request_id = str(uuid.uuid4())
+    html_path = generate_animation(text, engine=get_engine(request))
+    if html_path:
+        filename = Path(html_path).name
+        url = f"/static/animations/{filename}"
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="animation",
+                    title="AI动画",
+                    content=url,
+                    extra_json={"ocr_text": text[:200]},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[动画-文本] 保存历史记录失败: {e}")
+        return {"status": "ok", "url": url, "request_id": request_id}
     else:
         return {"status": "error", "message": "动画生成失败"}
 
@@ -833,6 +872,33 @@ async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     
     solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request), ocr_mode=get_ocr_mode(request), vision_model=get_vision_model(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
     
+    return {"request_id": request_id, "status": "processing"}
+
+
+
+@app.post("/extend/text")
+async def knowledge_extension_text(request: Request, body: SolveTextRequest):
+    """⑧ 文字输入直接知识延伸（跳过OCR）"""
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    request_id = str(uuid.uuid4())
+    image_path = HISTORY_DIR / f"{request_id}.txt.jpg"
+    solve_pipeline.start_knowledge_extension(
+        image_path, request_id,
+        user_id=get_current_user(request),
+        engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        text_input=text,
+    )
     return {"request_id": request_id, "status": "processing"}
 
 @app.get("/extend/stream/{request_id}")
