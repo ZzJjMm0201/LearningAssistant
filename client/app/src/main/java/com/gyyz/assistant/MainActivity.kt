@@ -591,6 +591,8 @@ class MainViewModel : ViewModel() {
         val rid = _pendingQuestionSelectRequestId.value
         _pendingQuestionSelectRequestId.value = ""
         showQuestionSelectDialog.value = false
+        // ② 按实际选中数量更新，选中1题时不显示顶部切换器（服务端也会按单题处理）
+        multiQuestionCount.value = indices.size
         if (rid.isNotEmpty()) {
             viewModelScope.launch(Dispatchers.IO) {
                 try {
@@ -814,11 +816,7 @@ class MainViewModel : ViewModel() {
                                         val ocrObj = json.optJSONObject("content")
                                         val ocrText0 = if (ocrObj != null) ocrObj.optString("text", "") else json.optString("content", "")
                                         ocrMap[cur(qiKey)] = ocrText0
-                                        _statusText.value = "正在搜索题库..."
-                                        _pendingOcrRequestId.value = requestId
-                                        showOcrConfirmDialog.value = true
-                                        ocrConfirmText.value = ocrText0
-                                        ocrConfirmTitle.value = "确认识别结果"
+                                        _statusText.value = "正在分题解答..."
                                         emit(qiKey, AppState.Solving(
                                                 stage = SolveStage.ANALYZING,
                                                 requestId = requestId,

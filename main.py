@@ -96,9 +96,13 @@ async def lifespan(app):
     """服务生命周期：启动时预加载OCR模型"""
     # startup
     import threading
-    thread = threading.Thread(target=ocr_service.preload_local_model, daemon=True)
-    thread.start()
-    print("[启动] OCR模型预加载已触发（后台异步加载中...）")
+    # 本地 PaddleOCR 内存占用大，仅在本机OCR启用时才预加载（避免空载 OOM/卡顿）
+    if FEATURE_FLAGS.get("enable_local_ocr", False):
+        thread = threading.Thread(target=ocr_service.preload_local_model, daemon=True)
+        thread.start()
+        print("[启动] OCR模型预加载已触发（后台异步加载中...）")
+    else:
+        print("[启动] 本地OCR未启用，跳过 PaddleOCR 模型预加载")
     yield
     # shutdown
     print("[关闭] 服务关闭")

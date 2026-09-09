@@ -164,16 +164,6 @@ class SolvePipeline:
                 self._emit_event(request_id, "complete", None)
                 return
 
-            # ========== 等待用户确认OCR结果 ==========
-            self._emit_event(request_id, "waiting_confirm", {"text": ocr_text})
-            confirm_event = threading.Event()
-            _pending_confirm[request_id] = confirm_event
-            if not confirm_event.wait(timeout=30):
-                print(f"[{request_id}] OCR确认超时，自动继续")
-            else:
-                print(f"[{request_id}] 用户已确认OCR结果")
-            _pending_confirm.pop(request_id, None)
-
             # ========== ① 多题分题（⑧ 文字输入模式免分题） ==========
             if ocr_source == "text":
                 questions = [ocr_text]
@@ -203,12 +193,32 @@ class SolvePipeline:
                 questions = [questions[i] for i in selected]
                 print(f"[{request_id}] 用户选定 {len(questions)} 道题，索引 {selected}")
 
-            # 逐题走完整流程（循环）
-            for qi, q_text in enumerate(questions):
-                q_session = f"{session_id}__q{qi}" if len(questions) > 1 else session_id
+            # ③ 多题：所有题目同时解答（并发线程，各自独立走完整流程）；单题顺序
+            if len(questions) > 1:
+                def _run_one(qi: int, q_text: str):
+                    try:
+                        q_session = f"{session_id}__q{qi}"
+                        self._solve_one(
+                            request_id=request_id, qi=qi, ocr_text=q_text, session_id=q_session, base_host=base_host,
+                            user_id=user_id, engine=engine, model=model, style=style,
+                            thinking=thinking, search_enabled=search_enabled,
+                            dialect=dialect, grade=grade,
+                            personality=personality, subject=subject, detail=detail, weak_count=weak_count,
+                            ocr_time=ocr_time, vision_model=vision_model,
+                        )
+                    except Exception as e:
+                        print(f"[{request_id}] 第{qi + 1}题解答异常: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        self._emit_event(request_id, "error", f"第{qi + 1}题异常: {e}", qi)
+                threads = [threading.Thread(target=_run_one, args=(qi, q)) for qi, q in enumerate(questions)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            else:
                 self._solve_one(
-                    request_id=request_id, qi=qi if len(questions) > 1 else None,
-                    ocr_text=q_text, session_id=q_session, base_host=base_host,
+                    request_id=request_id, qi=None, ocr_text=questions[0], session_id=session_id, base_host=base_host,
                     user_id=user_id, engine=engine, model=model, style=style,
                     thinking=thinking, search_enabled=search_enabled,
                     dialect=dialect, grade=grade,
