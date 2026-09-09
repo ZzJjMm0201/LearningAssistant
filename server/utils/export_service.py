@@ -203,11 +203,7 @@ def export_pdf(title: str, markdown_text: str, out_path: Path, host: str = "") -
         md = _download_images(markdown_text, host, tmp)
         # 标题单独加在最前（heading 1）
         md = f"# {title}\n\n" + md
-        if _pandoc_available():
-            if _export_via_pandoc(md, out_path, "pdf"):
-                return True
-            print("[Export] pandoc PDF 失败，回退 reportlab")
-        # 回退 reportlab
+        # PDF 直接用 reportlab（pandoc 需 LaTeX/MiKTeX，缺包会卡住/失败）
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.cidfonts import UnicodeCIDFont
