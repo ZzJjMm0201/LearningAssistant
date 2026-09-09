@@ -774,7 +774,8 @@ async def export_content(request: Request, body: ExportRequest):
     ext = "pdf" if fmt == "pdf" else "docx"
     fname = f"export_{_uuid.uuid4().hex[:10]}.{ext}"
     out_path = export_dir / fname
-    ok = export_pdf(body.title, body.content, out_path) if fmt == "pdf" else export_word(body.title, body.content, out_path)
+    _host = get_request_host(request)
+    ok = export_pdf(body.title, body.content, out_path, host=_host) if fmt == "pdf" else export_word(body.title, body.content, out_path, host=_host)
     if not ok:
         return {"status": "error", "message": "导出失败"}
     return {"status": "ok", "url": f"/static/exports/{fname}", "filename": fname}
