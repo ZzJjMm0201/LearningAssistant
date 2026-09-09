@@ -25,6 +25,9 @@ _event_queues: Dict[str, deque] = {}
 _event_threads: Dict[str, threading.Thread] = {}
 # 用户确认等待标志
 _pending_confirm: Dict[str, threading.Event] = {}
+# ① 多题选择：等待标志 / 已选题目索引（0-based）
+_pending_question_select: Dict[str, threading.Event] = {}
+_selected_questions: Dict[str, list] = {}
 
 def _normalize_mindmap(text: str) -> str:
     """思维导图围栏规范化：AI输出已含```代码块则原样使用，否则包裹（避免双层围栏格式错乱）"""
@@ -95,6 +98,18 @@ class SolvePipeline:
             event.set()
             return True
         return False
+
+    def select_questions(self, request_id: str, indices):
+        """① 多题：用户选定要解的题目索引（0-based），继续流程"""
+        ev = _pending_question_select.get(request_id)
+        if ev is None:
+            return False
+        try:
+            _selected_questions[request_id] = [int(i) for i in (indices or [])]
+        except Exception:
+            _selected_questions[request_id] = []
+        ev.set()
+        return True
     
     def cancel_solve(self, request_id: str):
         """用户取消后，清理并结束"""
@@ -173,6 +188,20 @@ class SolvePipeline:
 
             if len(questions) > 1:
                 self._emit_event(request_id, "question_split", {"count": len(questions), "questions": questions})
+                # ① 等待用户选题（默认/超时全选；客户端5秒倒计时自动确认）
+                sel_event = threading.Event()
+                _pending_question_select[request_id] = sel_event
+                if not sel_event.wait(timeout=120):
+                    print(f"[{request_id}] 多题选择超时，默认全选")
+                    selected = list(range(len(questions)))
+                else:
+                    selected = _selected_questions.pop(request_id, list(range(len(questions))))
+                _pending_question_select.pop(request_id, None)
+                selected = sorted({i for i in selected if isinstance(i, int) and 0 <= i < len(questions)})
+                if not selected:
+                    selected = list(range(len(questions)))
+                questions = [questions[i] for i in selected]
+                print(f"[{request_id}] 用户选定 {len(questions)} 道题，索引 {selected}")
 
             # 逐题走完整流程（循环）
             for qi, q_text in enumerate(questions):

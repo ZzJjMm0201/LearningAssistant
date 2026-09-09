@@ -253,6 +253,9 @@ class MainViewModel : ViewModel() {
     // 待确认的解题 request_id（用于把确认结果回传给服务端，避免30秒超时等待）
     private val _pendingOcrRequestId = MutableStateFlow("")
     val pendingOcrRequestId: StateFlow<String> = _pendingOcrRequestId.asStateFlow()
+    // ① 多题选择弹窗
+    val showQuestionSelectDialog = MutableStateFlow(false)
+    private val _pendingQuestionSelectRequestId = MutableStateFlow("")
 
     // Feature 3: 提问loading状态
     val isAskingQuestion = MutableStateFlow(false)
@@ -583,6 +586,22 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    // ① 多题：用户选定题目索引后继续（超时/未确认则服务端默认全选）
+    fun confirmQuestionSelect(indices: List<Int>) {
+        val rid = _pendingQuestionSelectRequestId.value
+        _pendingQuestionSelectRequestId.value = ""
+        showQuestionSelectDialog.value = false
+        if (rid.isNotEmpty()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    apiService.selectQuestions(rid, indices)
+                } catch (e: Exception) {
+                    Log.w("MainViewModel", "选题回传失败: ${e.message}")
+                }
+            }
+        }
+    }
+
     fun onPhotoReady(photoFile: java.io.File) {
         Log.d("MainViewModel", "照片就绪，开始上传: ${photoFile.absolutePath}")
         cancelCurrentSSE = false  // Feature 5: 重置取消标志
@@ -777,7 +796,12 @@ class MainViewModel : ViewModel() {
                                         }
                                         multiQuestionCount.value = if (cnt > 1) cnt else (if (qs.size > 1) qs.size else 0)
                                         multiQuestionTexts.value = qs
-                                        _statusText.value = "识别到 ${multiQuestionCount.value} 道题，正在逐题解答..."
+                                        if (multiQuestionCount.value > 1) {
+                                            _pendingQuestionSelectRequestId.value = requestId
+                                            showQuestionSelectDialog.value = true
+                                        } else {
+                                            _statusText.value = "正在逐题解答..."
+                                        }
                                     }
                                     "info" -> {
                                         _statusText.value = json.optString("content", "处理中...")
@@ -2242,6 +2266,16 @@ fun MainScreen(
                     viewModel.confirmOcr()
                     viewModel.backToTracking()
                 }
+            )
+        }
+
+        // ① 多题选择弹窗（OCR分题后：默认全选，5秒倒计时；改动选择则取消倒计时）
+        val showQuestionSelect by viewModel.showQuestionSelectDialog.collectAsState()
+        val multiQTexts by viewModel.multiQuestionTexts.collectAsState()
+        if (showQuestionSelect) {
+            QuestionSelectDialog(
+                questions = multiQTexts,
+                onConfirm = { indices -> viewModel.confirmQuestionSelect(indices) }
             )
         }
 
@@ -7346,6 +7380,73 @@ FontScaleScope {
 }
 
 // ==================== Feature 9/10: 倒计时确认弹窗 ====================
+
+@Composable
+fun QuestionSelectDialog(questions: List<String>, onConfirm: (List<Int>) -> Unit) {
+    var selected by remember(questions) { mutableStateOf(questions.indices.toSet()) }
+    var countdown by remember { mutableStateOf(5) }
+    var counting by remember { mutableStateOf(true) }
+    var touched by remember { mutableStateOf(false) }
+
+    LaunchedEffect(counting, touched) {
+        while (counting && !touched && countdown > 0) {
+            delay(1000)
+            countdown--
+        }
+        if (counting && !touched && countdown == 0) {
+            counting = false
+            onConfirm(selected.sorted())
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("识别到 ${questions.size} 道题，请选择要解答的题目", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                FontScaleScope {
+                    questions.forEachIndexed { i, q ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = i in selected,
+                                onCheckedChange = { chk ->
+                                    touched = true
+                                    counting = false
+                                    selected = if (chk) selected + i else selected - i
+                                },
+                                colors = CheckboxDefaults.colors(checkedColor = Color(0xFF00D2FF))
+                            )
+                            Text(
+                                "第${i + 1}题：${q.take(48)}${if (q.length > 48) "…" else ""}",
+                                color = tC(Color.White, Color(0xFF16181D)),
+                                fontSize = 13.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                    Text(
+                        if (counting && !touched) "将在 ${countdown} 秒后自动解答全部题目…" else "已取消倒计时，请点击下方“确认继续”",
+                        color = tC(Color.Gray, Color(0xFF5C6470)),
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { counting = false; onConfirm(selected.sorted()) },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+            ) {
+                Text(if (selected.isEmpty()) "请至少选择一题" else "确认继续（${selected.size} 题）", color = Color.Black, fontSize = 14.sp)
+            }
+        },
+        containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
+}
 
 @Composable
 fun CountdownConfirmDialog(

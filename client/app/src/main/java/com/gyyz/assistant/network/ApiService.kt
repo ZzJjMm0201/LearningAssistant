@@ -309,6 +309,27 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         }
     }
 
+    /** ① 多题：上传用户选定的题目索引，让服务端只解选中的题 */
+    suspend fun selectQuestions(requestId: String, indices: List<Int>) {
+        return withContext(Dispatchers.IO) {
+            try {
+                val arr = org.json.JSONArray()
+                indices.forEach { arr.put(it) }
+                val json = JSONObject().apply { put("indices", arr) }
+                val body = json.toString().toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("$BASE_URL/solve/select_questions/$requestId")
+                    .post(body)
+                    .withAuth()
+                    .build()
+                client.newCall(request).execute().close()
+            } catch (e: Exception) {
+                // 失败不阻塞（服务端超时后默认全选）
+                android.util.Log.w("ApiService", "selectQuestions失败: ${e.message}")
+            }
+        }
+    }
+
     /**
      * 多轮对话提问
      */

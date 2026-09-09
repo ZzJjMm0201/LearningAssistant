@@ -414,6 +414,14 @@ async def confirm_solve(request_id: str):
         return {"status": "ok", "message": "已确认，继续处理"}
     return {"status": "error", "message": "request_id无效或已过期"}
 
+@app.post("/solve/select_questions/{request_id}")
+async def select_questions(request_id: str, body: dict):
+    """① 多题：用户选定要解的题目索引后继续"""
+    indices = body.get("indices", []) if isinstance(body, dict) else []
+    if solve_pipeline.select_questions(request_id, indices):
+        return {"status": "ok", "message": "已确认选题"}
+    return {"status": "error", "message": "request_id无效或已超时"}
+
 @app.post("/solve/cancel/{request_id}")
 async def cancel_solve(request_id: str):
     """用户取消解题流程"""
