@@ -2884,6 +2884,7 @@ fun SolvingScreen(
                                     fontSize = 13.sp,
                                     lineHeight = 18.sp
                             )
+                            EndFoldArrow(Color(0xFFFFB74D)) { showThinking = false }
                         }
                     }
                 }
@@ -2962,6 +2963,7 @@ fun SolvingScreen(
                                 )
                                 Divider(color = tC(Color.White.copy(alpha = 0.15f), Color(0xFF16181D).copy(alpha = 0.15f)))
                             }
+                            EndFoldArrow(Color(0xFFFFB74D)) { showSearch = false }
                         }
                     }
                 }
@@ -3372,6 +3374,16 @@ fun AiUsageFooter(usage: Map<String, String>) {
 }
 
 @Composable
+fun EndFoldArrow(color: Color, onClick: () -> Unit) {
+    Row(
+            modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(top = 4.dp),
+            horizontalArrangement = Arrangement.Center
+    ) {
+        Text("▲ 收起", color = color.copy(alpha = 0.7f), fontSize = 12.sp)
+    }
+}
+
+@Composable
 fun SolutionCard(
     title: String,
     content: String,
@@ -3417,6 +3429,7 @@ fun SolutionCard(
                 } else {
                     MarkdownView(content = content, modifier = Modifier.fillMaxWidth(), fontSize = fontSize)
                 }
+                EndFoldArrow(color) { expanded = false }
             }
         }
     }
@@ -3564,6 +3577,7 @@ fun MindMapCard(mindMap: String, title: String = "🗺️ 思维导图", color: 
                 } else {
                     MindMapView(mindMap, fontSize = fontSize)
                 }
+                EndFoldArrow(color) { expanded = false }
             }
         }
     }
@@ -3748,6 +3762,7 @@ fun KnowledgeScreen(
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text("📝 ${item.answer}", color = tC(Color(0xFFB0BEC5), Color(0xFF546E7A)), fontSize = 13.sp)
                             }
+                            EndFoldArrow(Color(0xFF00D2FF)) { expanded = false }
                         }
                     }
                 }
@@ -3790,6 +3805,7 @@ fun KnowledgeScreen(
                                     Text("追问", color = Color(0xFF00D2FF), fontSize = 12.sp)
                                 }
                             }
+                            EndFoldArrow(Color(0xFF00D2FF)) { expanded = false }
                         }
                     }
                 }
