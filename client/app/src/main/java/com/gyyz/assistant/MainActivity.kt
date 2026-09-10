@@ -269,7 +269,8 @@ class MainViewModel : ViewModel() {
     // 番茄钟增强：正计时模式 + 暂停/继续 + 设置弹窗
     val pomodoroMode = MutableStateFlow(false)   // false=倒计时, true=正计时
     val elapsedTime = MutableStateFlow(0)        // 正计时经过秒数
-    val pomodoroRunning = MutableStateFlow(true) // 暂停/继续
+    val pomodoroRunning = MutableStateFlow(false) // 计时中
+    val pomodoroStarted = MutableStateFlow(false) // 是否已启动（idle/运行/暂停 三态）
     val showPomodoroSettings = MutableStateFlow(false)
 
     // Feature 20: GeoGebra
@@ -392,6 +393,8 @@ class MainViewModel : ViewModel() {
                         isResting.value = false
                         _statusText.value = "休息结束，继续学习！"
                         _pomodoroTime.value = pomodoroWorkDuration.value * 60
+                        pomodoroStarted.value = false
+                        pomodoroRunning.value = false
                     }
                 }
             }
@@ -423,7 +426,8 @@ class MainViewModel : ViewModel() {
         pomodoroMode.value = stopwatch
         elapsedTime.value = 0
         _pomodoroTime.value = pomodoroWorkDuration.value * 60
-        pomodoroRunning.value = true
+        pomodoroStarted.value = false
+        pomodoroRunning.value = false
     }
 
     /**
@@ -435,7 +439,8 @@ class MainViewModel : ViewModel() {
         pomodoroMode.value = stopwatch
         elapsedTime.value = 0
         _pomodoroTime.value = pomodoroWorkDuration.value * 60
-        pomodoroRunning.value = true
+        pomodoroStarted.value = false
+        pomodoroRunning.value = false
         isResting.value = false
     }
 
@@ -443,7 +448,12 @@ class MainViewModel : ViewModel() {
      * 暂停/继续计时
      */
     fun togglePomodoro() {
-        pomodoroRunning.value = !pomodoroRunning.value
+        if (!pomodoroStarted.value) {
+            pomodoroStarted.value = true
+            pomodoroRunning.value = true
+        } else {
+            pomodoroRunning.value = !pomodoroRunning.value
+        }
     }
 
     /**
@@ -452,7 +462,8 @@ class MainViewModel : ViewModel() {
     fun resetPomodoro() {
         elapsedTime.value = 0
         _pomodoroTime.value = pomodoroWorkDuration.value * 60
-        pomodoroRunning.value = true
+        pomodoroStarted.value = false
+        pomodoroRunning.value = false
     }
 
     private fun startTracking() {
@@ -1533,7 +1544,7 @@ class MainViewModel : ViewModel() {
 
     val gestureEnabled = MutableStateFlow(false)
     val voiceEnabled = MutableStateFlow(false)
-    val tomatoEnabled = MutableStateFlow(false)
+    val tomatoEnabled = MutableStateFlow(true)
     // 十一 手势识别成功后的收手提示（3秒倒计时，结束后执行动作）
     val showGestureCountdown = MutableStateFlow(false)
     val gesturePendingAction = MutableStateFlow("")   // solve/animation/extend/3/2
@@ -1858,6 +1869,7 @@ class MainActivity : ComponentActivity() {
                 val _sysFontScale = LocalDensity.current.fontScale
                 val _fontSizeState by themeVm.fontSize.collectAsState()
                 val _extraScale = (_fontSizeState / 16f).coerceAtLeast(0.6f)
+                SideEffect { AppFontScale = _extraScale }
 
                 CompositionLocalProvider(
                         LocalExtraFontScale provides _extraScale,
@@ -3424,7 +3436,7 @@ fun SolutionCard(
     initiallyCollapsed: Boolean = false,
     streaming: Boolean = false,
 ) {
-    val m = LocalExtraFontScale.current
+    val m = AppFontScale
     var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
     Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -3476,7 +3488,7 @@ val LocalExtraFontScale = staticCompositionLocalOf { 1f }
  *  在此按全局倍率重新放大其内部文字 */
 @Composable
 fun FontScaleScope(content: @Composable () -> Unit) {
-    val s = LocalExtraFontScale.current
+    val s = AppFontScale
     val d = LocalDensity.current
     if (s != 1f) {
         CompositionLocalProvider(LocalDensity provides Density(d.density, d.fontScale * s)) {
@@ -3532,7 +3544,7 @@ private fun colorForLv(lv: Int): Color = MIND_COLORS[lv % MIND_COLORS.size]
 
 @Composable
 fun MindMapView(content: String, fontSize: Float = 17f) {
-    val m = LocalExtraFontScale.current
+    val m = AppFontScale
     val nodes = remember(content) { parseMindTree(content) }
     if (nodes.isEmpty()) {
         // 失败则退回纯文本
@@ -3585,7 +3597,7 @@ fun MindMapView(content: String, fontSize: Float = 17f) {
 // 思维导图卡片（用 UI 树形渲染，而非纯文本）
 @Composable
 fun MindMapCard(mindMap: String, title: String = "🗺️ 思维导图", color: Color = Color(0xFF00C853), initiallyCollapsed: Boolean = false, streaming: Boolean = false, fontSize: Float = 17f) {
-    val m = LocalExtraFontScale.current
+    val m = AppFontScale
     var expanded by remember(initiallyCollapsed) { mutableStateOf(!initiallyCollapsed) }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
@@ -4349,6 +4361,8 @@ private fun prepareMarkdownContent(content: String): String {
 // ==================== ⑦ 主题（亮/暗/跟随系统） ====================
 // 全局暗色标记：所有自绘颜色根据它切换（在 LearningAssistantTheme 组合时更新）
 var AppDarkTheme: Boolean by mutableStateOf(true)
+// ⑬ 全局字体倍率（顶层状态，弹窗独立窗口也能读到；组合时更新）
+var AppFontScale: Float by mutableStateOf(1f)
 
 /** 主题色选择器：深色模式返回 dark，亮色模式返回 light（组合期调用，可响应切换） */
 private fun tC(dark: Color, light: Color): Color = if (AppDarkTheme) dark else light
@@ -6779,7 +6793,7 @@ FontScaleScope {
                     Text(
                         "预览文字 ABC 123 学习助手",
                         color = tC(Color.White, Color(0xFF16181D)),
-                        fontSize = (fontSize / LocalExtraFontScale.current).sp,
+                        fontSize = (fontSize / AppFontScale).sp,
                         modifier = Modifier.padding(vertical = 4.dp)
                     )
 
@@ -6820,7 +6834,7 @@ FontScaleScope {
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
                                 selected = llmProvider == "deepseek",
                                 onClick = {
@@ -7080,6 +7094,7 @@ fun PomodoroSettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val rest by viewModel.pomodoroRestDuration.collectAsState()
     val mode by viewModel.pomodoroMode.collectAsState()
     val running by viewModel.pomodoroRunning.collectAsState()
+    val started by viewModel.pomodoroStarted.collectAsState()
     val tomatoEnabled by viewModel.tomatoEnabled.collectAsState()
 
     var workInput by remember(work) { mutableStateOf(work.toString()) }
@@ -7268,10 +7283,10 @@ FontScaleScope {
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     TextButton(onClick = { viewModel.togglePomodoro() }) {
-                        Text(if (running) "⏸ 暂停" else "▶ 继续", color = Color(0xFF00D2FF), fontSize = 14.sp)
-                    }
-                    TextButton(onClick = { viewModel.resetPomodoro() }) {
-                        Text("🔄 重置", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp)
+                        Text(
+                            if (!started) "▶ 启动" else if (running) "⏸ 暂停" else "▶ 继续",
+                            color = Color(0xFF00D2FF), fontSize = 14.sp
+                        )
                     }
                 }
             }}

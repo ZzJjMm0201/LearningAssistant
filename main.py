@@ -189,9 +189,9 @@ async def favicon():
     return Response(status_code=204)
 
 def get_engine(request: Request) -> str:
-    """AI提供方（X-Engine头，deepseek/qwen），默认deepseek"""
+    """AI提供方（X-Engine头：deepseek/qwen/doubao/hunyuan），默认deepseek"""
     engine = (request.headers.get("X-Engine") or "deepseek").lower()
-    return engine if engine in ("deepseek", "qwen") else "deepseek"
+    return engine if engine in ("deepseek", "qwen", "doubao", "hunyuan") else "deepseek"
 
 
 def get_llm_model(request: Request) -> Optional[str]:
