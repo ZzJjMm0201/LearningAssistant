@@ -5292,10 +5292,12 @@ fun HistoryViewScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
         ) {
-            Button(
-                    onClick = { showFilterDialog = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
-            ) { Text("🔍 筛选", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp) }
+            if (typeFilter == "all" || typeFilter == "solve") {
+                Button(
+                        onClick = { showFilterDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
+                ) { Text("🔍 筛选", color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp) }
+            }
             val activeFilters =
                     listOf(
                             subjectFilter.joinToString("/"),
@@ -7822,13 +7824,6 @@ fun ExportActions(
             modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Button(
-                onClick = {
-                    val saved = captureScreenToGallery(context)
-                    Toast.makeText(context, if (saved != null) "截图已保存到相册" else "截图失败", Toast.LENGTH_SHORT).show()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)), contentColor = tC(Color.White, Color(0xFF16181D)))
-        ) { Text("📷 截图", fontSize = 12.sp) }
         if (allowPdf) {
             Button(
                     onClick = {

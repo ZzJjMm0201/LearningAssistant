@@ -46,12 +46,12 @@ def _wordcloud_trace(top_words):
     palette = ['#2196F3', '#00BCD4', '#4CAF50', '#00D2FF', '#7B2FBE', '#8BC34A', '#03A9F4']
     colors = [palette[i % len(palette)] for i in range(n)]
     # 行式布局：x 累计，超宽换行；宽度按“字符数 × 字号 × 0.7”估算（中文≈字号宽）
-    max_w = 900.0
+    max_w = 520.0
     xs, ys = [], []
     x, y, row_max = 10.0, 0.0, 0.0
     for i in range(n):
         size = sizes[i]
-        w_est = max(34.0, len(labels[i]) * size * 0.70)
+        w_est = max(40.0, len(labels[i]) * size * 1.05)
         if x > 10.0 and x + w_est > max_w:
             y += row_max * 1.22
             x = 10.0
@@ -375,7 +375,7 @@ class ReportGenerator:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
         )
         fig5.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
-        fig5.update_xaxes(fixedrange=True)
+        fig5.update_xaxes(fixedrange=True, type="category")
         fig5.update_yaxes(fixedrange=True)
 
         # 7. 专注度分析（算法统计：书写/思考/翻页/求助时长占比）
@@ -446,7 +446,7 @@ class ReportGenerator:
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
             )
             fig9.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
-            fig9.update_xaxes(fixedrange=True)
+            fig9.update_xaxes(fixedrange=True, type="date")
             fig9.update_yaxes(fixedrange=True, range=[-0.1, 1.1])
 
         # 10. 学科掌握率（算法统计：按学科聚合加权平均）

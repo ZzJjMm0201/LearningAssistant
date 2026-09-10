@@ -251,6 +251,11 @@ def export_word(title: str, markdown_text: str, out_path: Path, host: str = "") 
     try:
         md = _download_images(markdown_text, host, tmp)
         md = f"# {title}\n\n" + md
+        # ④ 颜色标记 [[#RRGGBB]文字[[#RRGGBB] → HTML span（pandoc 转 Word 保留为彩色文字，不再原样输出标记）
+        md = re.sub(
+            r'\[\[#([0-9A-Fa-f]{6})\]\](.*?)\[\[#[0-9A-Fa-f]{6}\]\]',
+            r'<span style="color:#\1">\2</span>', md, flags=re.DOTALL
+        )
         if _pandoc_available():
             if _export_via_pandoc(md, out_path, "docx"):
                 return True
