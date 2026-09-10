@@ -45,7 +45,7 @@ class SolvePipeline:
         pass
     
     def start_solve(self, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                    style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, text_input: Optional[str] = None) -> str:
+                    style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, latex_helper=None, text_input: Optional[str] = None) -> str:
         # 使用 session_id 作为 request_id，如果不提供则生成新ID
         request_id = session_id or str(uuid.uuid4())
         
@@ -54,7 +54,7 @@ class SolvePipeline:
         thread = threading.Thread(
             target=self._solve_worker,
             args=(request_id, image_path, session_id, base_host, user_id, engine, ocr_mode, vision_model, model,
-                  style, thinking, search_enabled, dialect, grade, personality, subject, detail, weak_count, text_input)
+                  style, thinking, search_enabled, dialect, grade, personality, subject, detail, weak_count, latex_helper, text_input)
         )
         thread.daemon = True
         _event_threads[request_id] = thread
@@ -121,7 +121,7 @@ class SolvePipeline:
         self._cleanup(request_id)
     
     def _solve_worker(self, request_id: str, image_path: Path, session_id: Optional[str] = None, base_host: Optional[str] = None, user_id: Optional[int] = None, engine: Optional[str] = None, ocr_mode: str = "paddle", vision_model: Optional[str] = None, model: Optional[str] = None,
-                      style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, text_input: Optional[str] = None):
+                      style: Optional[str] = None, thinking=False, search_enabled: bool = True, dialect: str = "", grade: str = "", personality=None, subject: str = "", detail=None, weak_count: int = 0, latex_helper=None, text_input: Optional[str] = None):
         """后台解题工作线程（① 支持多题：OCR后分题，逐题走完整流程）"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
@@ -201,7 +201,7 @@ class SolvePipeline:
                         self._solve_one(
                             request_id=request_id, qi=qi, ocr_text=q_text, session_id=q_session, base_host=base_host,
                             user_id=user_id, engine=engine, model=model, style=style,
-                            thinking=thinking, search_enabled=search_enabled,
+                            thinking=thinking, search_enabled=search_enabled, latex_helper=latex_helper,
                             dialect=dialect, grade=grade,
                             personality=personality, subject=subject, detail=detail, weak_count=weak_count,
                             ocr_time=ocr_time, vision_model=vision_model,
@@ -220,7 +220,7 @@ class SolvePipeline:
                 self._solve_one(
                     request_id=request_id, qi=None, ocr_text=questions[0], session_id=session_id, base_host=base_host,
                     user_id=user_id, engine=engine, model=model, style=style,
-                    thinking=thinking, search_enabled=search_enabled,
+                    thinking=thinking, search_enabled=search_enabled, latex_helper=latex_helper,
                     dialect=dialect, grade=grade,
                     personality=personality, subject=subject, detail=detail, weak_count=weak_count,
                     ocr_time=ocr_time, vision_model=vision_model,
@@ -238,7 +238,7 @@ class SolvePipeline:
             self._cleanup(request_id)
 
     def _solve_one(self, request_id: str, qi: Optional[int], ocr_text: str, session_id: Optional[str], base_host: Optional[str], user_id: Optional[int], engine: Optional[str], model: Optional[str],
-                   style: Optional[str], thinking, search_enabled: bool, dialect: str, grade: str, personality=None, subject: str = "", detail=None, weak_count: int = 0, ocr_time: float = 0.0, vision_model: Optional[str] = None):
+                   style: Optional[str], thinking, search_enabled: bool, dialect: str, grade: str, personality=None, subject: str = "", detail=None, weak_count: int = 0, ocr_time: float = 0.0, vision_model: Optional[str] = None, latex_helper=None):
         """解单道题：题库搜索 + AI多轮 + LaTeX渲染 + 保存（事件带 qi 标记）"""
         # ========== 阶段2: 题库搜索（④ 设置中可关闭） ==========
         search_result, search_time, search_items = "", 0, []
@@ -263,7 +263,8 @@ class SolvePipeline:
         first_question_info = None
 
         for event in ai_service.solve_problem_stream(ocr_text, search_result, engine=engine, model=model,
-                                                     style=style, thinking=thinking, dialect=dialect, grade=grade):
+                                                     style=style, thinking=thinking, dialect=dialect, grade=grade,
+                                                     latex_helper=latex_helper):
             stage = event["stage"]
             content = event["content"]
 

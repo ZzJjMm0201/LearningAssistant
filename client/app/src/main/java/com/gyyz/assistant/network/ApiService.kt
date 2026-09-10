@@ -29,6 +29,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         private const val KEY_ANSWER_STYLE = "answer_style"
         private const val KEY_SEARCH_ENABLED = "search_enabled"
         private const val KEY_THINKING_ENABLED = "thinking_enabled"
+    private const val KEY_LATEX_HELPER = "latex_helper"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_DIALECT = "dialect"
         private const val KEY_GRADE = "grade"
@@ -131,6 +132,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     var answerStyle: String = "formal"
     var searchEnabled: Boolean = true
     var thinkingMode: String = "off"        // 十一 思考模式：off / on / auto（auto按难度）
+    var latexHelper: String = "auto"       // 图解辅助：off / on / auto（auto: 数学/物理且较难/难）
     var themeMode: String = "system"       // system / light / dark（纯客户端，不发服务器）
     var dialect: String = "普通话"         // ③ 方言名称（style=dialect 时；默认普通话）
     var grade: String = ""                 // ④ 年级（小学/初中/高中/考研）
@@ -150,6 +152,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         // 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度（回答风格已移除，不再发 X-Style）
         if (thinkingMode == "on") addHeader("X-Thinking", "1")
         else if (thinkingMode == "auto") addHeader("X-Thinking", "auto")
+        if (latexHelper == "on") addHeader("X-Latex-Helper", "1")
+        else if (latexHelper == "auto") addHeader("X-Latex-Helper", "auto")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
         // 中文值需 URL 编码，否则 OkHttp 报 "Unexpected char"（HTTP 头仅允许 ASCII）
         // 方言：非普通话才发送（以前要选“方言风格”才发，导致选了方言不生效）
@@ -197,6 +201,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             }
         } catch (e: Exception) { tm = null }
         thinkingMode = if (tm == "on" || tm == "auto") tm else "off"
+        latexHelper = sharedPreferences?.getString(KEY_LATEX_HELPER, "auto") ?: "auto"
         themeMode = sharedPreferences?.getString(KEY_THEME_MODE, "system") ?: "system"
         dialect = sharedPreferences?.getString(KEY_DIALECT, "普通话") ?: "普通话"
         grade = sharedPreferences?.getString(KEY_GRADE, "") ?: ""
@@ -208,17 +213,19 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     /**
      * 持久化 ②④⑦十一 扩展设置（风格/搜题/思考模式/主题）
      */
-    fun saveExtraSettings(style: String, search: Boolean, thinking: String, theme: String) {
+    fun saveExtraSettings(style: String, search: Boolean, thinking: String, theme: String, latexHelper: String = "auto") {
         sharedPreferences?.edit()
             ?.putString(KEY_ANSWER_STYLE, style)
             ?.putBoolean(KEY_SEARCH_ENABLED, search)
             ?.putString(KEY_THINKING_ENABLED, thinking)
             ?.putString(KEY_THEME_MODE, theme)
+            ?.putString(KEY_LATEX_HELPER, latexHelper)
             ?.apply()
         answerStyle = style
         searchEnabled = search
         thinkingMode = thinking
         themeMode = theme
+        this.latexHelper = latexHelper
     }
 
     /** 持久化 ⑧ 人格/详细度/学科 */

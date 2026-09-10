@@ -262,6 +262,18 @@ def get_thinking_enabled(request: Request):
     return v in ("1", "true", "yes", "on")
 
 
+def get_latex_helper(request: Request):
+    """图解辅助（X-Latex-Helper头：1/on 开启；0/off 关闭；auto 自动（数学/物理 且 较难/难））"""
+    v = (request.headers.get("X-Latex-Helper") or "").strip().lower()
+    if v == "auto":
+        return "auto"
+    if v in ("0", "false", "off", "no"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return "auto"
+
+
 def get_search_enabled(request: Request) -> bool:
     """④ 搜题开关（X-Search-Enabled头：0/false/off 关闭；默认开启）"""
     v = (request.headers.get("X-Search-Enabled") or "").strip().lower()
@@ -313,6 +325,7 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         model=get_llm_model(request),
         style=get_answer_style(request),
         thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
         search_enabled=get_search_enabled(request),
         dialect=get_dialect(request),
         grade=get_grade(request),
@@ -359,6 +372,7 @@ async def solve_text(request: Request, body: SolveTextRequest):
         model=get_llm_model(request),
         style=get_answer_style(request),
         thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
         search_enabled=get_search_enabled(request),
         dialect=get_dialect(request),
         grade=get_grade(request),

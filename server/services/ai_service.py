@@ -290,7 +290,7 @@ class AIService:
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
                              style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "",
-                             personality: Optional[str] = None, subject: str = "", detail: Optional[str] = None, weak_count: int = 0) -> Generator[Dict, None, None]:
+                             personality: Optional[str] = None, subject: str = "", detail: Optional[str] = None, weak_count: int = 0, latex_helper=None) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
@@ -319,6 +319,8 @@ class AIService:
             st_ins = (st_ins + "\n" + d_ins) if st_ins else d_ins
         thinking_auto = (thinking == "auto")
         use_thinking = (thinking is True) and self._thinking_supported(engine)
+        latex_helper_auto = (latex_helper == "auto")
+        use_latex_helper = (latex_helper is True)
         
         # 构建系统提示（含风格 + 颜色标记规则）
         system_prompt = self._build_system_prompt(ocr_text, search_result)
@@ -369,6 +371,11 @@ class AIService:
         # ⑨ 思考 auto：难度为“较难/难”时开启
         if thinking_auto:
             use_thinking = (info_difficulty in ("较难", "难")) and self._thinking_supported(engine)
+
+        # 图解辅助 auto：数学/物理 且 较难/难 时开启
+        if latex_helper_auto:
+            _subj = (info_subject or subject or "")
+            use_latex_helper = (("数学" in _subj or "物理" in _subj) and (info_difficulty in ("较难", "难")))
 
         yield {"stage": "info", "content": question_info}
         
@@ -433,27 +440,28 @@ class AIService:
         
         yield {"stage": "solution", "content": solution_response}
         
-        # === 第三点五阶段：生成LaTeX辅助图形（多图，单独一轮对话） ===
-        latex_prompt = """请为这道题生成有助于学生理解的LaTeX/TikZ图形代码。
+        # === 第三点五阶段：生成LaTeX辅助图形（图解辅助开关控制） ===
+        if use_latex_helper:
+            latex_prompt = """请为这道题生成有助于学生理解的LaTeX/TikZ图形代码。
 要求：
 1. 生成1-6个图形，每个图形单独一个```latex ... ```代码块
 2. 图形按解题步骤顺序排列，覆盖：题目情景图、关键几何关系、函数图像、过程示意图等
 3. 每个代码块前用一行文字说明该图的作用（如：**图1：题目情景示意**）
 4. 只使用tikz/pgfplots，代码要能在xelatex直接编译（不要documentclass等完整文档结构）
 5. 图形要标注关键点、线、面的名称，越直观越好"""
-        
-        messages.append({"role": "assistant", "content": solution_response})
-        messages.append({"role": "user", "content": latex_prompt})
-        # ② LaTeX图形生成改为流式（客户端显示“图形正在生成”占位）
-        latex_accumulated = ""
-        for evt in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model,
-                                            temperature=p_temp):
-            if evt["stage"] == "content":
-                latex_accumulated = evt["content"]
-                yield {"stage": "latex_chunk", "content": latex_accumulated}
-        latex_response = latex_accumulated
-        
-        yield {"stage": "latex_extras", "content": latex_response}
+
+            messages.append({"role": "assistant", "content": solution_response})
+            messages.append({"role": "user", "content": latex_prompt})
+            # ② LaTeX图形生成改为流式（客户端显示“图形正在生成”占位）
+            latex_accumulated = ""
+            for evt in self._call_api_streaming(messages, max_tokens=4000, engine=engine, model=model,
+                                                temperature=p_temp):
+                if evt["stage"] == "content":
+                    latex_accumulated = evt["content"]
+                    yield {"stage": "latex_chunk", "content": latex_accumulated}
+            latex_response = latex_accumulated
+
+            yield {"stage": "latex_extras", "content": latex_response}
         
         # === 第四阶段：思维导图 ===
         mindmap_prompt = """请用纯文本缩进格式，为这道题生成一个解题思维导图。

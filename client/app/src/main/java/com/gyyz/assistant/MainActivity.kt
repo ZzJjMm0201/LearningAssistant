@@ -303,6 +303,7 @@ class MainViewModel : ViewModel() {
         answerStyle.value = apiService.answerStyle
         searchEnabled.value = apiService.searchEnabled
         thinkingMode.value = apiService.thinkingMode
+        latexHelper.value = apiService.latexHelper
         themeMode.value = apiService.themeMode
         dialect.value = apiService.dialect
         grade.value = apiService.grade
@@ -1595,6 +1596,7 @@ class MainViewModel : ViewModel() {
     val answerStyle = MutableStateFlow("formal")
     val searchEnabled = MutableStateFlow(true)
     val thinkingMode = MutableStateFlow("off")   // off / on / auto
+    val latexHelper = MutableStateFlow("auto")   // 图解辅助 off / on / auto
     val themeMode = MutableStateFlow("system")   // system / light / dark
     // ③ 方言 / ④ 年级
     val dialect = MutableStateFlow("普通话")
@@ -1607,7 +1609,7 @@ class MainViewModel : ViewModel() {
     fun saveExtraSettings() {
         apiService.saveExtraSettings(
             answerStyle.value, searchEnabled.value,
-            thinkingMode.value, themeMode.value
+            thinkingMode.value, themeMode.value, latexHelper.value
         )
     }
 
@@ -6526,6 +6528,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     // ②④十一⑦ 扩展设置
     val searchEnabled by viewModel.searchEnabled.collectAsState()
     val thinkingMode by viewModel.thinkingMode.collectAsState()
+    val latexHelper by viewModel.latexHelper.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
     val dialect by viewModel.dialect.collectAsState()
     val grade by viewModel.grade.collectAsState()
@@ -6773,6 +6776,34 @@ FontScaleScope {
                             fontSize = 11.sp
                     )
 
+                    // 图解辅助（off/on/auto；auto: 数学/物理 且 较难/难）
+                    Text(
+                            "📐 图解辅助",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("off" to "关闭", "on" to "开启", "auto" to "自动").forEach { (id, label) ->
+                            FilterChip(
+                                    selected = latexHelper == id,
+                                    onClick = {
+                                        viewModel.latexHelper.value = id
+                                        viewModel.saveExtraSettings()
+                                    },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF7B2FBE)
+                                    )
+                            )
+                        }
+                    }
+                    Text(
+                            "自动：数学/物理 且 难度为“较难”或“难”时，额外生成图解辅助",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
+                    )
+
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
 
                     // ⑦ 主题模式（跟随系统/亮色/暗色）
@@ -6896,7 +6927,7 @@ FontScaleScope {
                                 selected = llmProvider == "doubao",
                                 onClick = {
                                     viewModel.llmProvider.value = "doubao"
-                                    viewModel.llmModel.value = "Doubao-Seed-2.1-pro"
+                                    viewModel.llmModel.value = "doubao-seed-2-1-pro-260628"
                                     viewModel.saveAiSettings()
                                 },
                                 label = { Text("豆包 Doubao", fontSize = 12.sp) },
@@ -6942,7 +6973,7 @@ FontScaleScope {
                                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            listOf("Doubao-Seed-2.1-pro", "Doubao-Seed-2.1-turbo", "Doubao-Seed-Evolving").forEach { m ->
+                            listOf("doubao-seed-2-1-pro-260628", "doubao-seed-2-1-turbo-260628", "doubao-seed-evolving-260628").forEach { m ->
                                 FilterChip(
                                         selected = llmModel == m,
                                         onClick = {
