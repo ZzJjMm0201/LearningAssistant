@@ -4201,37 +4201,37 @@ private fun applyColorMarkers(textView: TextView, colors: List<Int>) {
     try {
         val src = textView.text
         if (src == null || src.isEmpty()) return
-        val rebuilt = android.text.SpannableStringBuilder()
-        var openRebuilt = -1
+        // 用 SpannableStringBuilder(src) 复制文本并保留 markwon 渲染出的 spans（加粗/标题/公式/图片），
+        // 只删除颜色哨兵并给区间上色，避免逐字符重建丢失所有格式。
+        val rebuilt = android.text.SpannableStringBuilder(src)
         var segIdx = 0
         var i = 0
-        val n = src.length
-        while (i < n) {
-            val ch = src[i]
-            when {
-                ch == COLOR_MARK_OPEN -> {
-                    openRebuilt = rebuilt.length
-                }
-                ch == COLOR_MARK_CLOSE && openRebuilt >= 0 && segIdx < colors.size -> {
-                    val col = colors[segIdx]
-                    if (col != -1 && rebuilt.length > openRebuilt) {
-                        rebuilt.setSpan(
-                                android.text.style.ForegroundColorSpan(col),
-                                openRebuilt, rebuilt.length,
-                                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                        )
-                        // 复制区间内的样式（粗体/斜体等）——ForegroundColorSpan 已覆盖颜色，无需额外
+        while (i < rebuilt.length) {
+            val ch = rebuilt[i]
+            if (ch == COLOR_MARK_OPEN) {
+                var j = i + 1
+                while (j < rebuilt.length && rebuilt[j] != COLOR_MARK_CLOSE) j++
+                if (j < rebuilt.length) {
+                    if (segIdx < colors.size) {
+                        val col = colors[segIdx]
+                        if (col != -1 && j > i + 1) {
+                            rebuilt.setSpan(
+                                    android.text.style.ForegroundColorSpan(col),
+                                    i + 1, j,
+                                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                            )
+                        }
                     }
                     segIdx++
-                    openRebuilt = -1
+                    rebuilt.delete(j, j + 1)  // 删 CLOSE（先删后面避免位置偏移）
+                    rebuilt.delete(i, i + 1)  // 删 OPEN；i 不变继续扫描
+                } else {
+                    i++
                 }
-                else -> {
-                    rebuilt.append(ch)
-                }
+            } else {
+                i++
             }
-            i++
         }
-        // 若还有未闭合的开标记忽略
         textView.text = rebuilt
     } catch (e: Exception) {
         Log.e("MarkdownView", "颜色标记渲染失败: ${e.message}")
