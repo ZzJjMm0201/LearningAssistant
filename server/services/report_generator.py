@@ -187,7 +187,7 @@ class ReportGenerator:
         for r in records:
             day = r.timestamp.strftime('%m-%d') if r.timestamp else "未知"
             daily_counts[day] = daily_counts.get(day, 0) + 1
-        daily_dates = sorted(daily_counts.keys())[-14:]  # 最近14天
+        daily_dates = sorted(daily_counts.keys())  # 按选择的时间范围(7/30/90/全部)，不再固定14天
         daily_values = [daily_counts.get(d, 0) for d in daily_dates]
         
         # 7日移动平均（算法统计：平滑做题趋势）
@@ -367,7 +367,7 @@ class ReportGenerator:
                 name='3日移动平均',
             ))
         fig5.update_layout(
-            title="每日做题趋势（最近14天，含移动平均）",
+            title="每日做题趋势（含3日移动平均）",
             margin=dict(l=20, r=20, t=50, b=20),
             height=300,
             dragmode=False,

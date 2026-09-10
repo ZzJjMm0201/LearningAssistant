@@ -5321,7 +5321,7 @@ fun HistoryViewScreen(
                             loadHistory()
                         }
                 ) { Text("重置", color = Color(0xFFF44336), fontSize = 12.sp) }
-            } else {
+            } else if (typeFilter == "all" || typeFilter == "solve") {
                 Text(
                         "可按日期/学科/年级/难度筛选",
                         color = tC(Color.Gray, Color(0xFF5C6470)),
