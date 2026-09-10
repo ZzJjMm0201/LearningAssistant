@@ -3,11 +3,36 @@ AI 动画生成服务
 让 AI 生成 Plotly 动画 HTML 文件
 """
 import os
+import re
 import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 from server.config import HISTORY_DIR
 from server.services.ai_service import ai_service
+
+
+def _ensure_plotly_local(anim_dir: Path) -> str:
+    """确保本地 plotly.min.js 存在，返回文件名；失败返回空串（手机端 CDN 被墙会导致动画白屏）"""
+    target = anim_dir / "plotly.min.js"
+    if target.exists() and target.stat().st_size > 100_000:
+        return "plotly.min.js"
+    urls = [
+        "https://cdn.plot.ly/plotly-2.35.2.min.js",
+        "https://cdn.staticfile.org/plotly.js/2.32.0/plotly.min.js",
+        "https://cdn.bootcdn.net/ajax/libs/plotly.js/2.32.0/plotly.min.js",
+        "https://fastly.jsdelivr.net/npm/plotly.js-dist-min@2.32.0/plotly.min.js",
+    ]
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=40) as resp, open(target, "wb") as f:
+                f.write(resp.read())
+            if target.stat().st_size > 100_000:
+                return "plotly.min.js"
+        except Exception as e:
+            print(f"[动画] 下载 plotly 失败 {u}: {e}")
+    return ""
 
 
 def generate_animation(ocr_text: str, solution: str = "", engine: str = None) -> str | None:
@@ -87,6 +112,14 @@ except Exception:
             print(f"动画生成成功: {html_file}")
             # Bug 3: 添加移动端适配 - 注入viewport和响应式样式
             html_content = html_file.read_text(encoding='utf-8')
+            # 手机端 CDN 可能被墙：把 plotly 的 CDN script 换成本地 plotly.min.js
+            local_plotly = _ensure_plotly_local(anim_dir)
+            if local_plotly:
+                html_content = re.sub(
+                    r'<script[^>]*src="https?://cdn\.plot\.ly/[^"]*plotly[^"]*\.js"[^>]*></script>',
+                    f'<script charset="utf-8" src="{local_plotly}"></script>',
+                    html_content
+                )
             viewport_meta = '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
             responsive_css = '<style>html,body{width:100%;height:100%;margin:0;padding:0;overflow-x:hidden;} .plotly-graph-div{width:100% !important;} .main-svg{width:100% !important;}</style>'
             if '<head>' in html_content:

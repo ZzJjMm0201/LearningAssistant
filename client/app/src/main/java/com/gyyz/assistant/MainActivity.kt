@@ -5115,6 +5115,8 @@ fun HistoryViewScreen(
     var difficultyFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
     var masteryFilter by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showFilterDialog by remember { mutableStateOf(false) }
+    // 分类分页：all/solve/animation/extension
+    var typeFilter by remember { mutableStateOf("all") }
     
     fun loadHistory() {
         // Feature 16: 日期格式验证
@@ -5256,6 +5258,32 @@ fun HistoryViewScreen(
             }
         }
         
+        // 分类分页（AI解答 / AI动画 / 知识延伸）
+        Row(
+                modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            listOf(
+                    "all" to "全部",
+                    "solve" to "📝 AI解答",
+                    "animation" to "🎬 AI动画",
+                    "extension" to "📎 知识延伸"
+            ).forEach { (t, label) ->
+                FilterChip(
+                        selected = typeFilter == t,
+                        onClick = { typeFilter = t },
+                        label = { Text(label, fontSize = 12.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFF00D2FF),
+                                selectedLabelColor = Color.Black
+                        )
+                )
+            }
+        }
+
         // ③ 筛选按钮行（日期/学科/年级/难度统一在筛选面板中）
         Row(
                 modifier = Modifier
@@ -5357,7 +5385,10 @@ fun HistoryViewScreen(
             }
             else -> {
                 val filteredRecords =
-                        if (subjectFilter.isEmpty()) records else records.filter { it.subject in subjectFilter }
+                        records.filter { r ->
+                            (typeFilter == "all" || r.recordType == typeFilter) &&
+                            (subjectFilter.isEmpty() || r.subject in subjectFilter)
+                        }
                 if (filteredRecords.isEmpty()) {
                     Box(
                             modifier = Modifier.fillMaxSize(),
