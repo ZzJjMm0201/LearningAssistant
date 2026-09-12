@@ -1294,6 +1294,7 @@ async def auth_register(request: AuthRequest):
     db = SessionLocal()
     try:
         result = register(db, request.username.strip(), request.password)
+        result["user"]["ai_permission"] = can_use_ai(result["user"]["username"], result["user"]["is_admin"])
         return {"status": "ok", "data": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1307,6 +1308,7 @@ async def auth_login(request: AuthRequest):
     db = SessionLocal()
     try:
         result = login(db, request.username.strip(), request.password)
+        result["user"]["ai_permission"] = can_use_ai(result["user"]["username"], result["user"]["is_admin"])
         return {"status": "ok", "data": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1322,6 +1324,7 @@ async def auth_verify(request: TokenRequest):
         user = get_user_by_token(db, request.token)
         if user is None:
             raise HTTPException(status_code=401, detail="Token无效或已过期")
+        user["ai_permission"] = can_use_ai(user["username"], user["is_admin"])
         return {"status": "ok", "user": user}
     finally:
         db.close()

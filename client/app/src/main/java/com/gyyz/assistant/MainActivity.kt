@@ -224,6 +224,7 @@ class MainViewModel : ViewModel() {
     private val _isLoggedIn = MutableStateFlow(false)
     val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
 
+    val aiPermission = MutableStateFlow(true)   // 是否允许使用 AI 功能（受限账号 false）
     private val _loggedInUsername = MutableStateFlow("")
     val loggedInUsername: StateFlow<String> = _loggedInUsername.asStateFlow()
 
@@ -328,6 +329,7 @@ class MainViewModel : ViewModel() {
                 withContext(Dispatchers.Main) {
                     _isLoggedIn.value = true
                     _loggedInUsername.value = result.user.username
+                    aiPermission.value = result.user.aiPermission
                     _appState.value = AppState.Tracking
                     _statusText.value = "注册成功，欢迎 ${result.user.username}"
                 }
@@ -347,6 +349,7 @@ class MainViewModel : ViewModel() {
                 withContext(Dispatchers.Main) {
                     _isLoggedIn.value = true
                     _loggedInUsername.value = result.user.username
+                    aiPermission.value = result.user.aiPermission
                     _appState.value = AppState.Tracking
                     _statusText.value = "登录成功，欢迎 ${result.user.username}"
                 }
@@ -361,6 +364,7 @@ class MainViewModel : ViewModel() {
     fun logout() {
         apiService.logout()
         _isLoggedIn.value = false
+        aiPermission.value = true
         _loggedInUsername.value = ""
         _appState.value = AppState.Login()
         _statusText.value = "已退出登录"
@@ -2164,6 +2168,12 @@ fun MainScreen(
                 rebindKey = cameraRebindTrigger
             )
         }
+        // 新账号权限受限：全屏提示，禁止使用
+        val aiPerm by viewModel.aiPermission.collectAsState()
+        if (!aiPerm) {
+            RestrictedScreen(onLogout = { viewModel.logout() })
+            return@Box
+        }
         when (val state = appState) {
             is AppState.Login ->
                 LoginScreen(
@@ -2623,6 +2633,37 @@ fun TrackingOverlay(
     }
 }
 
+
+@Composable
+fun RestrictedScreen(onLogout: () -> Unit) {
+    Box(
+        modifier = Modifier.fillMaxSize().background(tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8))),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("🔒", fontSize = 48.sp)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "此账号暂无 AI 使用权限",
+                color = tC(Color.White, Color(0xFF16181D)),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "因 AI 资源有限，该账号尚未开通 AI 解题/动画/报告等功能。\n请联系管理员（老师）开通后再使用。",
+                color = tC(Color.Gray, Color(0xFF5C6470)),
+                fontSize = 14.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 32.dp)
+            )
+            Spacer(Modifier.height(20.dp))
+            Button(onClick = onLogout, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))) {
+                Text("退出登录", color = Color.Black, fontSize = 14.sp)
+            }
+        }
+    }
+}
 
 @Composable
 fun LoginScreen(
@@ -4335,6 +4376,39 @@ private fun rewriteLatexImageForDark(content: String): String {
 private fun prepareMarkdownContent(content: String): String {
     if (content.isEmpty()) return ""
     var processed = content
+    // 处理 JLatexMath 不支持的命令，转成可读形式（\ce 化学方程式、\mathrm 字体包裹、rac 分数等）
+    // \ce{...}（mhchem 化学方程式）→ 内容
+    processed = processed.replace(Regex("""\\ce\s*\{([^{}]*)\}""")) { m -> m.groupValues[1] }
+    // 字体包裹命令 \mathrm{}/\mathbf{}/	ext{}/oldsymbol{}/\mathsf{}/\mathit{} → 内容
+    processed = processed.replace(Regex("""\\(?:mathrm|mathbf|boldsymbol|text|mathsf|mathit|qquad|quad|hspace\*?\{[^{}]*\})\s*\{([^{}]*)\}""")) { m -> m.groupValues[1] }
+    // 分数 rac{a}{b}/\dfrac{a}{b}/	frac{a}{b} → (a/b)
+    processed = processed.replace(Regex("""\\(?:dfrac|frac|tfrac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}""")) { m -> "(${m.groupValues[1]}/${m.groupValues[2]})" }
+    // 根号 \sqrt{a} → √(a)
+    processed = processed.replace(Regex("""\\sqrt\s*\{([^{}]*)\}""")) { m -> "√(${m.groupValues[1]})" }
+    // 常见符号命令 → Unicode/可读
+    processed = processed.replace("\\rightleftharpoons", "⇌")
+    processed = processed.replace("\\Leftrightarrow", "⇔")
+    processed = processed.replace("\\Rightarrow", "⇒")
+    processed = processed.replace("\\rightarrow", "→")
+    processed = processed.replace("\\leftarrow", "←")
+    processed = processed.replace("\\Rightarrow", "⇒")
+    processed = processed.replace("\\times", "×")
+    processed = processed.replace("\\cdot", "·")
+    processed = processed.replace("\\div", "÷")
+    processed = processed.replace("\\pm", "±")
+    processed = processed.replace("\\leq", "≤")
+    processed = processed.replace("\\geq", "≥")
+    processed = processed.replace("\\neq", "≠")
+    processed = processed.replace("\\approx", "≈")
+    processed = processed.replace("\\infty", "∞")
+    processed = processed.replace("\\pi", "π")
+    processed = processed.replace("\\alpha", "α")
+    processed = processed.replace("\\beta", "β")
+    processed = processed.replace("\\theta", "θ")
+    processed = processed.replace("\\Delta", "Δ")
+    // 化学箭头 \ce 内容里常见：->  →，<=> → ⇌
+    processed = processed.replace("->", "→")
+    processed = processed.replace("<=>", "⇌")
     // 1. Preserve existing $$...$$ blocks (don't touch them)
     // 2. Convert \(...\) to $...$ (inline LaTeX)
     processed = processed.replace(Regex("""\\\((.*?)\\\)""", RegexOption.DOT_MATCHES_ALL)) { match ->

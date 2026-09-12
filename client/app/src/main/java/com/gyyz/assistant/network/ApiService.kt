@@ -744,7 +744,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     )
 
     data class AuthResult(val token: String, val user: AuthUser)
-    data class AuthUser(val id: Int, val username: String, val createdAt: String, val isAdmin: Boolean)
+    data class AuthUser(val id: Int, val username: String, val createdAt: String, val isAdmin: Boolean, val aiPermission: Boolean = true)
 
     /**
      * 注册
@@ -774,7 +774,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 id = userJson.getInt("id"),
                 username = userJson.getString("username"),
                 createdAt = userJson.optString("created_at", ""),
-                isAdmin = userJson.optBoolean("is_admin", false)
+                isAdmin = userJson.optBoolean("is_admin", false),
+                aiPermission = userJson.optBoolean("ai_permission", true)
             )
             // 保存token
             saveToken(token)
@@ -811,7 +812,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 id = userJson.getInt("id"),
                 username = userJson.getString("username"),
                 createdAt = userJson.optString("created_at", ""),
-                isAdmin = userJson.optBoolean("is_admin", false)
+                isAdmin = userJson.optBoolean("is_admin", false),
+                aiPermission = userJson.optBoolean("ai_permission", true)
             )
             // 保存token
             saveToken(token)
@@ -842,7 +844,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                     id = userJson.getInt("id"),
                     username = userJson.getString("username"),
                     createdAt = userJson.optString("created_at", ""),
-                    isAdmin = userJson.optBoolean("is_admin", false)
+                    isAdmin = userJson.optBoolean("is_admin", false),
+                    aiPermission = userJson.optBoolean("ai_permission", true)
                 )
             } catch (e: Exception) {
                 null
