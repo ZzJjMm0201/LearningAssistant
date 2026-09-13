@@ -107,6 +107,7 @@ sealed class AppState {
             val subject: String = "",
             val solutionSteps: String = "",
             val fullSolution: String = "",
+            val latexExtras: String = "",
             val mindMap: String = "",
             val suggestedQuestions: List<String> = emptyList(),
             val suggestedQA: List<QAItem> = emptyList(),
@@ -133,7 +134,8 @@ sealed class AppState {
             val similarQuestions: List<QAItem> = emptyList(),
             val suggestedQuestions: List<QAItem> = emptyList(),
             val summaryStreaming: Boolean = false,
-            val extensionStreaming: Boolean = false
+            val extensionStreaming: Boolean = false,
+            val imageUrl: String = ""
     ) : AppState()
 }
 
@@ -752,6 +754,7 @@ class MainViewModel : ViewModel() {
             val qaMap = mutableMapOf<Int, List<QAItem>>()
             val subjectMap = mutableMapOf<Int, String>()
             val ocrMap = mutableMapOf<Int, String>()
+            val latexExtrasMap = mutableMapOf<Int, String>()
             // 流式显示节流：每100ms最多刷新一次UI
             var lastSolutionUpdate = 0L
             var lastStepsUpdate = 0L
@@ -958,6 +961,22 @@ class MainViewModel : ViewModel() {
                                                 fullSolution = fs
                                         ))
                                     }
+                                    "latex_extras_rendered" -> {
+                                        val ex = json.optString("content", "")
+                                        if (ex.isNotEmpty()) {
+                                            latexExtrasMap[cur(qiKey)] = ex
+                                            fullMap[cur(qiKey)]?.let { fs ->
+                                                emit(qiKey, AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_FULL,
+                                                        requestId = requestId,
+                                                        ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                        solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                        fullSolution = fs,
+                                                        latexExtras = ex
+                                                ))
+                                            }
+                                        }
+                                    }
                                     "mindmap_chunk" -> {
                                         val chunk = json.optString("content", "")
                                         if (chunk.isNotEmpty()) {
@@ -973,6 +992,7 @@ class MainViewModel : ViewModel() {
                                                         solutionSteps = stepsMap[cur(qiKey)] ?: "",
                                                         fullSolution = fullMap[cur(qiKey)] ?: "",
                                                         mindMap = mm,
+                                                        latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
                                                         mindmapStreaming = true
                                                 ))
                                             }
@@ -988,6 +1008,7 @@ class MainViewModel : ViewModel() {
                                                 ocrText = ocrMap[cur(qiKey)] ?: "",
                                                 solutionSteps = stepsMap[cur(qiKey)] ?: "",
                                                 fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
                                                 mindMap = mm
                                         ))
                                     }
@@ -1016,6 +1037,7 @@ class MainViewModel : ViewModel() {
                                                 ocrText = ocrMap[cur(qiKey)] ?: "",
                                                 solutionSteps = stepsMap[cur(qiKey)] ?: "",
                                                 fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
                                                 mindMap = mindMapMap[cur(qiKey)] ?: "",
                                                 suggestedQuestions = qStrings,
                                                 suggestedQA = qaItems,
@@ -1031,6 +1053,7 @@ class MainViewModel : ViewModel() {
                                                 ocrText = ocrMap[cur(qiKey)] ?: "",
                                                 solutionSteps = stepsMap[cur(qiKey)] ?: "",
                                                 fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
                                                 mindMap = mindMapMap[cur(qiKey)] ?: "",
                                                 suggestedQuestions = suggMap[cur(qiKey)] ?: emptyList(),
                                                 suggestedQA = suggQAMap[cur(qiKey)] ?: emptyList(),
@@ -1432,6 +1455,7 @@ class MainViewModel : ViewModel() {
             var extension = ""
             var similar = emptyList<QAItem>()
             var questions = emptyList<QAItem>()
+            var imageUrl = ""
             var lastSummaryUpdate = 0L
             var lastExtensionUpdate = 0L
 
@@ -1452,7 +1476,11 @@ class MainViewModel : ViewModel() {
 
                             when (stage) {
                                 "info" -> _statusText.value = json.optString("content", "处理中...")
-                                "ocr_complete" -> _statusText.value = "正在分析内容..."
+                                "ocr_complete" -> {
+                                    val o = json.optJSONObject("content")
+                                    if (o != null) imageUrl = o.optString("image_url", "")
+                                    _statusText.value = "正在分析内容..."
+                                }
                                 "question_info" -> {
                                     _appState.value = AppState.Knowledge()
                                     _statusText.value = "正在总结知识点..."
@@ -1464,19 +1492,19 @@ class MainViewModel : ViewModel() {
                                         if (now - lastSummaryUpdate >= 100) {
                                             lastSummaryUpdate = now
                                             summary = chunk
-                                            _appState.value = AppState.Knowledge(summary = summary, summaryStreaming = true)
+                                            _appState.value = AppState.Knowledge(summary = summary, summaryStreaming = true, imageUrl = imageUrl)
                                             _statusText.value = "正在总结知识点..."
                                         }
                                     }
                                 }
                                 "summary" -> {
                                     summary = json.optString("content", "")
-                                    _appState.value = AppState.Knowledge(summary = summary)
+                                    _appState.value = AppState.Knowledge(summary = summary, imageUrl = imageUrl)
                                     _statusText.value = "知识点已总结"
                                 }
                                 "similar_questions" -> {
                                     similar = parseQAList(json.opt("content"))
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar)
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, imageUrl = imageUrl)
                                     _statusText.value = "已推荐相似题"
                                 }
                                 "extension_chunk" -> {
@@ -1486,19 +1514,19 @@ class MainViewModel : ViewModel() {
                                         if (now - lastExtensionUpdate >= 100) {
                                             lastExtensionUpdate = now
                                             extension = chunk
-                                            _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, extensionStreaming = true)
+                                            _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, extensionStreaming = true, imageUrl = imageUrl)
                                             _statusText.value = "正在生成知识拓展..."
                                         }
                                     }
                                 }
                                 "extension" -> {
                                     extension = json.optString("content", "")
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension)
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, imageUrl = imageUrl)
                                     _statusText.value = "知识拓展已生成"
                                 }
                                 "suggested_questions" -> {
                                     questions = parseQAList(json.opt("content"))
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions)
+                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions, imageUrl = imageUrl)
                                     _statusText.value = "延伸完成"
                                 }
                                 "complete" -> {
@@ -2989,6 +3017,18 @@ fun SolvingScreen(
                 )
             }
 
+            // ③ 图解辅助：独立模块（不再混在完整解析里）
+            if (solveState.latexExtras.isNotEmpty()) {
+                SolutionCard(
+                        title = "📐 图解辅助",
+                        content = solveState.latexExtras,
+                        color = Color(0xFF00BCD4),
+                        fontSize = solvingFontSize,
+                        initiallyCollapsed = false,
+                        streaming = false
+                )
+            }
+
             if (solveState.mindMap.isNotEmpty()) {
                 // ② UI 思维导图渲染（层级色点 + 连线）
                 MindMapCard(
@@ -3302,6 +3342,7 @@ fun SolvingScreen(
                 append("# 学习助手解题结果\n\n")
                 if (solveState.solutionSteps.isNotEmpty()) append("## 解题思路\n\n${solveState.solutionSteps}\n\n")
                 if (solveState.fullSolution.isNotEmpty()) append("## 完整解析\n\n${solveState.fullSolution}\n\n")
+                if (solveState.latexExtras.isNotEmpty()) append("## 图解辅助\n\n${solveState.latexExtras}\n\n")
                 if (solveState.mindMap.isNotEmpty()) append("## 思维导图\n\n${solveState.mindMap}\n")
             }
             if (exportContent.isNotBlank() && (solveState.stage == SolveStage.INTERACTIVE || solveState.stage == SolveStage.COMPLETED)) {
@@ -3770,6 +3811,9 @@ fun KnowledgeScreen(
                             .background(tC(Color(0xFF1A1A2E), Color(0xFFF2F4F8)))
     ) {
         val knowledgeFontSize by (viewModel?.fontSize ?: MutableStateFlow(18f)).collectAsState()
+        // 知识延伸：追问输入框
+        var askInput by remember { mutableStateOf("") }
+        val asking by (viewModel?.isAskingQuestion ?: MutableStateFlow(false)).collectAsState()
         // Feature 14: 固定返回按钮在顶部
         Surface(
             modifier = Modifier.fillMaxWidth(),
@@ -3797,6 +3841,21 @@ fun KnowledgeScreen(
                 LoadingOverlay("正在分析内容...")
             }
 
+            // ② 原题展示（与 AI解答一致：显示拍照图片）
+            if (state.imageUrl.isNotEmpty()) {
+                Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                        shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("📷 原题", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        MarkdownView(content = "![](${state.imageUrl})", fontSize = 13f)
+                    }
+                }
+            }
+
             if (state.summary.isNotEmpty()) {
                 SolutionCard(
                         title = "📝 知识点总结",
@@ -3821,13 +3880,19 @@ fun KnowledgeScreen(
 
             // ② 相似题推荐（3个，折叠展示题目+答案）
             if (state.similarQuestions.isNotEmpty()) {
-                Text(
-                        text = "🔗 相似题推荐：",
-                        color = tC(Color.White, Color(0xFF16181D)),
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
-                )
+                Card(
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                        shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                                text = "🔗 相似题推荐",
+                                color = Color(0xFF2196F3),
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                        )
                 state.similarQuestions.forEach { item ->
                     var expanded by remember(item.question) { mutableStateOf(false) }
                     Card(
@@ -3853,17 +3918,25 @@ fun KnowledgeScreen(
                         }
                     }
                 }
+                    }
+                }
             }
 
-            // ② 延伸思考（折叠块，带答案 + 问追问，同AI解答样式）
+            // ② 延伸思考（独立卡片，带答案 + 追问，同AI解答样式）
             if (state.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
-                Text(
-                        text = "💬 延伸思考：",
-                        color = tC(Color.White, Color(0xFF16181D)),
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
-                )
+                Card(
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                        shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                                text = "💬 延伸思考",
+                                color = Color(0xFF7B2FBE),
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                        )
                 state.suggestedQuestions.forEach { item ->
                     var expanded by remember(item.question) { mutableStateOf(false) }
                     Card(
@@ -3896,6 +3969,8 @@ fun KnowledgeScreen(
                         }
                     }
                 }
+                    }
+                }
             }
             
             // ④ 导出（截图/PDF/Word）— 知识延伸内容
@@ -3909,6 +3984,37 @@ fun KnowledgeScreen(
             }
             if (exportContent.isNotBlank()) {
                 ExportActions(viewModel = viewModel, title = "知识延伸", content = exportContent, allowPdf = true)
+            }
+
+            // 💬 继续追问（知识延伸也支持输入问题追问）
+            Spacer(modifier = Modifier.height(12.dp))
+            Text("💬 继续追问：", color = tC(Color.White, Color(0xFF16181D)), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                        value = askInput,
+                        onValueChange = { askInput = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("针对上面的知识点继续提问…", fontSize = 13.sp) },
+                        singleLine = false,
+                        maxLines = 4,
+                        colors = darkTextFieldColors()
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(
+                        onClick = {
+                            val q = askInput.trim()
+                            if (q.isNotEmpty() && !asking) {
+                                onAskQuestion(q)
+                                askInput = ""
+                            }
+                        },
+                        enabled = !asking && askInput.trim().isNotEmpty(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                ) {
+                    if (asking) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.Black, strokeWidth = 2.dp)
+                    else Text("发送", color = Color.Black, fontSize = 13.sp)
+                }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -5860,30 +5966,67 @@ fun AuxRecordScreen(record: ApiService.HistoryRecord, baseUrl: String, onBack: (
             .background(tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8)))
     ) {
         Column(Modifier.fillMaxSize()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
+            // 顶部栏（与 AI解答详情一致：Surface 固定返回栏）
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = tC(Color(0xFF16213E), Color(0xFFFFFFFF)),
+                shadowElevation = 4.dp
             ) {
-                Text("← 返回", color = Color(0xFF00D2FF), fontSize = 14.sp, modifier = Modifier.clickable(onClick = onBack))
-                Spacer(Modifier.weight(1f))
-                Text(
-                    if (record.title.isNotEmpty()) record.title else "📎 知识延伸",
-                    color = tC(Color.White, Color(0xFF16181D)),
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.weight(1f))
-                Spacer(Modifier.width(48.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(onClick = onBack) { Text("← 返回") }
+                    Text(
+                        if (record.title.isNotEmpty()) record.title else "📎 知识延伸",
+                        color = tC(Color.White, Color(0xFF16181D)),
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.width(60.dp))
+                }
             }
-            Divider(color = tC(Color.White.copy(alpha = 0.15f), Color(0xFF16181D).copy(alpha = 0.15f)))
-            if (record.fullSolution.isNotEmpty()) {
-                MarkdownView(
-                    content = record.fullSolution,
-                    modifier = Modifier.fillMaxSize().padding(4.dp),
-                    fontSize = 16f
-                )
-            } else {
-                Text("（无内容）", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
+            ) {
+                // 原题区（图片或识别文本）
+                if (record.imageUrl.isNotEmpty() || record.ocrText.isNotEmpty()) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("📷 原题", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            if (record.imageUrl.isNotEmpty()) {
+                                val _host = baseUrl.removePrefix("http://").removePrefix("https://").trimEnd('/')
+                                val _imgPath = if (record.imageUrl.startsWith("/")) record.imageUrl else "/" + record.imageUrl
+                                MarkdownView(content = "![](${_imgPath})", fontSize = 13f)
+                            } else {
+                                MarkdownView(content = record.ocrText, fontSize = 13f)
+                            }
+                        }
+                    }
+                }
+                // 知识延伸内容卡片（MarkdownView，与 AI解答的"完整解析"卡片风格一致）
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("📎 知识延伸", color = Color(0xFF7B2FBE), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        if (record.fullSolution.isNotEmpty()) {
+                            MarkdownView(content = record.fullSolution, fontSize = 15f)
+                        } else {
+                            Text("（无内容）", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 14.sp)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
             }
         }
     }

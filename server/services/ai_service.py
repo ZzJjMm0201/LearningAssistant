@@ -579,9 +579,9 @@ class AIService:
         "knowledge_summary": "知识点总结（100字内）",
         "extension_topics": ["可延伸的知识点1", "可延伸的知识点2"],
         "similar_questions": [
-            {"question": "相似题1（与本题同知识点的另一道题）", "answer": "简要答案1"},
-            {"question": "相似题2", "answer": "简要答案2"},
-            {"question": "相似题3", "answer": "简要答案3"}
+            {"question": "相似题1（与本题同知识点的另一道题）", "answer": "答案1（要给出完整解题步骤与结论，150~250字，不要只写一两句）"},
+            {"question": "相似题2", "answer": "答案2（完整步骤与结论，150~250字）"},
+            {"question": "相似题3", "answer": "答案3（完整步骤与结论，150~250字）"}
         ],
         "extension_questions": [
             {"question": "延伸思考题1", "answer": "完整答案1"},
@@ -591,7 +591,7 @@ class AIService:
         "difficulty": "易/较易/中/较难/难",
         "subject": "学科"
     }
-    相似题推荐要换成与本题知识点相关的、还没做过的题目；延伸思考题要有深度、引导思考，并给出完整答案。只输出JSON。"""
+    相似题推荐要换成与本题知识点相关的、还没做过的题目；每道相似题的答案要写完整解题步骤和最终结论（150~250字），不要只给简答。延伸思考题要有深度、引导思考，并给出完整答案。只输出JSON。"""
         
         messages.append({"role": "user", "content": summary_prompt})
         info_response = self._call_api(messages, engine=engine, model=model)

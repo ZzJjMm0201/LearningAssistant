@@ -34,39 +34,93 @@ def _segment_knowledge_points(all_kp):
             counter[w] = counter.get(w, 0) + 1
     return sorted(counter.items(), key=lambda x: -x[1])
 
+# 词云中文字体候选（优先系统字体）
+_WC_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+]
+# 自定义遮罩（可选，参考用户素材 your_template.png）
+_WC_MASK_CANDIDATES = [
+    r"C:\Users\gyyzkczx\WPSDrive\337413621_6\WPS云盘\桌面\HighSchool\高二上\物理公开课\your_template.png",
+]
+
+
+def _wc_font_path():
+    import os as _os
+    for f in _WC_FONT_CANDIDATES:
+        if _os.path.exists(f):
+            return f
+    return None
+
+
+def _wc_mask_path():
+    import os as _os
+    for f in _WC_MASK_CANDIDATES:
+        if _os.path.exists(f):
+            return f
+    return None
+
+
+def render_wordcloud_png(top_words, out_path, width=1100, height=680) -> bool:
+    """用 wordcloud 库生成词云 PNG（中文字体 + 可选遮罩 + 分层配色：高频蓝/中频青绿/低频紫）。
+    top_words: [(词, 次数)]。返回是否成功。"""
+    try:
+        if not top_words:
+            return False
+        from wordcloud import WordCloud
+        font = _wc_font_path()
+        if not font:
+            print("[词云] 未找到中文字体，跳过")
+            return False
+        freq = {str(w): int(cnt) for w, cnt in top_words if w}
+        if not freq:
+            return False
+        mask = None
+        mp = _wc_mask_path()
+        if mp:
+            try:
+                import numpy as _np
+                from PIL import Image as _Image
+                arr = _np.array(_Image.open(mp).convert("L"))
+                if arr.ndim == 2 and arr.shape[0] > 20 and arr.shape[1] > 20:
+                    mask = arr
+            except Exception as e:
+                print(f"[词云] 遮罩读取失败(忽略): {e}")
+                mask = None
+        # 分层配色：按频率分三档（高频/中频/低频），参考用户素材中心词/二级词/附加词配色
+        vals = sorted(freq.values(), reverse=True)
+        hi = vals[0] if vals else 1
+        lo = vals[-1] if vals else 0
+        def _tier(v):
+            if hi == lo:
+                return 0
+            return 0 if v >= hi * 0.66 else (1 if v >= hi * 0.33 else 2)
+        tier_colors = [["#1565C0", "#1E88E5"], ["#00897B", "#26A69A"], ["#6A1B9A", "#8E24AA"]]
+        import random as _random
+        def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+            t = _tier(freq.get(word, lo))
+            return _random.choice(tier_colors[t])
+        wc_kwargs = dict(width=width, height=height, background_color=None, mode="RGBA",
+                         font_path=font, max_words=60, relative_scaling=0.55,
+                         prefer_horizontal=0.9, margin=4, random_state=42)
+        if mask is not None:
+            wc_kwargs["mask"] = mask
+            wc_kwargs["contour_width"] = 0
+        wc = WordCloud(**wc_kwargs)
+        wc.generate_from_frequencies(freq)
+        wc.recolor(color_func=_color_func, random_state=42)
+        img = wc.to_image()
+        img.save(str(out_path))
+        return True
+    except Exception as e:
+        print(f"[词云] 生成失败: {e}")
+        return False
+
+
 def _wordcloud_trace(top_words):
-    """用 plotly scatter 生成词云（词+次数；行式标签布局：按文本估算宽度换行，避免相互挤压）"""
-    if not top_words:
-        return None, [], 0.0, 0.0
-    n = len(top_words)
-    counts = [c for _, c in top_words]
-    maxc = max(counts) if counts else 1
-    sizes = [int(13 + 24 * (c / maxc)) for c in counts]
-    labels = [f"{w}({c})" for w, c in top_words]
-    palette = ['#2196F3', '#00BCD4', '#4CAF50', '#00D2FF', '#7B2FBE', '#8BC34A', '#03A9F4']
-    colors = [palette[i % len(palette)] for i in range(n)]
-    # 行式布局：x 累计，超宽换行；宽度按“字符数 × 字号 × 0.7”估算（中文≈字号宽）
-    max_w = 520.0
-    xs, ys = [], []
-    x, y, row_max = 10.0, 0.0, 0.0
-    for i in range(n):
-        size = sizes[i]
-        w_est = max(40.0, len(labels[i]) * size * 1.05)
-        if x > 10.0 and x + w_est > max_w:
-            y += row_max * 1.22
-            x = 10.0
-            row_max = 0.0
-        xs.append(x + w_est / 2)
-        ys.append(y)
-        x += w_est + 12
-        row_max = max(row_max, size)
-    total_h = y + row_max * 1.22 + 12.0
-    trace = go.Scatter(
-        x=xs, y=ys, mode='text', text=labels,
-        textfont=dict(size=sizes, color=colors),
-        hoverinfo='skip',
-    )
-    return trace, top_words, max_w, total_h
+    """兼容旧调用：plotly scatter 版已弃用（保留空实现，避免破坏其它引用）"""
+    return None, top_words, 0.0, 0.0
 
 
 def ensure_plotly_local() -> str:
@@ -325,58 +379,69 @@ class ReportGenerator:
         fig2.update_xaxes(fixedrange=True)
         fig2.update_yaxes(fixedrange=True)
         
-        # 3. 高频知识点词云图（① 分词后词频，词后带(数量)）
-        fig3 = None
+        # 3. 高频知识点词云图（wordcloud 库生成 PNG，中文分词词频）
+        wordcloud_img_html = ""
         if kp_word_freq:
-            fig3 = go.Figure()
-            word_trace, _, wc_w, wc_h = _wordcloud_trace(kp_word_freq)
-            if word_trace is not None:
-                fig3.add_trace(word_trace)
-                fig3.update_layout(
-                    title="高频知识点词云（词后为出现次数）",
-                    margin=dict(l=10, r=10, t=50, b=10),
-                    height=460,
-                    xaxis=dict(visible=False, range=[0, wc_w]),
-                    yaxis=dict(visible=False, range=[-wc_h, 10]),
-                    dragmode=False,
-                    hovermode=False,
-                )
-                fig3.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
+            try:
+                import base64 as _b64
+                _wc_png = REPORT_DIR / f"wordcloud_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.png"
+                if render_wordcloud_png(kp_word_freq, _wc_png):
+                    _b64s = _b64.b64encode(_wc_png.read_bytes()).decode("ascii")
+                    wordcloud_img_html = (
+                        '<div class="chart-container">'
+                        '<h3 style="color:' + BODY_ACCENT + ';margin-bottom:10px">高频知识点词云</h3>'
+                        '<img src="data:image/png;base64,' + _b64s + '" '
+                        'style="width:100%;height:auto;display:block;border-radius:8px"/>'
+                        '</div>'
+                    )
+                    os.remove(_wc_png)
+            except Exception as _e:
+                print(f"[词云] 内联失败: {_e}")
+                wordcloud_img_html = ""
+        fig3 = None
         
         # 4. 易错点（① 改为文字段落，见HTML组装末尾）
         fig4 = None
         
-        # 5. 每日做题趋势（折线图 + 3日移动平均线）
+        # 5. 每日做题趋势（自上而下横向条形图：日期自上而下，最新在最上面）
         fig5 = go.Figure()
-        fig5.add_trace(go.Scatter(
-            x=daily_dates,
-            y=daily_values,
-            mode='lines+markers',
-            marker=dict(color='#00D2FF', size=8),
-            line=dict(color='#00D2FF', width=2),
-            fill='tozeroy',
-            fillcolor='rgba(0, 210, 255, 0.1)',
+        _d5_rows = list(zip(daily_dates, daily_values, daily_ma or [None] * len(daily_dates)))
+        _d5_rows = list(reversed(_d5_rows))  # 最新日期排最上
+        _d5_labels = [d for d, _, _ in _d5_rows]
+        _d5_vals = [v for _, v, _ in _d5_rows]
+        fig5.add_trace(go.Bar(
+            x=_d5_vals, y=_d5_labels, orientation='h',
+            marker_color='#00D2FF',
+            text=[str(v) for v in _d5_vals],
+            textposition='outside',
+            textfont=dict(color=FCOL, size=11),
             name='每日做题数',
+            hoverinfo='skip',
         ))
         if daily_ma:
             fig5.add_trace(go.Scatter(
-                x=daily_dates,
-                y=daily_ma,
-                mode='lines',
+                x=[m for _, _, m in _d5_rows],
+                y=_d5_labels,
+                mode='markers+lines',
+                marker=dict(color='#FFD700', size=8),
                 line=dict(color='#FFD700', width=2, dash='dot'),
                 name='3日移动平均',
+                hoverinfo='skip',
             ))
         fig5.update_layout(
-            title="每日做题趋势（含3日移动平均）",
-            margin=dict(l=20, r=20, t=50, b=20),
-            height=300,
+            title="每日做题趋势（自上而下，最新在最上）",
+            barmode='overlay',
+            margin=dict(l=10, r=40, t=50, b=90),
+            height=max(280, 30 * len(_d5_labels) + 140),
             dragmode=False,
             hovermode=False,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
+            bargap=0.3,
+            xaxis=dict(title="做题数", fixedrange=True, rangemode='tozero'),
+            yaxis=dict(autorange='reversed', fixedrange=True, tickfont=dict(size=11)),
+            legend=dict(orientation="h", yanchor="top", y=-0.08, x=0.5, xanchor="center",
+                        font=dict(size=12, color=FCOL)),
         )
         fig5.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
-        fig5.update_xaxes(fixedrange=True, type="category")
-        fig5.update_yaxes(fixedrange=True)
 
         # 7. 专注度分析（算法统计：书写/思考/翻页/求助时长占比）
         fig7 = None
@@ -419,35 +484,42 @@ class ReportGenerator:
             fig8.update_xaxes(fixedrange=True)
             fig8.update_yaxes(fixedrange=True)
 
-        # 9. 掌握率趋势（加权得分 + 3点移动平均）
+        # 9. 掌握程度（横向条形图，每题一行从上到下，按日期排序；图例在底部、清晰可见）
         fig9 = None
         if mastery_timeline:
+            _level_name = {1.0: "完全掌握", 0.5: "部分掌握", 0.0: "完全没掌握"}
+            _lvl_color = {1.0: "#4CAF50", 0.5: "#FF9800", 0.0: "#F44336"}
+            # 每道题一行；行标签=日期+学科；按日期升序（最新在下）
+            _rows = mastery_timeline[:40]  # 最多 40 条，避免过长
+            _y_labels = [f"{d}  {s}" for d, _, s in _rows]
+            _scores = [sc for _, sc, _ in _rows]
             fig9 = go.Figure()
-            fig9.add_trace(go.Scatter(
-                x=mastery_dates, y=mastery_values,
-                mode='lines+markers',
-                marker=dict(color='#00D2FF', size=7),
-                line=dict(color='#00D2FF', width=2),
-                name='掌握得分(完全=1,部分=0.5,未掌握=0)',
-            ))
-            if mastery_ma:
-                fig9.add_trace(go.Scatter(
-                    x=mastery_dates, y=mastery_ma,
-                    mode='lines',
-                    line=dict(color='#FFD700', width=2, dash='dot'),
-                    name='3次移动平均',
+            # 按掌握等级分组绘制（保证图例只出现 3 项）
+            for _sc in (1.0, 0.5, 0.0):
+                _xs = [sc if sc == _sc else None for sc in _scores]
+                fig9.add_trace(go.Bar(
+                    x=_xs, y=_y_labels, orientation='h',
+                    marker_color=_lvl_color[_sc], name=_level_name[_sc],
+                    text=[_level_name[_sc] if sc == _sc else "" for sc in _scores],
+                    textposition='inside', insidetextanchor='middle',
+                    textfont=dict(color='white', size=11),
+                    hoverinfo='skip',
                 ))
             fig9.update_layout(
-                title="掌握程度趋势",
-                margin=dict(l=20, r=20, t=50, b=20),
-                height=300,
+                title="掌握程度（每道题，自上而下）",
+                barmode='stack',
+                margin=dict(l=10, r=20, t=50, b=90),
+                height=max(280, 34 * len(_y_labels) + 130),
                 dragmode=False,
                 hovermode=False,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10, color='white')),
+                bargap=0.28,
+                xaxis=dict(range=[0, 1], tickvals=[0, 0.5, 1.0],
+                           ticktext=["完全没掌握", "部分掌握", "完全掌握"], fixedrange=True),
+                yaxis=dict(autorange='reversed', fixedrange=True, tickfont=dict(size=11)),
+                legend=dict(orientation="h", yanchor="top", y=-0.08, x=0.5, xanchor="center",
+                            font=dict(size=12, color=FCOL)),
             )
             fig9.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
-            fig9.update_xaxes(fixedrange=True, type="date")
-            fig9.update_yaxes(fixedrange=True, range=[-0.1, 1.1])
 
         # 10. 学科掌握率（算法统计：按学科聚合加权平均）
         fig10 = None
@@ -543,7 +615,7 @@ class ReportGenerator:
         {fig2.to_html(full_html=False, include_plotlyjs=False)}
     </div>
     
-    {'<div class="chart-container">' + fig3.to_html(full_html=False, include_plotlyjs=False) + '</div>' if fig3 else ''}
+    {wordcloud_img_html}
     
     {'<div class="chart-container">' + fig5.to_html(full_html=False, include_plotlyjs=False) + '</div>' if daily_dates else ''}
     {'<div class="chart-container">' + fig6.to_html(full_html=False, include_plotlyjs=False) + '</div>' if mastery_counts else ''}

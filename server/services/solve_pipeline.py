@@ -310,6 +310,7 @@ class SolvePipeline:
 
                 # ========== 阶段4: LaTeX图形渲染 ==========
                 final_solution = ""
+                final_extras = ""
                 if solution_content:
                     print(f"[{request_id}] 开始渲染图形...")
                     svg_dir = HISTORY_DIR / f"svgs_{session_id or request_id}"
@@ -337,14 +338,17 @@ class SolvePipeline:
                     processed_solution = process_latex_blocks_with_retry(str(solution_content), svg_dir, ai_service=ai_service, engine=engine, model=model, vision_model=vision_model, enable_review=FEATURE_FLAGS.get("enable_latex_review", False))
                     processed_solution = _rewrite_img_urls(processed_solution)
 
+                    # 完整解析：只含解题过程（图解辅助独立成模块，不再拼接）
+                    final_solution = processed_solution
+
+                    self._emit_event(request_id, "solution_rendered", final_solution, qi)
+
+                    # ③ 图解辅助：作为独立模块单独下发（不再混进完整解析）
                     if latex_extras_content:
                         processed_extras = process_latex_blocks_with_retry(str(latex_extras_content), svg_dir, ai_service=ai_service, engine=engine, model=model, vision_model=vision_model, enable_review=FEATURE_FLAGS.get("enable_latex_review", False))
                         processed_extras = _rewrite_img_urls(processed_extras)
-                        final_solution = processed_solution + "\n\n---\n\n## 📐 图解辅助\n\n" + processed_extras
-                    else:
-                        final_solution = processed_solution
-
-                    self._emit_event(request_id, "solution_rendered", final_solution, qi)
+                        final_extras = processed_extras
+                        self._emit_event(request_id, "latex_extras_rendered", processed_extras, qi)
 
                     try:
                         _qi = first_question_info if first_question_info is not None else {}
@@ -364,6 +368,7 @@ class SolvePipeline:
                     messages=messages,
                     user_id=user_id,
                     full_solution_rendered=final_solution if solution_content else "",
+                    latex_extras_rendered=final_extras,
                 )
                 break
 
@@ -394,12 +399,24 @@ class SolvePipeline:
                 ocr_time = 0.0
                 ocr_source = "text"
                 print(f"[{request_id}] 文字输入模式，跳过OCR，长度: {len(ocr_text)}")
-                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": 0.0, "source": "text"})
+                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": 0.0, "source": "text", "image_url": ""})
             else:
                 self._emit_event(request_id, "info", "正在识别内容...")
                 ocr_text, ocr_time, ocr_source = ocr_service.recognize(str(image_path), mode=ocr_mode, vision_model=vision_model)
                 print(f"[{request_id}] OCR完成，来源={ocr_source}，耗时{ocr_time}s，文本长度: {len(ocr_text)}")
-                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": ocr_time, "source": ocr_source})
+                # ② 附上原题图片 URL（历史静态目录），供客户端知识延伸页显示原题
+                _img_url = ""
+                try:
+                    _host = (base_host or "").strip().removeprefix("http://").removeprefix("https://").rstrip("/")
+                    if not _host:
+                        try:
+                            _host = (Path(__file__).resolve().parent.parent.parent / "server_ip.txt").read_text(encoding="utf-8").strip()
+                        except Exception:
+                            _host = "127.0.0.1:8000"
+                    _img_url = f"http://{_host}/static/history/{request_id}.jpg"
+                except Exception:
+                    _img_url = ""
+                self._emit_event(request_id, "ocr_complete", {"text": ocr_text, "time": ocr_time, "source": ocr_source, "image_url": _img_url})
             
             if not ocr_text or ocr_text.startswith("OCR"):
                 self._emit_event(request_id, "error", "OCR识别失败")
@@ -487,7 +504,8 @@ class SolvePipeline:
     
     def _save_record(self, request_id: str, session_id: Optional[str], ocr_text: str, 
                 ocr_time: float, search_result: Optional[str], search_time: float,
-                messages: list, user_id: Optional[int] = None, full_solution_rendered: str = ""):
+                messages: list, user_id: Optional[int] = None, full_solution_rendered: str = "",
+                latex_extras_rendered: str = ""):
         """保存解题记录到数据库（每次调用使用独立会话，避免多线程共享Session导致保存失败）
         full_solution_rendered: 已渲染LaTeX图片的完整解析（带图片URL），优先存储它"""
         db = SessionLocal()
@@ -558,7 +576,13 @@ class SolvePipeline:
                 f.write(f"# 解题结果\n\n")
                 f.write(f"## 解题思路\n\n{solution_steps}\n\n")
                 f.write(f"## 完整解析\n\n{full_solution}\n\n")
+                if latex_extras_rendered:
+                    f.write(f"## 图解辅助\n\n{latex_extras_rendered}\n\n")
                 f.write(f"## 思维导图\n\n{mind_map}\n\n")
+            # ③ 图解辅助独立保存为旁文件（历史详情可单独展示）
+            if latex_extras_rendered:
+                extras_path = HISTORY_DIR / f"{session_id or request_id}_latex_extras.md"
+                extras_path.write_text(latex_extras_rendered, encoding="utf-8")
             
             # 保存对话历史
             for msg in messages:
