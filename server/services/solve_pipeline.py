@@ -125,7 +125,12 @@ class SolvePipeline:
         """后台解题工作线程（① 支持多题：OCR后分题，逐题走完整流程）"""
         print(f"[{request_id}] ========== 解题流水线启动 ==========\n")
         print(f"[{request_id}] 图片路径: {image_path}")
-        print(f"[{request_id}] 图片存在: {image_path.exists()}, 大小: {image_path.stat().st_size} bytes")
+        try:
+            _exists = image_path.exists()
+            _size = image_path.stat().st_size if _exists else 0
+        except Exception:
+            _exists, _size = False, 0
+        print(f"[{request_id}] 图片存在: {_exists}, 大小: {_size} bytes")
         try:
             # ========== 阶段1: OCR识别（⑧ 文字输入模式跳过OCR） ==========
             if text_input and text_input.strip():

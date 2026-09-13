@@ -179,7 +179,9 @@ class TokenRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "2.0.0"}
+    """网页端入口：重定向到学生端"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/web/")
 
 # Feature 7: 处理favicon.ico请求避免404日志
 @app.get("/favicon.ico")
@@ -879,6 +881,12 @@ async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
         return {"status": "error", "message": f"推荐失败: {e}"}
 
 
+
+# ④ 网页端（学生端）静态目录：与 API 同源，避免跨域
+from pathlib import Path as _WebPath
+_WEB_DIR = _WebPath(__file__).resolve().parent / "web"
+if _WEB_DIR.is_dir():
+    app.mount("/web", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
 
 @app.get("/static/{filename:path}")
 async def get_history_image(filename: str):
