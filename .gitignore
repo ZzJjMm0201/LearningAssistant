@@ -45,3 +45,6 @@ Desktop.ini
 *.model
 *.h5
 *.onnx
+
+# 网页端
+*.bak_sub
