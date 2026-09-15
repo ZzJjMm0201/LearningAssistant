@@ -15,11 +15,7 @@ const S = {
     style: 'formal', dialect: '普通话', grade: '',
     thinking: 'auto', searchEnabled: true, latexHelper: 'auto',
     personality: 'auto', detail: 'auto', subject: '',
-    fontSize: 16, theme: 'dark',
-    showModules: { solution_steps: true, full_solution: true, mind_map: true,
-                   suggested_questions: true, mistakes: true, extension: true },
-    pomodoroWork: 25, pomodoroRest: 5, pomodoroMode: 'countdown',
-    historyStartDate: '', historyEndDate: ''
+    fontSize: 16, theme: 'dark'
   }
 };
 function settings() { return Object.assign({}, S.defaults, S.settings); }
@@ -41,29 +37,10 @@ function overlay(text) {
   $('#overlayText').textContent = text || '处理中…';
   o.classList.remove('hidden');
 }
-/* ⑥ 颜色标记 [[#RRGGBB]文字[[#RRGGBB] → <span style="color:#RRGGBB">文字</span>
-   服务端会下发 [[#1E88E5]]牛顿第二定律[[#1E88E5]] 这类标记（易错/突破/结论/答案配色），
-   安卓端用 Spannable 上色；网页端用 span 包裹，长度不限、不与 Markdown 冲突。 */
-const COLOR_MARK_RE = /\[\[#([0-9A-Fa-f]{6})\]\]([\s\S]*?)\[\[#[0-9A-Fa-f]{6}\]\]/g;
-function applyColorMarkers(text) {
-  if (!text || text.indexOf('[[') < 0) return text;
-  return String(text).replace(COLOR_MARK_RE, (m, hex, inner) => {
-    // 若内层还有标记则递归处理（支持嵌套）
-    return '<span style="color:#' + hex + '">' + inner + '</span>';
-  });
-}
-/* LaTeX 兜底：模型偶尔输出 \\( ... \\) 或未闭合 $，统一成 MathJax 认识的行内定界符 */
-function normalizeLatex(text) {
-  if (!text) return text;
-  let s = String(text);
-  s = s.replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');
-  s = s.replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$');
-  return s;
-}
 function md(text) {
   if (!text) return '';
-  let t = normalizeLatex(applyColorMarkers(String(text)));
-  return (window.marked ? marked.parse(t) : esc(t));
+  let html = (window.marked ? marked.parse(String(text)) : esc(text));
+  return html;
 }
 function renderMarkdownInto(el, text) {
   el.innerHTML = md(text);
@@ -108,7 +85,6 @@ function enterApp() {
   $('#app').classList.remove('hidden');
   const st = settings();
   applyTheme(st.theme); applyFontSize(st.fontSize);
-  pomoInit();
   render();
 }
 
@@ -122,8 +98,6 @@ $('#themeBtn').onclick = () => {
   saveSettings('theme', next); applyTheme(next);
   toast(next === 'dark' ? '已切换到深色' : '已切换到浅色');
 };
-const pomoBtnEl = $('#pomoBtn');
-if (pomoBtnEl) pomoBtnEl.onclick = () => pomoDialog();
 $('#meBtn').onclick = () => {
   const u = S.user;
   const name = u ? (u.username + (u.is_admin ? '（管理员）' : '') + (u.ai_permission ? '' : '｜⚠️无AI权限')) : '未登录';
@@ -345,13 +319,11 @@ function foldCard(title, color, bodyHtml, id, collapsed) {
 function renderSolveBody() {
   const box = $('#solveBody'); if (!box) return;
   let html = '';
-  const sm = Object.assign({}, settings().showModules || {});
-  const on = (k) => sm[k] !== false;
-  if (solveAcc.steps && on('solution_steps')) html += foldCard('📝 解题思路', '#00D2FF', `<div class="md" data-md></div>`, 'foldSteps', false);
-  if (solveAcc.full && on('full_solution')) html += foldCard('📝 完整解析', '#7B2FBE', `<div class="md" data-md></div>`, 'foldFull', false);
-  if (solveAcc.extras && on('full_solution')) html += foldCard('📐 图解辅助', '#00BCD4', `<div class="md" data-md></div>`, 'foldExtras', false);
-  if (solveAcc.mindmap && on('mind_map')) html += foldCard('🗺️ 思维导图', '#00C853', `<pre style="white-space:pre-wrap;font-size:13px;line-height:1.8;font-family:inherit">${esc(solveAcc.mindmap)}</pre>`, 'foldMind', false);
-  if (solveAcc.similar && solveAcc.similar.length && on('suggested_questions')) {
+  if (solveAcc.steps) html += foldCard('📝 解题思路', '#00D2FF', `<div class="md" data-md></div>`, 'foldSteps', false);
+  if (solveAcc.full) html += foldCard('📝 完整解析', '#7B2FBE', `<div class="md" data-md></div>`, 'foldFull', false);
+  if (solveAcc.extras) html += foldCard('📐 图解辅助', '#00BCD4', `<div class="md" data-md></div>`, 'foldExtras', false);
+  if (solveAcc.mindmap) html += foldCard('🗺️ 思维导图', '#00C853', `<pre style="white-space:pre-wrap;font-size:13px;line-height:1.8;font-family:inherit">${esc(solveAcc.mindmap)}</pre>`, 'foldMind', false);
+  if (solveAcc.similar && solveAcc.similar.length) {
     let b = '';
     solveAcc.similar.forEach((x) => {
       b += `<div class="bubble q"><b>❓ ${esc(x.q)}</b>${x.a ? `<div class="muted" style="margin-top:6px">💡 ${esc(x.a)}</div>` : ''}</div>`;
@@ -463,10 +435,8 @@ function streamExtend(rid) {
 function renderExtend(acc) {
   const box = $('#extBody'); if (!box) return;
   let html = '';
-  const smx = Object.assign({}, settings().showModules || {});
-  const onx = (k) => smx[k] !== false;
-  if (acc.summary && onx('extension')) html += foldCard('📝 知识点总结', '#00D2FF', '<div class="md" data-md></div>', 'exSum', false);
-  if (acc.extension && onx('extension')) html += foldCard('🚀 知识拓展', '#7B2FBE', '<div class="md" data-md></div>', 'exExt', false);
+  if (acc.summary) html += foldCard('📝 知识点总结', '#00D2FF', '<div class="md" data-md></div>', 'exSum', false);
+  if (acc.extension) html += foldCard('🚀 知识拓展', '#7B2FBE', '<div class="md" data-md></div>', 'exExt', false);
   if (acc.similar.length) {
     let b = ''; acc.similar.forEach((x) => { b += `<div class="bubble q"><b>🔗 ${esc(x.q)}</b>${x.a ? `<div class="muted" style="margin-top:6px">📝 ${esc(x.a)}</div>` : ''}</div>`; });
     html += foldCard('🔗 相似题推荐', '#2196F3', b, 'exSim', false);
@@ -595,73 +565,20 @@ function renderReport(v) {
     } catch (e) { overlay(false); toast('生成失败：' + e.message); }
   };
   $('#btnAi').onclick = async () => {
-    const out = $('#reportOut');
-    out.innerHTML = `<div class="card"><div class="card-title">🤖 AI 学情报告</div>
-      <div id="aiRepStatus" class="muted">正在生成…</div><div class="md" id="aiRep"></div></div>`;
-    let acc = '';
-    let ended = false;
+    overlay('AI 正在撰写学情报告…');
     try {
-      // 服务端 /report/ai/stream 为 POST 型 SSE；用 postSSE（EventSource 只能 GET）
-      const src = API.postSSE('/report/ai/stream', { days: days, theme: settings().theme }, {
-        onEvent: (m) => {
-          if (m.stage === 'summary') {
-            const st = $('#aiRepStatus'); if (st) st.textContent = '分析完成，正在撰写…';
-            return;
-          }
-          if (m.stage === 'report_chunk') {
-            acc += (m.content || '');
-            const el = $('#aiRep'); if (el) renderMarkdownInto(el, acc);
-            if (!ended) {
-              const st = $('#aiRepStatus'); if (st) st.textContent = '';
-            }
-            return;
-          }
-          if (m.stage === 'error') {
-            ended = true;
-            if (!acc) out.innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">${esc(m.content || m.message || '生成失败')}</div></div>`;
-            return;
-          }
-        },
-        onDone: () => {
-          ended = true;
-          const st = $('#aiRepStatus'); if (st) st.textContent = '';
-          if (!acc) out.innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">报告内容为空</div></div>`;
-        },
-        onError: () => {
-          ended = true;
-          const st = $('#aiRepStatus');
-          if (st) st.textContent = '';
-          if (!acc) out.innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">生成失败：连接中断</div></div>`;
-        }
-      });
-    } catch (e) {
-      if (!acc) out.innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">生成失败：${esc(e.message)}</div></div>`;
-    }
+      const r = await API.aiReport(days, opts());
+      overlay(false);
+      if (r.status !== 'ok') { $('#reportOut').innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">${esc(r.message || '生成失败')}</div></div>`; return; }
+      $('#reportOut').innerHTML = `<div class="card"><div class="card-title">🤖 AI 学情报告</div><div class="md" id="aiRep"></div></div>`;
+      renderMarkdownInto($('#aiRep'), r.report || '');
+    } catch (e) { overlay(false); toast('生成失败：' + e.message); }
   };
 }
 
 /* ==================== 设置 ==================== */
 function renderSettings(v) {
   const st = settings();
-  const P = {
-    dialects: ["普通话", "四川话", "东北话", "粤语", "上海话", "天津话", "陕西话", "河南话", "湖南话"],
-    grades: [["", "不限"], ["小学", "小学"], ["初中", "初中"], ["高中", "高中"], ["考研", "考研"]],
-    details: [["auto", "自动"], ["very_detailed", "非常细"], ["detailed", "较细"], ["brief", "简略"]],
-    subjects: [["", "不限"], ["数学", "数学"], ["物理", "物理"], ["化学", "化学"], ["语文", "语文"], ["英语", "英语"], ["生物", "生物"], ["历史", "历史"], ["地理", "地理"], ["政治", "政治"]],
-    modules: [["solution_steps", "解题思路"], ["full_solution", "完整解析"], ["mind_map", "思维导图"], ["suggested_questions", "延伸问题"], ["mistakes", "易错点详解"], ["extension", "知识拓展"]],
-    llm: {
-      deepseek: [],
-      qwen: ["qwen3.8-max", "qwen3.7-plus", "qwen3.8-flash", "deepseek-v4-flash-0731", "kimi-k3", "glm-5.3", "MiniMax-M3"],
-      doubao: ["doubao-seed-2-1-pro-260628", "doubao-seed-2-1-turbo-260628", "doubao-seed-evolving-260628"],
-      hunyuan: ["hy4-preview"]
-    },
-    vision: ["qwen3.8-max", "qwen3.7-plus", "qwen3.5-omni-plus", "kimi-k3", "deepseek-v4-flash-vision-exp"]
-  };
-  const modelList = P.llm[st.engine] || [];
-  const mods = st.showModules || {};
-  const chipsHtml = (items, cur, key, cast) => items.map(([id, label]) =>
-    `<button class="chip ${String(cur) === String(id) ? 'active' : ''}" data-k="${key}" data-v="${id}">${label}</button>`).join('');
-
   v.innerHTML = `
     <div class="card">
       <div class="card-title">⚙️ 账号</div>
@@ -670,174 +587,82 @@ function renderSettings(v) {
       <div class="setting-row"><span class="lbl">AI 使用权限</span>
         <span class="muted" style="color:${S.user && S.user.ai_permission === false ? '#F44336' : '#4CAF50'}">${S.user ? (S.user.ai_permission === false ? '未开通' : '已开通') : '—'}</span></div>
     </div>
-
     <div class="card">
       <div class="card-title">🎨 外观</div>
       <div class="setting-row"><span class="lbl">主题模式</span>
-        <div class="chips" data-group="theme">${chipsHtml([["dark", "深色"], ["light", "浅色"]], st.theme, 'theme')}</div></div>
-      <div class="setting-row"><span class="lbl">全局字号</span>
-        <div class="chips" data-group="fontSize">${chipsHtml([[12, "小"], [16, "默认"], [20, "大"], [24, "特大"]], st.fontSize, 'fontSize', Number)}</div></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">🧠 AI 模型</div>
-      <div class="setting-row"><span class="lbl">大语言模型</span>
-        <div class="chips" data-group="engine">${chipsHtml([["deepseek", "DeepSeek"], ["qwen", "千问 Qwen"], ["doubao", "豆包"], ["hunyuan", "混元"]], st.engine, 'engine')}</div></div>
-      ${modelList.length ? `<div class="setting-row"><span class="lbl">具体模型</span>
-        <div class="chips" data-group="llmModel">${chipsHtml(modelList.map((m) => [m, m]), st.llmModel, 'llmModel')}</div></div>` : ''}
-      <div class="setting-row"><span class="lbl">OCR 模式</span>
-        <div class="chips" data-group="ocrMode">${chipsHtml([["paddle", "PaddleOCR 本地"], ["qwen", "AI 视觉"]], st.ocrMode, 'ocrMode')}</div></div>
-      ${st.ocrMode === 'qwen' ? `<div class="setting-row"><span class="lbl">视觉模型</span>
-        <div class="chips" data-group="visionModel">${chipsHtml(P.vision.map((m) => [m, m]), st.visionModel, 'visionModel')}</div></div>` : ''}
-    </div>
-
-    <div class="card">
-      <div class="card-title">🗣️ 讲解口吻</div>
-      <div class="setting-row"><span class="lbl">方言</span>
-        <div class="chips" data-group="dialect">${chipsHtml(P.dialects.map((d) => [d, d]), st.dialect, 'dialect')}</div></div>
-      <div class="setting-row"><span class="lbl">年级</span>
-        <div class="chips" data-group="grade">${chipsHtml(P.grades, st.grade, 'grade')}</div></div>
-      <div class="setting-row"><span class="lbl">回答风格</span>
-        <div class="chips" data-group="style">${chipsHtml([["formal", "正式"], ["encouraging", "鼓励"], ["humorous", "幽默"]], st.style, 'style')}</div></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">👤 老师人格（MBTI）</div>
-      <div class="setting-row"><span class="lbl">人格</span>
-        <div class="chips" data-group="personalityMode">
-          <button class="chip ${st.personality === 'auto' ? 'active' : ''}" data-k="personalityMode" data-v="auto">自动（按学科）</button>
-          <button class="chip ${st.personality !== 'auto' ? 'active' : ''}" data-k="personalityMode" data-v="manual">手动选择</button>
+        <div class="chips" id="themeChips">
+          <button class="chip ${st.theme === 'dark' ? 'active' : ''}" data-v="dark">深色</button>
+          <button class="chip ${st.theme === 'light' ? 'active' : ''}" data-v="light">浅色</button>
         </div></div>
-      ${st.personality !== 'auto' ? `<div class="setting-row"><span class="lbl">类型</span>
-        <div class="chips" data-group="personality">${chipsHtml(mbtiList().map((m) => [m, m]), st.personality, 'personality')}</div></div>` : ''}
-      <div class="muted">自动将按学科推荐合适类型的老师风格（如数学→INTP、语文→INFJ）</div>
+      <div class="setting-row"><span class="lbl">字号（全局）</span>
+        <div class="chips" id="fontChips">
+          ${[[12, '小'], [16, '默认'], [20, '大'], [24, '特大']].map(([v2, l]) => `<button class="chip ${st.fontSize === v2 ? 'active' : ''}" data-v="${v2}">${l}</button>`).join('')}
+        </div></div>
     </div>
-
+    <div class="card">
+      <div class="card-title">🤖 AI 模型</div>
+      <div class="setting-row"><span class="lbl">大语言模型</span>
+        <select class="sel" id="selEngine">
+          <option value="deepseek" ${st.engine === 'deepseek' ? 'selected' : ''}>DeepSeek</option>
+          <option value="qwen" ${st.engine === 'qwen' ? 'selected' : ''}>千问 Qwen</option>
+          <option value="doubao" ${st.engine === 'doubao' ? 'selected' : ''}>豆包 Doubao</option>
+        </select></div>
+      <div class="setting-row"><span class="lbl">OCR 模式</span>
+        <select class="sel" id="selOcr">
+          <option value="qwen" ${st.ocrMode === 'qwen' ? 'selected' : ''}>视觉模型</option>
+          <option value="paddle" ${st.ocrMode === 'paddle' ? 'selected' : ''}>PaddleOCR 本地</option>
+        </select></div>
+    </div>
     <div class="card">
       <div class="card-title">📐 解题偏好</div>
-      <div class="setting-row"><span class="lbl">详细度</span>
-        <div class="chips" data-group="detail">${chipsHtml(P.details, st.detail, 'detail')}</div></div>
-      <div class="setting-row"><span class="lbl">学科</span>
-        <div class="chips" data-group="subject">${chipsHtml(P.subjects, st.subject, 'subject')}</div></div>
-      <div class="setting-row"><span class="lbl">题库搜题</span>
-        <div class="chips" data-group="searchEnabled">${chipsHtml([[true, "开启"], [false, "关闭"]], st.searchEnabled, 'searchEnabled')}</div></div>
       <div class="setting-row"><span class="lbl">思考模式</span>
-        <div class="chips" data-group="thinking">${chipsHtml([["off", "关闭"], ["on", "开启"], ["auto", "自动"]], st.thinking, 'thinking')}</div></div>
+        <div class="chips" id="thinkChips">
+          <button class="chip ${st.thinking === 'off' ? 'active' : ''}" data-v="off">关闭</button>
+          <button class="chip ${st.thinking === 'on' ? 'active' : ''}" data-v="on">开启</button>
+          <button class="chip ${st.thinking === 'auto' ? 'active' : ''}" data-v="auto">自动</button>
+        </div></div>
       <div class="setting-row"><span class="lbl">图解辅助</span>
-        <div class="chips" data-group="latexHelper">${chipsHtml([["off", "关闭"], ["on", "开启"], ["auto", "自动"]], st.latexHelper, 'latexHelper')}</div></div>
+        <div class="chips" id="latexChips">
+          <button class="chip ${st.latexHelper === 'off' ? 'active' : ''}" data-v="off">关闭</button>
+          <button class="chip ${st.latexHelper === 'on' ? 'active' : ''}" data-v="on">开启</button>
+          <button class="chip ${st.latexHelper === 'auto' ? 'active' : ''}" data-v="auto">自动</button>
+        </div></div>
+      <div class="setting-row"><span class="lbl">题库搜题</span>
+        <div class="chips" id="searchChips">
+          <button class="chip ${st.searchEnabled ? 'active' : ''}" data-v="1">开启</button>
+          <button class="chip ${!st.searchEnabled ? 'active' : ''}" data-v="0">关闭</button>
+        </div></div>
+      <div class="setting-row"><span class="lbl">回答风格</span>
+        <select class="sel" id="selStyle">
+          <option value="formal" ${st.style === 'formal' ? 'selected' : ''}>正式</option>
+          <option value="encouraging" ${st.style === 'encouraging' ? 'selected' : ''}>鼓励</option>
+          <option value="humorous" ${st.style === 'humorous' ? 'selected' : ''}>幽默</option>
+        </select></div>
     </div>
-
-    <div class="card">
-      <div class="card-title">📂 显示模块</div>
-      <div class="chips" data-group="showModules">${P.modules.map(([k, label]) =>
-        `<button class="chip ${mods[k] !== false ? 'active' : ''}" data-k="showModules" data-v="${k}">${label}</button>`).join('')}</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">🍅 番茄钟</div>
-      <div class="setting-row"><span class="lbl">工作时长（分钟）</span>
-        <input class="ipt" id="pmWork" type="number" min="1" max="180" value="${st.pomodoroWork || 25}" style="max-width:110px"></div>
-      <div class="setting-row"><span class="lbl">休息时长（分钟）</span>
-        <input class="ipt" id="pmRest" type="number" min="1" max="60" value="${st.pomodoroRest || 5}" style="max-width:110px"></div>
-      <div class="setting-row"><span class="lbl">计时模式</span>
-        <div class="chips" data-group="pomodoroMode">${chipsHtml([["countdown", "⏳ 倒计时"], ["countup", "⏱ 正计时"]], st.pomodoroMode || 'countdown', 'pomodoroMode')}</div></div>
-      <div class="muted">提示：番茄钟计时器在主界面顶部 🍅 显示</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">📅 历史与数据</div>
-      <div class="setting-row"><span class="lbl">开始日期</span>
-        <input class="ipt" id="hStart" type="date" value="${esc(st.historyStartDate || '')}" style="max-width:170px"></div>
-      <div class="setting-row"><span class="lbl">截止日期</span>
-        <input class="ipt" id="hEnd" type="date" value="${esc(st.historyEndDate || '')}" style="max-width:170px"></div>
-      <div class="row" style="margin-top:10px">
-        <button class="btn btn-ghost" id="btnClearHistory">🗑️ 清除历史记录</button>
-        <button class="btn btn-ghost" id="btnExport">📤 导出数据</button>
-      </div>
-    </div>
-
     <div class="card">
       <div class="card-title">ℹ️ 关于</div>
       <div class="muted">学习助手 学生端（网页版）v2.1.2<br>服务端：${location.host || '本机'}</div>
-      <div class="row" style="margin-top:10px"><button class="btn btn-primary" id="btnLogout">🚪 退出登录</button></div>
     </div>`;
 
-  /* 统一 chip 绑定：点击切换 + 持久化；特殊键附带副作用 */
-  v.querySelectorAll('.chips[data-group] .chip').forEach((c) => {
-    c.onclick = () => {
-      const k = c.dataset.k, val = c.dataset.v;
-      let out = val;
-      if (k === 'fontSize') out = Number(val);
-      else if (k === 'searchEnabled') out = (val === 'true');
-      else if (k === 'showModules') {
-        const cur = Object.assign({}, settings().showModules || {});
-        cur[val] = !(cur[val] !== false);
-        cur[val] = (cur[val] === true) ? true : false;
-        saveSettings('showModules', cur);
-        renderSettings(v);
+  const bindChips = (sel, key, cast) => {
+    v.querySelectorAll(sel + ' .chip').forEach((c) => {
+      c.onclick = () => {
+        v.querySelectorAll(sel + ' .chip').forEach((x) => x.classList.toggle('active', x === c));
+        saveSettings(key, cast ? cast(c.dataset.v) : c.dataset.v);
+        if (key === 'theme') applyTheme(c.dataset.v);
+        if (key === 'fontSize') applyFontSize(+c.dataset.v);
         toast('已保存');
-        return;
-      } else if (k === 'personalityMode') {
-        saveSettings('personality', val === 'auto' ? 'auto' : (settings().personality === 'auto' ? 'INTJ' : settings().personality));
-        renderSettings(v); toast('已保存'); return;
-      } else if (k === 'engine') {
-        const def = { deepseek: '', qwen: 'qwen3.8-max', doubao: 'doubao-seed-2-1-pro-260628', hunyuan: 'hy4-preview' }[val] || '';
-        saveSettings('engine', val); saveSettings('llmModel', def);
-        renderSettings(v); toast('已保存'); return;
-      } else if (k === 'ocrMode') {
-        saveSettings('ocrMode', val);
-        if (val === 'qwen' && !settings().visionModel) saveSettings('visionModel', 'qwen3.8-max');
-        renderSettings(v); toast('已保存'); return;
-      }
-      saveSettings(k, out);
-      renderSettings(v);
-      if (k === 'theme') applyTheme(val);
-      if (k === 'fontSize') applyFontSize(Number(val));
-      toast('已保存');
-    };
-  });
-
-  /* 番茄钟输入 */
-  const bindNum = (sel, key, def) => {
-    const el = $(sel); if (!el) return;
-    el.onchange = () => {
-      const n = parseInt(el.value, 10);
-      saveSettings(key, (isNaN(n) || n <= 0) ? def : n);
-      toast('已保存');
-    };
+      };
+    });
   };
-  bindNum('#pmWork', 'pomodoroWork', 25);
-  bindNum('#pmRest', 'pomodoroRest', 5);
-
-  /* 历史日期 */
-  const bindDate = (sel, key) => {
-    const el = $(sel); if (!el) return;
-    el.onchange = () => { saveSettings(key, el.value); toast('已保存'); };
-  };
-  bindDate('#hStart', 'historyStartDate');
-  bindDate('#hEnd', 'historyEndDate');
-
-  const bc = $('#btnClearHistory');
-  if (bc) bc.onclick = () => {
-    if (!confirm('确定要清除全部历史记录吗？此操作不可恢复。')) return;
-    API.req('/history', { method: 'DELETE' })
-      .then(() => toast('已清除'))
-      .catch((e) => toast('清除失败：' + e.message));
-  };
-  const be = $('#btnExport');
-  if (be) be.onclick = () => { S.view = 'history'; render(); toast('请在历史记录页导出'); };
-  const bl = $('#btnLogout');
-  if (bl) bl.onclick = () => {
-    if (!confirm('确定退出登录？')) return;
-    API.logout(); S.user = null; render();
-  };
-}
-
-/* MBTI 16 型 */
-function mbtiList() {
-  const out = [];
-  for (const a of ['E', 'I']) for (const b of ['S', 'N']) for (const c of ['T', 'F']) for (const d of ['J', 'P']) out.push(a + b + c + d);
-  return out;
+  bindChips('#themeChips', 'theme');
+  bindChips('#fontChips', 'fontSize', Number);
+  bindChips('#thinkChips', 'thinking');
+  bindChips('#latexChips', 'latexHelper');
+  bindChips('#searchChips', 'searchEnabled', (v2) => v2 === '1');
+  $('#selEngine').onchange = (e) => { saveSettings('engine', e.target.value); toast('已保存'); };
+  $('#selOcr').onchange = (e) => { saveSettings('ocrMode', e.target.value); toast('已保存'); };
+  $('#selStyle').onchange = (e) => { saveSettings('style', e.target.value); toast('已保存'); };
 }
 
 /* ==================== 悬浮回到底部 ==================== */
@@ -849,103 +674,6 @@ function bindScrollFab() {
     fab.classList.toggle('hidden', gap < 120);
   };
   fab.onclick = () => v.scrollTo({ top: v.scrollHeight, behavior: 'smooth' });
-}
-
-/* ==================== 🍅 番茄钟 ==================== */
-const POMO = { running: false, remaining: 0, elapsed: 0, timer: null, show: false };
-
-function pomoInit() {
-  const st = settings();
-  POMO.remaining = (st.pomodoroWork || 25) * 60;
-  POMO.elapsed = 0;
-  pomoPaint();
-}
-function pomoFmt(sec) {
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
-}
-function pomoIsCountup() { return (settings().pomodoroMode || 'countdown') === 'countup'; }
-function pomoTick() {
-  if (pomoIsCountup()) {
-    POMO.elapsed++;
-  } else {
-    POMO.remaining--;
-    if (POMO.remaining <= 0) {
-      pomoStop();
-      pomoPaint();
-      toast('🍅 番茄钟结束，休息一下吧！', 4000);
-      try { new Audio('data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=').play(); } catch (e) {}
-      POMO.remaining = (settings().pomodoroRest || 5) * 60;
-      return;
-    }
-  }
-  pomoPaint();
-}
-function pomoStart() {
-  if (POMO.running) return;
-  POMO.running = true;
-  POMO.timer = setInterval(pomoTick, 1000);
-  pomoPaint();
-}
-function pomoStop() {
-  POMO.running = false;
-  if (POMO.timer) { clearInterval(POMO.timer); POMO.timer = null; }
-  pomoPaint();
-}
-function pomoReset() {
-  pomoStop();
-  const st = settings();
-  POMO.remaining = (st.pomodoroWork || 25) * 60;
-  POMO.elapsed = 0;
-  pomoPaint();
-}
-function pomoPaint() {
-  const btn = document.getElementById('pomoBtn');
-  if (!btn) return;
-  if (POMO.running) {
-    btn.textContent = '🍅 ' + (pomoIsCountup() ? pomoFmt(POMO.elapsed) : pomoFmt(POMO.remaining));
-    btn.style.fontSize = '12px';
-  } else {
-    btn.textContent = '🍅';
-    btn.style.fontSize = '';
-  }
-}
-function pomoDialog() {
-  const st = settings();
-  const countup = pomoIsCountup();
-  const cur = countup ? pomoFmt(POMO.elapsed) : pomoFmt(POMO.remaining);
-  let dlg = document.getElementById('pomoDlg');
-  if (dlg) dlg.remove();
-  dlg = document.createElement('div');
-  dlg.id = 'pomoDlg';
-  dlg.className = 'overlay';
-  dlg.style.background = 'rgba(0,0,0,0.55)';
-  dlg.innerHTML = `
-    <div class="card" style="max-width:340px;width:88%;margin:auto">
-      <div class="card-title">🍅 番茄钟</div>
-      <div style="text-align:center;margin:12px 0">
-        <div class="muted">${countup ? '⏱ 已计时' : '⏳ 剩余时间'}</div>
-        <div style="font-size:38px;font-weight:bold;color:${countup ? '#00D2FF' : '#FF5722'}">${cur}</div>
-      </div>
-      <div class="chips" style="justify-content:center">
-        <button class="chip" id="pmToggle">${POMO.running ? '⏸ 暂停' : '▶️ 开始'}</button>
-        <button class="chip" id="pmReset">🔄 重置</button>
-      </div>
-      <div class="muted" style="margin-top:10px;text-align:center">工作时长 ${st.pomodoroWork || 25} 分 · 休息 ${st.pomodoroRest || 5} 分<br>可在「设置 → 番茄钟」中修改</div>
-      <div class="row" style="margin-top:12px"><button class="btn btn-ghost" id="pmClose">关闭</button></div>
-    </div>`;
-  document.body.appendChild(dlg);
-  const refresh = () => {
-    const el = dlg.querySelector('div[style*="font-size:38px"]');
-    if (el) el.textContent = pomoIsCountup() ? pomoFmt(POMO.elapsed) : pomoFmt(POMO.remaining);
-    const t = dlg.querySelector('#pmToggle');
-    if (t) t.textContent = POMO.running ? '⏸ 暂停' : '▶️ 开始';
-  };
-  POMO._refresh = refresh;
-  dlg.querySelector('#pmToggle').onclick = () => { POMO.running ? pomoStop() : pomoStart(); refresh(); };
-  dlg.querySelector('#pmReset').onclick = () => { pomoReset(); refresh(); };
-  dlg.querySelector('#pmClose').onclick = () => { dlg.remove(); POMO._refresh = null; };
-  dlg.onclick = (e) => { if (e.target === dlg) { dlg.remove(); POMO._refresh = null; } };
 }
 
 /* ==================== 启动 ==================== */

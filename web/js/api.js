@@ -129,6 +129,43 @@ const API = (() => {
     return src;
   }
 
+  /* ---------- POST-SSE 读取器（EventSource 只能 GET，报告等接口是 POST） ---------- */
+  async function postSSE(path, body, { onEvent, onDone, onError } = {}) {
+    try {
+      const res = await fetch(BASE + path, {
+        method: 'POST',
+        headers: headers({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body || {})
+      });
+      if (!res.ok || !res.body) {
+        let msg = 'HTTP ' + res.status;
+        try { const j = await res.json(); msg = j.detail || j.message || msg; } catch (e) {}
+        onError && onError(new Error(msg));
+        return;
+      }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder('utf-8');
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) continue;
+          let m; try { m = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+          if (m.stage === 'complete') { onDone && onDone(m); return; }
+          onEvent && onEvent(m);
+        }
+      }
+      onDone && onDone(null);
+    } catch (e) {
+      onError && onError(e);
+    }
+  }
+
   /* ---------- 历史 ---------- */
   async function history(filters = {}) {
     return req('/history', { method: 'POST', raw: Object.assign({
@@ -195,7 +232,7 @@ const API = (() => {
     req, login, register, verify, logout,
     getToken: () => token, getUser: () => user,
     solveImage, solveText, confirmSolve, selectQuestions, cancelSolve, ask,
-    sse, history, deleteHistory, dataReport, aiReport,
+    sse, postSSE, history, deleteHistory, dataReport, aiReport,
     extendImage, extendText, animateImage, animateText,
     mastery, exportDoc, health
   };
