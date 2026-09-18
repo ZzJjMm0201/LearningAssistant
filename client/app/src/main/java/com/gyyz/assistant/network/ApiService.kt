@@ -128,7 +128,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     var llmModel: String = ""              // 大语言模型名（空=提供方默认）
     var ocrMode: String = "paddle"         // paddle / qwen（千问视觉OCR）
     var visionModel: String = ""           // 视觉模型名（空=默认 qwen3.8-max）
-    // ② 回答风格 formal/plain/concise/lively/dialect（④⑦十一 相关请求头）
+    // ② 回答风格 formal(正式)/encouraging(鼓励)/humorous(幽默)（④⑦十一 相关请求头）
     var answerStyle: String = "formal"
     var searchEnabled: Boolean = true
     var thinkingMode: String = "off"        // 十一 思考模式：off / on / auto（auto按难度）
@@ -149,7 +149,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (llmModel.isNotEmpty()) addHeader("X-LLM-Model", llmModel)
         addHeader("X-OCR-Mode", ocrMode)
         if (visionModel.isNotEmpty()) addHeader("X-Vision-Model", visionModel)
-        // 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度（回答风格已移除，不再发 X-Style）
+        // ② 回答风格 / 十一 思考模式 / ④ 搜题开关 / ③ 方言 / ④ 年级 / ⑧ 人格/详细度
+        if (answerStyle.isNotEmpty()) addHeader("X-Style", answerStyle)
         if (thinkingMode == "on") addHeader("X-Thinking", "1")
         else if (thinkingMode == "auto") addHeader("X-Thinking", "auto")
         if (latexHelper == "on") addHeader("X-Latex-Helper", "1")
@@ -427,26 +428,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
      * 获取AI动画
      */
     data class AnimationResponse(val status: String, val url: String = "", val message: String = "")
-    data class GeoGebraResponse(val status: String, val url: String = "", val message: String = "")
 
-    suspend fun generateGeoGebra(ocrText: String): GeoGebraResponse {
-        return withContext(Dispatchers.IO) {
-            val json = JSONObject().apply { put("ocr_text", ocrText) }
-            val body = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                    .url("$BASE_URL/geogebra")
-                    .post(body)
-                    .withAuth()
-                    .build()
-            val response = client.newCall(request).execute()
-            val result = JSONObject(response.body?.string() ?: "{}")
-            GeoGebraResponse(
-                    status = result.optString("status", "error"),
-                    url = result.optString("url", ""),
-                    message = result.optString("message", "")
-            )
-        }
-    }
     suspend fun animateText(text: String): AnimationResponse {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().apply { put("text", text) }
@@ -876,6 +858,32 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                 .withAuth()
                 .build()
             client.newCall(request).execute()
+        }
+    }
+
+    /**
+     * ⑰ AI批注：上传作业图片，返回带批注的图片 URL + 批注列表
+     * 通道由 X-OCR-Mode 决定（qwen=视觉模型直出；paddle=坐标投给大模型），与设置一致
+     */
+    suspend fun annotateImage(imageBytes: ByteArray): JSONObject {
+        return withContext(Dispatchers.IO) {
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", "photo.jpg",
+                    imageBytes.toRequestBody("image/jpeg".toMediaType()))
+                .build()
+            val request = Request.Builder()
+                .url("$BASE_URL/annotate")
+                .post(requestBody)
+                .withAuth()
+                .build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: throw Exception("批注响应为空")
+            val json = JSONObject(body)
+            if (json.optString("status") == "error") {
+                throw Exception(json.optString("message", "批注失败"))
+            }
+            json
         }
     }
 

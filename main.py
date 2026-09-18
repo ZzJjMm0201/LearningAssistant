@@ -11,7 +11,7 @@ for _s in (_sys.stdout, _sys.stderr):
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import asyncio
 
-from server.config import HISTORY_DIR, REPORT_DIR, FEATURE_FLAGS
+from server.config import HISTORY_DIR, REPORT_DIR, FEATURE_FLAGS, APIConfig
 from server.database.models import init_database, SubmissionRecord, TrackingRecord, ConversationHistory, User
 from server.services.ai_service import ai_service
 from server.services.search_service import search_service
@@ -147,6 +147,8 @@ class AskRequest(BaseModel):
 class ReportRequest(BaseModel):
     days: int = 30
     theme: str = "dark"  # dark / light（② 数据报告深浅色）
+    grade: str = ""      # ③ 报告筛选：年级（空=不限）
+    subject: str = ""    # ③ 报告筛选：学科（空=不限）
 
 class ExportRequest(BaseModel):
     title: str = "导出"
@@ -203,9 +205,11 @@ def get_llm_model(request: Request) -> Optional[str]:
 
 
 def get_ocr_mode(request: Request) -> str:
-    """OCR模式（X-OCR-Mode头：paddle/qwen），默认paddle"""
-    mode = (request.headers.get("X-OCR-Mode") or "paddle").lower()
-    return mode if mode in ("paddle", "qwen") else "paddle"
+    """OCR模式（X-OCR-Mode头：paddle/qwen），默认取 OCR_DEFAULT_MODE（qwen 视觉模型）"""
+    default = getattr(APIConfig, "OCR_DEFAULT_MODE", "qwen")
+    default = default if default in ("paddle", "qwen") else "qwen"
+    mode = (request.headers.get("X-OCR-Mode") or default).lower()
+    return mode if mode in ("paddle", "qwen") else default
 
 
 def get_vision_model(request: Request) -> Optional[str]:
@@ -215,9 +219,16 @@ def get_vision_model(request: Request) -> Optional[str]:
 
 
 def get_answer_style(request: Request) -> Optional[str]:
-    """② 回答风格（X-Style头：formal/plain/concise/lively），未指定用默认"""
-    s = (request.headers.get("X-Style") or "").strip().lower()
-    return s if s in ("formal", "plain", "concise", "lively", "dialect") else None
+    """② 回答风格（X-Style头；兼容网页端旧头 X-Answer-Style）
+    取值：formal(正式)/encouraging(鼓励)/humorous(幽默)，另保留历史值 plain/concise/lively/dialect"""
+    s = (request.headers.get("X-Style") or request.headers.get("X-Answer-Style") or "").strip().lower()
+    return s if s in ("formal", "encouraging", "humorous", "plain", "concise", "lively", "dialect") else None
+
+
+def get_theme(request: Request) -> str:
+    """界面主题（X-Theme头：light/dark）。用于动画等“生成时就固化了配色”的内容做深浅色适配"""
+    t = (request.headers.get("X-Theme") or "").strip().lower()
+    return "light" if t == "light" else "dark"
 
 
 def get_personality(request: Request) -> Optional[str]:
@@ -277,9 +288,27 @@ def get_latex_helper(request: Request):
 
 
 def get_search_enabled(request: Request) -> bool:
-    """④ 搜题开关（X-Search-Enabled头：0/false/off 关闭；默认开启）"""
+    """④ 搜题开关（X-Search-Enabled头：0/false/off 关闭；默认开启）
+
+    ⑲ 但全局开关 FEATURE_FLAGS['enable_question_search'] 为 False 时一律不搜，
+    避免好未来额度被消耗（客户端开关也已禁用，这里再做一层服务端兜底）。
+    """
+    if not FEATURE_FLAGS.get("enable_question_search", False):
+        return False
     v = (request.headers.get("X-Search-Enabled") or "").strip().lower()
     return v not in ("0", "false", "off", "no")
+
+
+def get_interactive_quiz(request: Request) -> bool:
+    """⑯ 边解答边设问（X-Interactive-Quiz头：1/true/on 开启；默认关闭）"""
+    v = (request.headers.get("X-Interactive-Quiz") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def get_ai_annotate(request: Request) -> bool:
+    """⑰ AI批注（X-AI-Annotate头）；实际由 /annotate 接口单独走，这里仅备用"""
+    v = (request.headers.get("X-AI-Annotate") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def get_weak_count(user_id: Optional[int]) -> int:
@@ -335,6 +364,7 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
         subject=get_subject(request),
         detail=get_detail(request),
         weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
     )
     
     return {
@@ -346,6 +376,88 @@ async def solve_problem(request: Request, file: UploadFile = File(...)):
 
 class SolveTextRequest(BaseModel):
     text: str
+
+
+@app.post("/solve/multipage")
+async def solve_multipage(request: Request, file: UploadFile = File(...)):
+    """长按多页拍摄：上传一段连续拍摄的视频，服务端抽关键帧
+
+    每帧视作一页 → 逐页 OCR → 合并成一篇长文本 → 交给现有分题流水线
+    （多题时会照常下发 question_split，由客户端选题）。
+    这样多页拍摄与单张多题走的是同一条下游路径，行为一致。
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    request_id = str(uuid.uuid4())
+    video_path = HISTORY_DIR / f"mp_{request_id}.mp4"
+    content = await file.read()
+    if not content:
+        return {"status": "error", "message": "视频内容为空"}
+    try:
+        with open(video_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        return {"status": "error", "message": f"视频保存失败: {e}"}
+
+    # ① 抽关键帧（OpenCV，本环境无 ffmpeg）
+    from server.services.keyframe_service import extract_keyframes
+    try:
+        frames, kf_err = extract_keyframes(HISTORY_DIR, str(video_path))
+    except Exception as e:
+        return {"status": "error", "message": f"关键帧提取失败: {e}"}
+    if kf_err or not frames:
+        return {"status": "error", "message": kf_err or "没有从视频中提取到有效画面"}
+
+    # ② 逐页 OCR（沿用请求里的 OCR 模式）
+    mode = get_ocr_mode(request)
+    vision_model = get_vision_model(request)
+    page_texts = []
+    for fr in frames:
+        try:
+            txt, _conf, _src = ocr_service.recognize(fr["path"], mode=mode, vision_model=vision_model)
+        except Exception as e:
+            print(f"[{request_id}] 第{fr['index']}页 OCR 异常: {e}")
+            txt = ""
+        if txt and not str(txt).startswith("OCR"):
+            page_texts.append(str(txt).strip())
+
+    if not page_texts:
+        return {"status": "error", "message": "多页识别失败，请重新拍摄（注意逐页拍清楚）"}
+
+    # ③ 合并成一篇长文，交给现有分题流水线（多题自动广播 question_split）
+    merged = "\n\n".join(page_texts)
+    _user_id = get_current_user(request)
+    solve_pipeline.start_solve(
+        image_path=frames[0]["path"],
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=mode,
+        vision_model=vision_model,
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+        text_input=merged,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "pages": len(page_texts),
+        "total_frames": len(frames),
+        "message": "多页解题已启动",
+    }
 
 
 @app.post("/solve/text")
@@ -382,6 +494,7 @@ async def solve_text(request: Request, body: SolveTextRequest):
         subject=get_subject(request),
         detail=get_detail(request),
         weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
         text_input=text,
     )
     return {
@@ -477,6 +590,12 @@ async def ask_question(request: AskRequest):
         messages: list = clean_conversation_history(
             [{"role": h.role, "content": h.content} for h in history]
         )
+        # 历史记录页追问：该会话没有对话上下文时，用客户端传入的 context 兜底
+        # （solve 会保存 ConversationHistory，知识延伸/动画记录不会，需要前端带上正文）
+        if not messages and isinstance(request.context, list):
+            messages = clean_conversation_history(
+                [m for m in request.context if isinstance(m, dict) and m.get("role") and m.get("content")]
+            )
 
         response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
 
@@ -510,6 +629,11 @@ async def ask_question_stream(request: Request, body: AskRequest):
         messages: list = clean_conversation_history(
             [{"role": h.role, "content": h.content} for h in history]
         )
+        # 历史记录页追问：无对话上下文时用客户端传入的 context 兜底（同 /ask）
+        if not messages and isinstance(body.context, list):
+            messages = clean_conversation_history(
+                [m for m in body.context if isinstance(m, dict) and m.get("role") and m.get("content")]
+            )
         engine = get_engine(request)
         llm_model = get_llm_model(request)
         style = get_answer_style(request)
@@ -591,8 +715,8 @@ async def create_animation(request: Request, file: UploadFile = File(...)):
     if not ocr_text or ocr_text.startswith("OCR"):
         return {"status": "error", "message": "OCR识别失败"}
     
-    # 生成动画
-    html_path = generate_animation(ocr_text, engine=get_engine(request))
+    # 生成动画（theme：浅色界面下用浅色背景，避免深色动画与页面格格不入）
+    html_path = generate_animation(ocr_text, engine=get_engine(request), theme=get_theme(request))
     if html_path:
         # 返回动画文件的 URL
         filename = Path(html_path).name
@@ -619,7 +743,8 @@ async def create_animation(request: Request, file: UploadFile = File(...)):
         return {
             "status": "ok",
             "url": url,
-            "request_id": request_id
+            "request_id": request_id,
+            "usage": ai_service.get_usage()   # ⑫ tokens：动画也要能显示用量
         }
     else:
         return {"status": "error", "message": "动画生成失败"}
@@ -637,7 +762,7 @@ async def create_animation_text(request: Request, body: SolveTextRequest):
     if not text:
         return {"status": "error", "message": "题目文本不能为空"}
     request_id = str(uuid.uuid4())
-    html_path = generate_animation(text, engine=get_engine(request))
+    html_path = generate_animation(text, engine=get_engine(request), theme=get_theme(request))
     if html_path:
         filename = Path(html_path).name
         url = f"/static/animations/{filename}"
@@ -659,7 +784,7 @@ async def create_animation_text(request: Request, body: SolveTextRequest):
                 db2.close()
         except Exception as e:
             print(f"[动画-文本] 保存历史记录失败: {e}")
-        return {"status": "ok", "url": url, "request_id": request_id}
+        return {"status": "ok", "url": url, "request_id": request_id, "usage": ai_service.get_usage()}
     else:
         return {"status": "error", "message": "动画生成失败"}
 
@@ -673,12 +798,14 @@ async def get_animation(filename: str):
 
 @app.post("/report/data")
 async def data_report(request: Request, body: ReportRequest):
-    """生成数据版学情报告（按用户隔离）"""
+    """生成数据版学情报告（按用户隔离 + ③ 年级/学科筛选）"""
     db = SessionLocal()
     try:
         generator = ReportGenerator(db)
         theme = "light" if (body.theme or "").lower() == "light" else "dark"
-        html_path = generator.generate_data_report_html(body.days, user_id=get_current_user(request), theme=theme)
+        html_path = generator.generate_data_report_html(
+            body.days, user_id=get_current_user(request), theme=theme,
+            grade=(body.grade or "").strip(), subject=(body.subject or "").strip())
         
         if html_path:
             filename = Path(html_path).name
@@ -708,9 +835,10 @@ async def ai_report(request: Request, body: ReportRequest):
         if body.days and body.days > 0:
             q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
         if user_id is not None:
-            q = q.filter(or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None)))
+            q = q.filter(SubmissionRecord.user_id == user_id)
         else:
-            q = q.filter(SubmissionRecord.user_id.is_(None))
+            # 未登录/游客：无个人记录可统计
+            q = q.filter(SubmissionRecord.id == -1)
         record_count = q.count()
         if record_count < 5:
             return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
@@ -721,7 +849,11 @@ async def ai_report(request: Request, body: ReportRequest):
         if summary == "暂无学习记录":
             return {"status": "error", "message": "暂无学习记录"}
         
-        ai_report_text = ai_service.generate_ai_report(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
+        ai_report_text = ai_service.generate_ai_report(
+            summary, engine=get_engine(request), model=get_llm_model(request),
+            style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request),
+            personality=get_personality(request), detail=get_detail(request),
+            subject=get_subject(request), weak_count=get_weak_count(user_id))
         
         return {
             "status": "ok",
@@ -748,9 +880,10 @@ async def ai_report_stream(request: Request, body: ReportRequest):
         if body.days and body.days > 0:
             q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
         if user_id is not None:
-            q = q.filter(or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None)))
+            q = q.filter(SubmissionRecord.user_id == user_id)
         else:
-            q = q.filter(SubmissionRecord.user_id.is_(None))
+            # 未登录/游客：无个人记录可统计
+            q = q.filter(SubmissionRecord.id == -1)
         record_count = q.count()
         if record_count < 5:
             return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
@@ -765,7 +898,11 @@ async def ai_report_stream(request: Request, body: ReportRequest):
             # 先发摘要供客户端展示
             yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
             # 流式生成报告正文
-            for chunk in ai_service.generate_ai_report_stream(summary, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request)):
+            for chunk in ai_service.generate_ai_report_stream(
+                    summary, engine=get_engine(request), model=get_llm_model(request),
+                    style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request),
+                    personality=get_personality(request), detail=get_detail(request),
+                    subject=get_subject(request), weak_count=get_weak_count(user_id)):
                 yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
             yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
@@ -821,6 +958,133 @@ async def get_export_file(filename: str):
         return {"detail": "Not Found"}
     mt = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if filename.endswith(".docx") else "application/pdf"
     return FileResponse(file_path, media_type=mt, filename=filename)
+
+
+# ==================== ⑰ AI 批注 ====================
+
+@app.post("/annotate")
+async def ai_annotate(request: Request, file: UploadFile = File(...)):
+    """⑰ AI批注：在学生作业/试卷图片上生成老师的批改标记
+
+    两条通道（由 X-OCR-Mode 决定，与设置里的 OCR 模式一致）：
+      ㈠ 视觉模型（qwen）：在外围画像素刻度尺，批注由视觉模型**直接生成**，不投给大语言模型
+      ㈡ PaddleOCR：取出文本块坐标，连同题目内容一起投给大语言模型来定位
+    产出：带批注的 PNG（可下载）+ 批注列表
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    import uuid as _uuid
+    from server.services import annotation_service as anno
+
+    request_id = str(_uuid.uuid4())
+    src_path = HISTORY_DIR / f"annotate_{request_id}.jpg"
+    content = await file.read()
+    try:
+        save_uploaded_image(content, src_path)
+    except Exception as e:
+        return {"status": "error", "message": f"图片保存失败: {e}"}
+
+    mode = get_ocr_mode(request)          # paddle / qwen
+    engine = get_engine(request)
+    model = get_llm_model(request)
+    vision_model = get_vision_model(request)
+
+    out_dir = HISTORY_DIR / "annotations"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f"anno_{request_id}.png"
+    out_path = out_dir / out_name
+
+    try:
+        if mode == "qwen":
+            # ---- ㈠ 视觉模型：画刻度尺 → 视觉模型直接产出批注 ----
+            ruler_path = out_dir / f"ruler_{request_id}.png"
+            try:
+                w, h = await asyncio.to_thread(anno.add_rulers, str(src_path), str(ruler_path))
+            except Exception as e:
+                return {"status": "error", "message": f"绘制刻度尺失败: {e}"}
+
+            raw = await asyncio.to_thread(
+                ai_service.recognize_image_with_vision,
+                str(ruler_path), vision_model, anno.VISION_ANNOTATE_PROMPT
+            )
+            raw_text = raw[0] if isinstance(raw, tuple) else (raw or "")
+            annotations = anno.parse_annotations(raw_text)
+            channel = "vision"
+        else:
+            # ---- ㈡ PaddleOCR：取文字块坐标 → 投给大语言模型 ----
+            text, blocks, width, height, _el = await asyncio.to_thread(
+                ocr_service.recognize_with_boxes, str(src_path)
+            )
+            if not text:
+                return {"status": "error", "message": "OCR识别失败，无法生成批注"}
+            if not width or not height:
+                try:
+                    from PIL import Image as _Image
+                    with _Image.open(src_path) as _im:
+                        width, height = _im.size
+                except Exception:
+                    width = height = 0
+            prompt = anno.build_paddle_annotate_prompt(text, blocks, width, height)
+            raw_text = await asyncio.to_thread(
+                ai_service.generate_response, prompt, engine, model
+            )
+            annotations = anno.parse_annotations(raw_text or "")
+            channel = "paddle"
+
+        if not annotations:
+            return {"status": "error", "message": "AI 未生成有效批注，请重试或换一张更清晰的图片"}
+
+        # 在原图（不带刻度尺）上绘制批注，便于下载使用
+        ok = await asyncio.to_thread(
+            anno.draw_annotations, str(src_path), annotations, str(out_path)
+        )
+        if not ok:
+            return {"status": "error", "message": "批注图片保存失败"}
+
+        # 存一条历史记录（与 AI动画/知识延伸 并列）
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="annotation",
+                    title="AI批注",
+                    content=f"/static/annotations/{out_name}",
+                    extra_json={"channel": channel, "annotations": annotations},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[批注] 保存历史记录失败: {e}")
+
+        return {
+            "status": "ok",
+            "url": f"/static/annotations/{out_name}",
+            "channel": channel,
+            "annotations": annotations,
+            "usage": ai_service.get_usage(),   # ⑫ tokens：批注也要能显示用量
+            "request_id": request_id,
+        }
+    except Exception as e:
+        print(f"[批注] 生成失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"批注生成失败: {e}"}
+
+
+@app.get("/static/annotations/{filename}")
+async def get_annotation_file(filename: str):
+    """获取批注后的图片"""
+    file_path = HISTORY_DIR / "annotations" / filename
+    if not file_path.exists():
+        return {"detail": "Not Found"}
+    return FileResponse(file_path, media_type="image/png")
 
 @app.post("/pomodoro/recommend")
 async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
@@ -885,8 +1149,17 @@ async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
 # ④ 网页端（学生端）静态目录：与 API 同源，避免跨域
 from pathlib import Path as _WebPath
 _WEB_DIR = _WebPath(__file__).resolve().parent / "web"
+# 开发/迭代期：静态资源禁缓存，避免浏览器继续使用旧版 JS/CSS
+class _NoCacheStatic(StaticFiles):
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
 if _WEB_DIR.is_dir():
-    app.mount("/web", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
+    app.mount("/web", _NoCacheStatic(directory=str(_WEB_DIR), html=True), name="web")
 
 @app.get("/static/{filename:path}")
 async def get_history_image(filename: str):
@@ -914,6 +1187,37 @@ async def knowledge_extension(request: Request, file: UploadFile = File(...)):
     
     return {"request_id": request_id, "status": "processing"}
 
+
+
+@app.post("/report-issue")
+async def report_issue(request: Request, body: dict = Body(...)):
+    """📣 上报问题：记录描述 + 环境信息供排查（不消耗 AI 额度，不受权限限制）"""
+    desc = str((body or {}).get("description") or "").strip()
+    if not desc:
+        return {"status": "error", "message": "问题描述不能为空"}
+    try:
+        from server.database.models import AuxRecord
+        rec = AuxRecord(
+            session_id=str(uuid.uuid4()),
+            user_id=get_current_user(request),
+            record_type="issue",
+            title=str((body or {}).get("version") or "上报问题")[:80],
+            content=desc[:4000],
+            extra_json={
+                "page": str((body or {}).get("page") or "")[:300],
+                "user_agent": str((body or {}).get("user_agent") or "")[:300],
+            },
+        )
+        db3 = SessionLocal()
+        try:
+            db3.add(rec)
+            db3.commit()
+        finally:
+            db3.close()
+    except Exception as e:
+        print(f"[上报问题] 保存失败: {e}")
+        return {"status": "error", "message": "提交失败，请稍后重试"}
+    return {"status": "ok"}
 
 
 @app.post("/extend/text")
@@ -991,10 +1295,11 @@ async def get_history(request: Request, body: dict):
         # 多用户隔离：登录用户看自己的+公共(NULL)；未登录只能看公共(NULL)
         if user_id is not None:
             query = query.filter(
-                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+                SubmissionRecord.user_id == user_id
             )
         else:
-            query = query.filter(SubmissionRecord.user_id.is_(None))
+            # 未登录/游客：不给任何人的记录（历史属私人数据）
+            query = query.filter(SubmissionRecord.id == -1)
         
         # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”），并在Python侧应用筛选
         all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
@@ -1096,6 +1401,16 @@ async def get_history(request: Request, body: dict):
                     if "未记录" not in filter_masteries:
                         continue
             
+            # 图解辅助（解题时单独落盘的旁文件）：历史详情需要独立成模块展示
+            extras_md = ""
+            if r.session_id:
+                try:
+                    _ex = HISTORY_DIR / f"{r.session_id}_latex_extras.md"
+                    if _ex.exists():
+                        extras_md = rewrite_static_urls(_ex.read_text(encoding="utf-8"), host)
+                except Exception:
+                    extras_md = ""
+
             result.append({
                 "id": r.id,
                 "session_id": r.session_id or "",
@@ -1109,6 +1424,8 @@ async def get_history(request: Request, body: dict):
                 "knowledge_points": knowledge_points,
                 "solution_steps": clean_steps,
                 "full_solution": clean_solution,
+                "mind_map": r.mind_map or "",
+                "latex_extras": extras_md,
                 "image_url": image_url,
                 "mastery_level": mastery_label,
             })
@@ -1117,9 +1434,9 @@ async def get_history(request: Request, body: dict):
         from server.database.models import AuxRecord
         aux_query = db.query(AuxRecord)
         if user_id is not None:
-            aux_query = aux_query.filter(or_(AuxRecord.user_id == user_id, AuxRecord.user_id.is_(None)))
+            aux_query = aux_query.filter(AuxRecord.user_id == user_id)
         else:
-            aux_query = aux_query.filter(AuxRecord.user_id.is_(None))
+            aux_query = aux_query.filter(AuxRecord.id == -1)
         for a in aux_query.order_by(AuxRecord.timestamp.desc()).all():
             try:
                 a_ts = (a.timestamp + local_offset).isoformat() if a.timestamp else ""
@@ -1142,6 +1459,9 @@ async def get_history(request: Request, body: dict):
                 "image_url": "",
                 "mastery_level": "",
                 "title": a.title or "",
+                "extra_json": extra if isinstance(extra, dict) else {},
+                "mind_map": "",
+                "latex_extras": "",
             })
         
         # 按时间降序排序（solve + aux 合并后）
@@ -1171,17 +1491,17 @@ async def clear_history(request: Request):
         user_id = get_current_user(request)
         if user_id is not None:
             records = db.query(SubmissionRecord).filter(
-                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+                SubmissionRecord.user_id == user_id
             ).all()
         else:
-            records = db.query(SubmissionRecord).filter(SubmissionRecord.user_id.is_(None)).all()
+            records = []
         for rec in records:
             _move_record_files_to_recycle_bin(rec)
             db.delete(rec)
         # ③ 同时清除知识延伸/AI动画记录
         from server.database.models import AuxRecord
         aux_list = db.query(AuxRecord).filter(
-            AuxRecord.user_id == user_id if user_id is not None else AuxRecord.user_id.is_(None)
+            AuxRecord.user_id == user_id if user_id is not None else AuxRecord.id == -1
         ).all()
         for a in aux_list:
             db.delete(a)
@@ -1224,10 +1544,11 @@ async def batch_delete_history(request: Request, body: dict):
         query = db.query(SubmissionRecord).filter(SubmissionRecord.id.in_(ids))
         if user_id is not None:
             query = query.filter(
-                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
+                SubmissionRecord.user_id == user_id
             )
         else:
-            query = query.filter(SubmissionRecord.user_id.is_(None))
+            # 未登录/游客：不给任何人的记录（历史属私人数据）
+            query = query.filter(SubmissionRecord.id == -1)
         records = query.all()
         for rec in records:
             _move_record_files_to_recycle_bin(rec)
@@ -1383,12 +1704,18 @@ def _ai_denied_response(username: str, is_admin: bool):
 
 # ⑮ AI类端点：受限则拒（新账号默认False；管理员/白名单放行）
 def check_ai_permission(request: Request):
-    """受限时返回 {"status":"error","code":403,"message":...}，否则返回 None"""
+    """受限时返回 {"status":"error","code":403,"message":...}，否则返回 None
+
+    安全修复：未登录不再无条件放行。
+    此前游客（无 token）可绕过全部 AI 端点，无限制消耗 API 额度，
+    而受限账号反被拦截——逻辑是反的。
+    这些端点均需绑定用户历史记录，未登录使用本身无意义，故要求先登录。
+    """
     _, username, is_admin = _resolve_user(request)
-    err, denied = _ai_denied_response(username, is_admin) if username is not None else (None, False)
     if username is None:
-        # 未登录仍沿用旧行为（透传受服务端登录保护），不额外拦截
-        return None
+        return {"status": "error", "code": 401,
+                "message": "请先登录后再使用 AI 功能"}
+    err, denied = _ai_denied_response(username, is_admin)
     return err if denied else None
 
 
@@ -1429,132 +1756,6 @@ async def save_mastery(request: Request, body: MasteryRequest):
         json.dump(record, f, ensure_ascii=False, indent=2)
     
     return {"status": "ok", "message": "掌握程度已保存"}
-
-# ==================== Feature 20: GeoGebra ====================
-
-class GeoGebraRequest(BaseModel):
-    ocr_text: str = ""
-    subject: str = ""
-
-@app.post("/geogebra")
-async def generate_geogebra(request: Request, body: GeoGebraRequest):
-    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
-    _perm_err = check_ai_permission(request)
-    if _perm_err is not None:
-        return _perm_err
-
-    """Feature 20: 生成GeoGebra图形（AI生成命令 + 官方GeoGebra Applet页面）"""
-    try:
-        prompt = f"""请根据以下数学题目内容，生成可以在GeoGebra中输入的命令。
-
-题目内容: {body.ocr_text if body.ocr_text else '绘制基本数学图形'}
-
-要求:
-1. 每行一个GeoGebra命令
-2. 使用标准GeoGebra语法，英文函数名
-3. 先定义基础对象(如函数、点、滑块)，再定义依赖对象
-4. 如果题目涉及函数，请定义函数并绘制图像
-5. 如果涉及几何，请绘制对应的几何图形并标注关键点
-6. 不要输出任何解释文字，只输出命令"""
-        
-        response = ai_service.generate_response(prompt, engine=get_engine(request), model=get_llm_model(request))
-        
-        # 清理响应，提取纯命令
-        import re as _re
-        commands_text = response.strip()
-        commands_text = _re.sub(r'```[\w]*\n?', '', commands_text)
-        commands_text = _re.sub(r'```', '', commands_text)
-        
-        commands = [line.strip() for line in commands_text.split('\n') 
-                   if line.strip() and not line.strip().startswith('//') and not line.strip().startswith('#')]
-        
-        if not commands:
-            return {"status": "error", "message": "AI未生成有效命令"}
-        
-        # 生成嵌入官方GeoGebra Applet的HTML页面（参考WPS云盘生成器方案）
-        import json as _json
-        commands_array = _json.dumps(commands)
-        ggb_dir = HISTORY_DIR / "geogebra"
-        ggb_dir.mkdir(parents=True, exist_ok=True)
-        html_name = f"ggb_{uuid.uuid4().hex[:8]}.html"
-        html_path = ggb_dir / html_name
-        # ⑥ deployggb.js 优先使用本地缓存（实体机/模拟器加载更快），失败回退CDN
-        ggb_script = ensure_geogebra_assets()
-        
-        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
-    <title>数学图形</title>
-    <script src="{ggb_script}"></script>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        html, body {{ width: 100%; height: 100%; background: #1A1A2E; overflow: hidden; }}
-        #ggb-container {{ width: 100%; height: 100%; }}
-    </style>
-</head>
-<body>
-    <div id="ggb-container"></div>
-    <script>
-        const commands = {commands_array};
-        const params = {{
-            "appName": "classic",
-            "width": window.innerWidth,
-            "height": window.innerHeight,
-            "showToolBar": false,
-            "showAlgebraInput": true,
-            "showMenuBar": false,
-            "showResetIcon": true,
-            "enableShiftDragZoom": true,
-            "language": "zh",
-            "borderColor": "#1A1A2E",
-            "bgColor": "#1A1A2E",
-            "perspective": "G",
-            "useBrowserStorage": false
-        }};
-        const applet = new GGBApplet(params, true);
-        applet.inject('ggb-container', 'preferHTML5');
-        // 等待Applet加载完成后逐条执行命令
-        let attempts = 0;
-        function runCommands() {{
-            try {{
-                const api = applet.getAppletObject();
-                if (api) {{
-                    commands.forEach(cmd => {{
-                        try {{ api.evalCommand(cmd); }} catch (e2) {{ console.warn('命令执行失败:', cmd, e2); }}
-                    }});
-                }} else {{
-                    throw new Error('not ready');
-                }}
-            }} catch (e3) {{
-                attempts++;
-                if (attempts < 60) setTimeout(runCommands, 500);
-            }}
-        }}
-        window.addEventListener('load', function() {{ setTimeout(runCommands, 1500); }});
-    </script>
-</body>
-</html>"""
-        html_path.write_text(html_content, encoding='utf-8')
-        
-        return {
-            "status": "ok",
-            "url": f"/static/geogebra/{html_name}",
-            "commands": commands,
-            "raw": commands_text,
-        }
-    except Exception as e:
-        print(f"[GeoGebra] 生成失败: {e}")
-        return {"status": "error", "message": f"图形生成失败: {e}"}
-
-@app.get("/static/geogebra/{filename}")
-async def get_geogebra_file(filename: str):
-    """获取生成的GeoGebra页面"""
-    file_path = HISTORY_DIR / "geogebra" / filename
-    if file_path.exists():
-        return FileResponse(file_path, media_type="text/html")
-    return {"detail": "Not Found"}
 
 # ==================== 工具函数 ====================
 
@@ -1627,62 +1828,6 @@ def _move_record_files_to_recycle_bin(record) -> str:
         except Exception as e:
             print(f"[recycle] 移动失败 {p}: {e}")
     return str(dest)
-
-
-_GEOGEBRA_ASSETS_DIR = HISTORY_DIR / "geogebra_assets"
-
-
-def ensure_geogebra_assets() -> str:
-    """确保本地 deployggb.js 存在（从 geogebra.org 下载缓存一次），返回本地URL；失败回退CDN"""
-    try:
-        _GEOGEBRA_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-        target = _GEOGEBRA_ASSETS_DIR / "deployggb.js"
-        # 校验：文件存在且大小合理（deployggb.js 实际约 37KB，内容含 GeoGebra 标识）
-        valid = target.exists() and target.stat().st_size > 10_000
-        if valid:
-            try:
-                head = target.read_bytes()[:512].lower()
-                if b"geogebra" not in head and b"ggbapplet" not in head:
-                    valid = False
-            except Exception:
-                valid = False
-        if not valid:
-            import urllib.request
-            print("[GeoGebra] 下载 deployggb.js 到本地缓存...")
-            tmp = target.with_suffix(".js.tmp")
-            try:
-                with urllib.request.urlopen(
-                        "https://www.geogebra.org/apps/deployggb.js", timeout=60) as resp, open(tmp, "wb") as f:
-                    f.write(resp.read())
-                if tmp.exists() and tmp.stat().st_size > 10_000:
-                    # ⑦ 补丁：CDN base → 本地镜像（若镜像目录存在）
-                    _txt = tmp.read_text(encoding="utf-8", errors="replace")
-                    _m = __import__("re").search(r'https://www\.geogebra\.org/apps/([0-9.]+)/', _txt)
-                    if _m:
-                        _ver = _m.group(1)
-                        _mirror = _GEOGEBRA_ASSETS_DIR.parent / "geogebra_apps" / _ver
-                        if _mirror.exists():
-                            _txt = _txt.replace(
-                                f"https://www.geogebra.org/apps/{_ver}/",
-                                f"/static/geogebra_apps/{_ver}/")
-                            tmp.write_text(_txt, encoding="utf-8")
-                            print(f"[GeoGebra] 已应用本地镜像补丁: apps/{_ver}/")
-                    tmp.replace(target)
-                    print(f"[GeoGebra] 本地缓存完成: {target.stat().st_size} bytes")
-                else:
-                    print(f"[GeoGebra] 下载结果异常({tmp.stat().st_size if tmp.exists() else 0} bytes)，回退CDN")
-                    if tmp.exists():
-                        tmp.unlink()
-                    return "https://www.geogebra.org/apps/deployggb.js"
-            except Exception as e:
-                print(f"[GeoGebra] 下载失败，回退CDN: {e}")
-                if tmp.exists():
-                    tmp.unlink()
-                return "https://www.geogebra.org/apps/deployggb.js"
-        return "/static/geogebra_assets/deployggb.js"
-    except Exception as e:
-        print(f"[GeoGebra] 本地缓存失败，回退CDN: {e}")
-        return "https://www.geogebra.org/apps/deployggb.js"
 
 
 # 解题流水线内部使用的提示词前缀（追问时应从上下文剔除，防止AI模仿之前的JSON输出格式）

@@ -35,24 +35,31 @@ def _ensure_plotly_local(anim_dir: Path) -> str:
     return ""
 
 
-def generate_animation(ocr_text: str, solution: str = "", engine: str = None) -> str | None:
+def generate_animation(ocr_text: str, solution: str = "", engine: str = None, theme: str = "dark") -> str | None:
     """
     根据题目内容生成动画 HTML 文件
     
     Args:
         ocr_text: OCR 识别的题目文本
         solution: AI 已生成的解答（可选，帮助 AI 理解题目）
+        theme: 界面主题（dark/light）。生成时固化一版配色，同时在 HTML 内注入按 ?theme= 切换的脚本，
+               避免“浅色界面下动画仍是深色背景”（11.1）
     
     Returns:
         str: 生成的 HTML 文件路径，失败返回 None
     """
+    is_light = (theme or "").strip().lower() == "light"
+    tpl = "plotly_white" if is_light else "plotly_dark"
+    paper = "#ffffff" if is_light else "#1a1a2e"
+    font_color = "#16181D" if is_light else "white"
+    theme_word = "浅色" if is_light else "深色"
     prompt = f"""请根据以下题目，使用 Python 的 Plotly 库生成一个交互式动画 HTML 文件。
 要求：
 1. 动画要能动态展示题目的核心概念或解题过程
 2. 如果涉及几何图形，要标注关键点、线、面的名称
 3. 如果有函数图像，要展示参数变化对图像的影响
 4. 动画要有播放/暂停按钮、滑块等交互控件
-    5. 使用暗色主题：必须在代码中调用 `fig.update_layout(template='plotly_dark')`，并设置 `paper_bgcolor='#1a1a2e'`、`plot_bgcolor='#1a1a2e'`，以及 `font=dict(color='white')`，以确保生成的 HTML 使用深色背景
+    5. 配色：使用{theme_word}主题——必须在代码中调用 `fig.update_layout(template='{tpl}')`，并设置 `paper_bgcolor='{paper}'`、`plot_bgcolor='{paper}'`，以及 `font=dict(color='{font_color}')`
 5. 代码保存为 HTML 格式，命名为 figure.html
 6. 只输出 Python 代码，不要写注释，不要有额外说明
 
@@ -80,10 +87,10 @@ def generate_animation(ocr_text: str, solution: str = "", engine: str = None) ->
     else:
         code = code_response
 
-    # 强制暗色主题的后处理：如果生成的代码包含 fig 对象，则确保使用 plotly_dark 和深色背景
-    theme_snippet = """
+    # 强制主题的后处理：如果生成的代码包含 fig 对象，则确保使用目标主题配色
+    theme_snippet = f"""
 try:
-    fig.update_layout(template='plotly_dark', paper_bgcolor='#1a1a2e', plot_bgcolor='#1a1a2e', font=dict(color='white'))
+    fig.update_layout(template='{tpl}', paper_bgcolor='{paper}', plot_bgcolor='{paper}', font=dict(color='{font_color}'))
 except Exception:
     pass
 """
@@ -122,12 +129,33 @@ except Exception:
                 )
             viewport_meta = '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
             responsive_css = '<style>html,body{width:100%;height:100%;margin:0;padding:0;overflow-x:hidden;} .plotly-graph-div{width:100% !important;} .main-svg{width:100% !important;}</style>'
+            # 11.1 深浅色适配：iframe 用 ?theme=light|dark 指定主题时，运行时切换配色
+            theme_script = """<script>
+(function(){
+  try{
+    var m = new URLSearchParams(location.search).get('theme');
+    if(!m) return;
+    var light = (m === 'light');
+    var bg = light ? '#ffffff' : '#1a1a2e', fg = light ? '#16181D' : '#ffffff';
+    document.documentElement.style.background = bg;
+    if(document.body){ document.body.style.background = bg; document.body.style.color = fg; }
+    var gd = document.querySelector('.plotly-graph-div');
+    if(gd && window.Plotly && gd.layout){
+      Plotly.relayout(gd, {template: light ? 'plotly_white' : 'plotly_dark', paper_bgcolor: bg, plot_bgcolor: bg, 'font.color': fg});
+    }
+  }catch(e){}
+})();
+</script>"""
             if '<head>' in html_content:
                 html_content = html_content.replace('<head>', f'<head>\n{viewport_meta}\n{responsive_css}')
             elif '<html>' in html_content:
                 html_content = html_content.replace('<html>', f'<html>\n<head>\n{viewport_meta}\n{responsive_css}\n</head>')
             else:
                 html_content = f'<!DOCTYPE html>\n<html>\n<head>\n{viewport_meta}\n{responsive_css}\n</head>\n<body>\n{html_content}\n</body>\n</html>'
+            if '</body>' in html_content:
+                html_content = html_content.replace('</body>', theme_script + '\n</body>')
+            else:
+                html_content += theme_script
             html_file.write_text(html_content, encoding='utf-8')
             py_file.unlink()  # 删除 .py 文件
             return str(html_file)

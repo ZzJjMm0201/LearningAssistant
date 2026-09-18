@@ -71,7 +71,9 @@ const API = (() => {
     if (opts.llmModel) h['X-LLM-Model'] = opts.llmModel;
     if (opts.ocrMode) h['X-OCR-Mode'] = opts.ocrMode;
     if (opts.visionModel) h['X-Vision-Model'] = opts.visionModel;
-    if (opts.style) h['X-Answer-Style'] = opts.style;
+    // ② 回答风格：服务端正式读的是 X-Style。历史版本误写成 X-Answer-Style，
+    //    导致“正式/鼓励/幽默”设了也从来没传到过服务端（两个都发，兼容旧服务端）。
+    if (opts.style) { h['X-Style'] = opts.style; h['X-Answer-Style'] = opts.style; }
     if (opts.dialect) h['X-Dialect'] = encodeURIComponent(opts.dialect);
     if (opts.grade) h['X-Grade'] = encodeURIComponent(opts.grade);
     if (opts.thinking) h['X-Thinking'] = opts.thinking;
@@ -80,6 +82,10 @@ const API = (() => {
     if (opts.personality) h['X-Personality'] = opts.personality;
     if (opts.detail) h['X-Detail'] = opts.detail;
     if (opts.subject) h['X-Subject'] = encodeURIComponent(opts.subject);
+    // 11.1 动画等“生成时固化配色”的内容需要知道当前主题
+    if (opts.theme) h['X-Theme'] = opts.theme;
+    // ⑯ 边解答边设问：开启时才发（服务端默认关闭）
+    if (opts.interactiveQuiz) h['X-Interactive-Quiz'] = '1';
     return headers(h);
   }
 
@@ -96,6 +102,15 @@ const API = (() => {
     });
     return res.json();
   }
+  /* 长按多页拍摄：上传一段连续拍摄的视频，服务端抽关键帧→逐页OCR→合并分题 */
+  async function solveMultipage(file, opts = {}) {
+    const fd = new FormData();
+    fd.append('file', file, file.name || 'mulipage.webm');
+    const res = await fetch(BASE + '/solve/multipage', {
+      method: 'POST', body: fd, headers: solveHeaders(opts), timeout: 300000
+    });
+    return res.json();
+  }
   async function confirmSolve(rid) { return req(`/solve/confirm/${rid}`, { method: 'POST' }); }
   async function selectQuestions(rid, indices) {
     return req(`/solve/select_questions/${rid}`, { method: 'POST', raw: { indices } });
@@ -103,10 +118,11 @@ const API = (() => {
   async function cancelSolve(rid) { return req(`/solve/cancel/${rid}`, { method: 'POST' }); }
 
   /* ---------- 追问 ---------- */
-  async function ask(sessionId, question, opts = {}) {
+  async function ask(sessionId, question, opts = {}, context = null) {
     const res = await fetch(BASE + '/ask', {
       method: 'POST', headers: solveHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts)),
-      body: JSON.stringify({ session_id: sessionId, question })
+      // context：该会话在服务端没有对话上下文时（如知识延伸/动画历史记录）用正文兜底
+      body: JSON.stringify({ session_id: sessionId, question: question, context: context })
     });
     return res.json();
   }
@@ -129,12 +145,16 @@ const API = (() => {
     return src;
   }
 
-  /* ---------- POST-SSE 读取器（EventSource 只能 GET，报告等接口是 POST） ---------- */
-  async function postSSE(path, body, { onEvent, onDone, onError } = {}) {
+  /* ---------- POST-SSE 读取器（EventSource 只能 GET，报告等接口是 POST）
+     注意：服务端在“题量不足 / 无记录”时会直接 return JSON（HTTP 200，非 SSE）。
+     以前这种响应会被当成流逐行找 'data:'，一行都找不到 → 静默 onDone(null)，
+     客户端 acc 为空 → 界面只显示“报告内容为空”，真正的原因（题不够 5 道）被吞掉。
+     现在：先看 Content-Type 与首个非空字符，是 JSON 就解析出 message 当错误上报。 ---------- */
+  async function postSSE(path, body, { onEvent, onDone, onError } = {}, opts = {}) {
     try {
       const res = await fetch(BASE + path, {
         method: 'POST',
-        headers: headers({ 'Content-Type': 'application/json' }),
+        headers: Object.assign({ 'Content-Type': 'application/json' }, solveHeaders(opts)),
         body: JSON.stringify(body || {})
       });
       if (!res.ok || !res.body) {
@@ -143,9 +163,18 @@ const API = (() => {
         onError && onError(new Error(msg));
         return;
       }
+      const ct = res.headers.get('content-type') || '';
+      // 非 SSE：服务端用 JSON 告知失败原因（题量不足等）
+      if (!ct.includes('text/event-stream')) {
+        let msg = '生成失败';
+        try { const j = await res.json(); msg = j.message || j.detail || msg; } catch (e) {}
+        onError && onError(new Error(msg));
+        return;
+      }
       const reader = res.body.getReader();
       const dec = new TextDecoder('utf-8');
       let buf = '';
+      let sawAnyData = false;
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -156,9 +185,15 @@ const API = (() => {
           buf = buf.slice(i + 1);
           if (!line.startsWith('data:')) continue;
           let m; try { m = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+          sawAnyData = true;
           if (m.stage === 'complete') { onDone && onDone(m); return; }
           onEvent && onEvent(m);
         }
+      }
+      // 流结束但从没收到过任何 data: —— 当作失败上报，不要静默成功
+      if (!sawAnyData) {
+        onError && onError(new Error('服务端未返回任何内容'));
+        return;
       }
       onDone && onDone(null);
     } catch (e) {
@@ -178,13 +213,17 @@ const API = (() => {
   }
 
   /* ---------- 报告 ---------- */
-  async function dataReport(days, theme) {
-    return req('/report/data', { method: 'POST', raw: { days, theme }, timeout: 180000 });
+  async function dataReport(days, theme, opts = {}) {
+    // ③ 报告筛选：年级/学科通过请求头传给服务端（空=不限）
+    return req('/report/data', {
+      method: 'POST', raw: { days, theme, grade: opts.grade || '', subject: opts.subject || '' },
+      timeout: 180000
+    });
   }
   async function aiReport(days, opts = {}) {
     const res = await fetch(BASE + '/report/ai', {
       method: 'POST', headers: solveHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts)),
-      body: JSON.stringify({ days, theme: 'dark' })
+      body: JSON.stringify({ days, theme: 'dark', grade: opts.grade || '', subject: opts.subject || '' })
     });
     return res.json();
   }
@@ -204,6 +243,11 @@ const API = (() => {
     return res.json();
   }
 
+  /* ---------- 历史导出 ---------- */
+  async function exportHistory(title, content, format) {
+    return req('/export', { method: 'POST', raw: { title: title, content: content, format: format || 'word' }, timeout: 180000 });
+  }
+
   /* ---------- AI动画 ---------- */
   async function animateImage(file, opts = {}) {
     const fd = new FormData();
@@ -219,6 +263,15 @@ const API = (() => {
     return res.json();
   }
 
+  /* ---------- ⑰ AI 批注 ---------- */
+  async function annotateImage(file, opts = {}) {
+    const fd = new FormData();
+    fd.append('file', file, file.name || 'photo.jpg');
+    // 批注通道跟 OCR 模式一致（qwen=视觉模型直出；paddle=取坐标投给LLM）
+    const res = await fetch(BASE + '/annotate', { method: 'POST', body: fd, headers: solveHeaders(opts), timeout: 180000 });
+    return res.json();
+  }
+
   /* ---------- 其它 ---------- */
   async function mastery(requestId, level) {
     return req('/mastery', { method: 'POST', raw: { request_id: requestId, mastery_level: level } });
@@ -231,9 +284,9 @@ const API = (() => {
   return {
     req, login, register, verify, logout,
     getToken: () => token, getUser: () => user,
-    solveImage, solveText, confirmSolve, selectQuestions, cancelSolve, ask,
+    solveImage, solveText, solveMultipage, confirmSolve, selectQuestions, cancelSolve, ask,
     sse, postSSE, history, deleteHistory, dataReport, aiReport,
-    extendImage, extendText, animateImage, animateText,
-    mastery, exportDoc, health
+    extendImage, extendText, animateImage, animateText, annotateImage,
+    mastery, exportDoc, exportHistory, health
   };
 })();

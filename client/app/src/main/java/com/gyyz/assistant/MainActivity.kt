@@ -120,6 +120,9 @@ sealed class AppState {
             val solutionStreaming: Boolean = false,
             val mindmapStreaming: Boolean = false,
             val aiUsage: Map<String, String> = emptyMap(),
+            // ⑯ 边解答边设问：思考题列表 + 作答状态（与网页端 solveAcc.quiz 对齐）
+            val quiz: List<QuizItem> = emptyList(),
+            val quizIdx: Int = 0,
     ) : AppState()
 
     data class Report(val reportText: String = "", val isLoading: Boolean = true, val streaming: Boolean = false) : AppState()
@@ -127,6 +130,15 @@ sealed class AppState {
     object History : AppState()
 
     object Animation : AppState()
+
+    /** ⑰ AI批注结果页 */
+    data class Annotation(
+            val imageUrl: String = "",
+            val annotations: List<Map<String, String>> = emptyList(),
+            val channel: String = "",
+            val isLoading: Boolean = false,
+            val error: String = ""
+    ) : AppState()
 
     data class Knowledge(
             val summary: String = "",
@@ -143,6 +155,18 @@ sealed class AppState {
  * 问答对：问题 + 答案（AI预判问题自带答案；用户追问后追加）
  */
 data class QAItem(val question: String, val answer: String = "", val rendered: Boolean = false)
+
+/**
+ * ⑯ 边解答边设问的思考题（与网页端 solveAcc.quiz 结构对齐）
+ * picked = -1 表示未作答
+ */
+data class QuizItem(
+        val question: String = "",
+        val options: List<String> = emptyList(),
+        val answerIndex: Int = 0,
+        val explanation: String = "",
+        val picked: Int = -1
+)
 
 /** 解析服务端下发的 [{question,answer}] 或 ["q1","q2"] 为 QAItem 列表 */
 private fun parseQAList(content: Any?): List<QAItem> {
@@ -227,6 +251,8 @@ class MainViewModel : ViewModel() {
     val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
 
     val aiPermission = MutableStateFlow(true)   // 是否允许使用 AI 功能（受限账号 false）
+    // 「先随便看看」游客模式：只能浏览，AI 功能需登录
+    val isGuest = MutableStateFlow(false)
     private val _loggedInUsername = MutableStateFlow("")
     val loggedInUsername: StateFlow<String> = _loggedInUsername.asStateFlow()
 
@@ -241,10 +267,6 @@ class MainViewModel : ViewModel() {
     val masteryLevel = MutableStateFlow("")
     // 解题阶段进度（右上角显示，如“阶段 3/6 · 完整解析”）
     val solveProgress = MutableStateFlow("")
-    // GeoGebra生成中（需要锁屏等待AI回复）
-    val isGeneratingGeoGebra = MutableStateFlow(false)
-    // GeoGebra：生成该题的交互式数学图形
-    val geoGebraUrl = MutableStateFlow("")
     private var lastPhotoFile: java.io.File? = null
     val currentSolvingRequestId = MutableStateFlow("")
 
@@ -275,10 +297,6 @@ class MainViewModel : ViewModel() {
     val pomodoroRunning = MutableStateFlow(false) // 计时中
     val pomodoroStarted = MutableStateFlow(false) // 是否已启动（idle/运行/暂停 三态）
     val showPomodoroSettings = MutableStateFlow(false)
-
-    // Feature 20: GeoGebra
-    val showGeoGebraScreen = MutableStateFlow(false)
-    val geogebraUrl = MutableStateFlow("")
 
     init {
         viewModelScope.launch {
@@ -755,6 +773,9 @@ class MainViewModel : ViewModel() {
             val subjectMap = mutableMapOf<Int, String>()
             val ocrMap = mutableMapOf<Int, String>()
             val latexExtrasMap = mutableMapOf<Int, String>()
+            // ⑯ 边解答边设问：每题独立的思考题列表与当前题号
+            val quizMap = mutableMapOf<Int, List<QuizItem>>()
+            val quizIdxMap = mutableMapOf<Int, Int>()
             // 流式显示节流：每100ms最多刷新一次UI
             var lastSolutionUpdate = 0L
             var lastStepsUpdate = 0L
@@ -1058,10 +1079,66 @@ class MainViewModel : ViewModel() {
                                                 suggestedQuestions = suggMap[cur(qiKey)] ?: emptyList(),
                                                 suggestedQA = suggQAMap[cur(qiKey)] ?: emptyList(),
                                                 qaList = qaMap[cur(qiKey)] ?: emptyList(),
-                                                subject = subjectMap[cur(qiKey)] ?: ""
+                                                subject = subjectMap[cur(qiKey)] ?: "",
+                                                aiUsage = aiUsage.value,
+                                                quiz = quizMap[cur(qiKey)] ?: emptyList(),
+                                                quizIdx = quizIdxMap[cur(qiKey)] ?: 0
                                         ))
                                         _statusText.value = if (multiQuestionCount.value > 1) "全部题目解答完成" else "解答完成"
                                         masteryVisible.value = true
+                                    }
+                                    "quiz" -> {
+                                        // ⑯ 边解答边设问：服务端在 steps 之后下发思考题
+                                        val content = json.opt("content")
+                                        val list = mutableListOf<QuizItem>()
+                                        if (content is JSONObject) {
+                                            val arr = content.optJSONArray("questions")
+                                            if (arr != null) {
+                                                for (i in 0 until arr.length()) {
+                                                    val o = arr.optJSONObject(i) ?: continue
+                                                    val q = o.optString("question", "").trim()
+                                                    val optsArr = o.optJSONArray("options")
+                                                    val opts = mutableListOf<String>()
+                                                    if (optsArr != null) {
+                                                        for (k in 0 until optsArr.length()) {
+                                                            val s = optsArr.optString(k, "").trim()
+                                                            if (s.isNotEmpty()) opts.add(s)
+                                                        }
+                                                    }
+                                                    if (q.isEmpty() || opts.size < 2) continue
+                                                    var ai = o.optInt("answer_index", 0)
+                                                    if (ai < 0 || ai >= opts.size) ai = 0
+                                                    list.add(QuizItem(
+                                                            question = q,
+                                                            options = opts,
+                                                            answerIndex = ai,
+                                                            explanation = o.optString("explanation", "").trim(),
+                                                            picked = -1
+                                                    ))
+                                                    if (list.size >= 5) break
+                                                }
+                                            }
+                                        }
+                                        quizMap[cur(qiKey)] = list
+                                        quizIdxMap[cur(qiKey)] = 0
+                                        if (list.isNotEmpty()) {
+                                            _statusText.value = "已生成 ${list.size} 个思考题"
+                                        }
+                                        emit(qiKey, AppState.Solving(
+                                                stage = SolveStage.INTERACTIVE,
+                                                requestId = requestId,
+                                                ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
+                                                mindMap = mindMapMap[cur(qiKey)] ?: "",
+                                                suggestedQuestions = suggMap[cur(qiKey)] ?: emptyList(),
+                                                suggestedQA = suggQAMap[cur(qiKey)] ?: emptyList(),
+                                                qaList = qaMap[cur(qiKey)] ?: emptyList(),
+                                                subject = subjectMap[cur(qiKey)] ?: "",
+                                                quiz = list,
+                                                quizIdx = 0
+                                        ))
                                     }
                                     "error" ->
                                             _statusText.value = "错误: ${json.optString("content")}"
@@ -1176,38 +1253,6 @@ class MainViewModel : ViewModel() {
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { _statusText.value = "保存掌握程度失败: ${e.message}" }
-            }
-        }
-    }
-
-    fun generateGeoGebra() {
-        val state = _appState.value as? AppState.Solving
-        val ocrText = state?.ocrText
-        if (ocrText.isNullOrBlank()) {
-            _statusText.value = "没有可用的题目内容"
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                withContext(Dispatchers.Main) {
-                    _statusText.value = "正在生成数学图形..."
-                    isGeneratingGeoGebra.value = true
-                }
-                val resp = apiService.generateGeoGebra(ocrText)
-                withContext(Dispatchers.Main) {
-                    isGeneratingGeoGebra.value = false
-                    if (resp.status == "ok" && resp.url.isNotEmpty()) {
-                        geoGebraUrl.value = "${apiService.getBaseUrl()}${resp.url}"
-                        showGeoGebraScreen.value = true
-                    } else {
-                        _statusText.value = "图形生成失败: ${resp.message}"
-                    }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    isGeneratingGeoGebra.value = false
-                    _statusText.value = "图形生成失败: ${e.message}"
-                }
             }
         }
     }
@@ -1330,6 +1375,57 @@ class MainViewModel : ViewModel() {
 
     // 报告统计周期（0=全部历史）
     val reportDays = MutableStateFlow(7)
+
+    /**
+     * ⑰ AI批注：上传作业图片，服务端生成带批注的图片（圈/划线/荧光/文字）
+     * 通道由 X-OCR-Mode 决定（qwen=视觉模型直出带刻度尺；paddle=坐标投给大模型）
+     */
+    fun requestAnnotation(photoFile: java.io.File) {
+        Log.d("MainViewModel", "请求AI批注: ${photoFile.absolutePath}")
+        cancelCurrentSSE = false
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Annotation(isLoading = true)
+                    _statusText.value = "正在生成批注..."
+                }
+                val bytes = photoFile.readBytes()
+                val json = apiService.annotateImage(bytes)
+                val url = json.optString("url", "")
+                val channel = json.optString("channel", "")
+                val arr = json.optJSONArray("annotations")
+                val list = mutableListOf<Map<String, String>>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        list.add(mapOf(
+                            "type" to o.optString("type", ""),
+                            "x" to o.optDouble("x", 0.0).toString(),
+                            "y" to o.optDouble("y", 0.0).toString(),
+                            "x2" to o.optString("x2", ""),
+                            "y2" to o.optString("y2", ""),
+                            "text" to o.optString("text", ""),
+                            "reason" to o.optString("reason", ""),
+                            "color" to o.optString("color", "")
+                        ))
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "批注完成（共 ${list.size} 条）"
+                    _appState.value = AppState.Annotation(
+                        imageUrl = if (url.startsWith("http")) url else apiService.getBaseUrl() + url,
+                        annotations = list,
+                        channel = channel
+                    )
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "批注失败: ${e.message}"
+                    _appState.value = AppState.Annotation(error = e.message ?: "批注失败")
+                }
+            }
+        }
+    }
 
     fun requestKnowledgeExtension(photoFile: java.io.File) {
         Log.d("MainViewModel", "请求知识延伸: ${photoFile.absolutePath}")
@@ -1456,6 +1552,20 @@ class MainViewModel : ViewModel() {
             var similar = emptyList<QAItem>()
             var questions = emptyList<QAItem>()
             var imageUrl = ""
+            // 阶段回显：每次下发状态都要带上“到目前为止已拿到的全部字段”，
+            // 否则后到的阶段会把先到的字段覆盖成默认值（曾经因此丢了
+            // 相似题推荐 / 延伸思考 / 原题图片）
+            fun pushState(streaming: String = "") {
+                _appState.value = AppState.Knowledge(
+                        summary = summary,
+                        similarQuestions = similar,
+                        extension = extension,
+                        suggestedQuestions = questions,
+                        imageUrl = imageUrl,
+                        summaryStreaming = streaming == "summary",
+                        extensionStreaming = streaming == "extension"
+                )
+            }
             var lastSummaryUpdate = 0L
             var lastExtensionUpdate = 0L
 
@@ -1482,55 +1592,57 @@ class MainViewModel : ViewModel() {
                                     _statusText.value = "正在分析内容..."
                                 }
                                 "question_info" -> {
-                                    _appState.value = AppState.Knowledge()
+                                    // 注意：这里不能重置整个状态，否则会丢掉已收到的 imageUrl
+                                    pushState()
                                     _statusText.value = "正在总结知识点..."
                                 }
                                 "summary_chunk" -> {
                                     val chunk = json.optString("content", "")
                                     if (chunk.isNotEmpty()) {
+                                        summary = chunk
                                         val now = System.currentTimeMillis()
                                         if (now - lastSummaryUpdate >= 100) {
                                             lastSummaryUpdate = now
-                                            summary = chunk
-                                            _appState.value = AppState.Knowledge(summary = summary, summaryStreaming = true, imageUrl = imageUrl)
+                                            pushState(streaming = "summary")
                                             _statusText.value = "正在总结知识点..."
                                         }
                                     }
                                 }
                                 "summary" -> {
                                     summary = json.optString("content", "")
-                                    _appState.value = AppState.Knowledge(summary = summary, imageUrl = imageUrl)
+                                    pushState()
                                     _statusText.value = "知识点已总结"
                                 }
                                 "similar_questions" -> {
                                     similar = parseQAList(json.opt("content"))
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, imageUrl = imageUrl)
+                                    pushState()
                                     _statusText.value = "已推荐相似题"
                                 }
                                 "extension_chunk" -> {
                                     val chunk = json.optString("content", "")
                                     if (chunk.isNotEmpty()) {
+                                        extension = chunk
                                         val now = System.currentTimeMillis()
                                         if (now - lastExtensionUpdate >= 100) {
                                             lastExtensionUpdate = now
-                                            extension = chunk
-                                            _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, extensionStreaming = true, imageUrl = imageUrl)
+                                            pushState(streaming = "extension")
                                             _statusText.value = "正在生成知识拓展..."
                                         }
                                     }
                                 }
                                 "extension" -> {
                                     extension = json.optString("content", "")
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, imageUrl = imageUrl)
+                                    pushState()
                                     _statusText.value = "知识拓展已生成"
                                 }
                                 "suggested_questions" -> {
                                     questions = parseQAList(json.opt("content"))
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions, imageUrl = imageUrl)
+                                    pushState()
                                     _statusText.value = "延伸完成"
                                 }
                                 "complete" -> {
-                                    _appState.value = AppState.Knowledge(summary = summary, similarQuestions = similar, extension = extension, suggestedQuestions = questions)
+                                    // 保留 imageUrl（原来会把它清掉）
+                                    pushState()
                                     _statusText.value = "延伸完成"
                                 }
                                 "error" -> _statusText.value = "错误: ${json.optString("content")}"
@@ -1701,20 +1813,82 @@ class MainViewModel : ViewModel() {
     var onButtonTakePhoto: (() -> Unit)? = null
     var onButtonAnimation: (() -> Unit)? = null
     var onButtonExtend: (() -> Unit)? = null
+    var onButtonAnnotation: (() -> Unit)? = null
+
+    /**
+     * 「先随便看看」：以游客身份进入主页（不登录）。
+     * 只能浏览；点 AI 功能会提示先登录。
+     */
+    fun enterGuestMode() {
+        isGuest.value = true
+        aiPermission.value = false
+        _appState.value = AppState.Tracking
+        _statusText.value = "游客模式：只能浏览，使用功能请先登录"
+    }
+
+    /** 游客点 AI 功能时的提示 */
+    fun requireLoginToast(): Boolean {
+        if (isGuest.value) {
+            _statusText.value = "请先登录后再使用该功能"
+            return true
+        }
+        return false
+    }
 
     fun onButtonSolve() {
+        if (requireLoginToast()) return
         _statusText.value = "正在拍照..."
         onButtonTakePhoto?.invoke()
     }
 
     fun onButtonAnimation() {
+        if (requireLoginToast()) return
         _statusText.value = "正在准备动画..."
         onButtonAnimation?.invoke()
     }
 
     fun onButtonExtend() {
+        if (requireLoginToast()) return
         _statusText.value = "正在准备知识延伸..."
         onButtonExtend?.invoke()
+    }
+
+    /**
+     * ⑯ 边解答边设问：作答某题（与网页端点选项行为一致）
+     */
+    fun answerQuiz(optionIndex: Int) {
+        val st = _appState.value as? AppState.Solving ?: return
+        val quiz = st.quiz
+        if (quiz.isEmpty()) return
+        val i = st.quizIdx.coerceIn(0, quiz.size - 1)
+        val q = quiz[i]
+        if (q.picked >= 0) return  // 已作答，不重复计
+        val updated = quiz.toMutableList()
+        updated[i] = q.copy(picked = optionIndex)
+        _appState.value = st.copy(quiz = updated)
+    }
+
+    /** ⑯ 切到下一题 */
+    fun nextQuiz() {
+        val st = _appState.value as? AppState.Solving ?: return
+        if (st.quiz.isEmpty()) return
+        _appState.value = st.copy(quizIdx = (st.quizIdx + 1).coerceAtMost(st.quiz.size - 1))
+    }
+
+    /** ⑯ 重新作答（清空所有选项） */
+    fun restartQuiz() {
+        val st = _appState.value as? AppState.Solving ?: return
+        if (st.quiz.isEmpty()) return
+        _appState.value = st.copy(
+                quiz = st.quiz.map { it.copy(picked = -1) },
+                quizIdx = 0
+        )
+    }
+
+    fun onButtonAnnotation() {
+        if (requireLoginToast()) return
+        _statusText.value = "正在准备AI批注..."
+        onButtonAnnotation?.invoke()
     }
 
     // 十一 手势触发：先弹收手提示倒计时（3秒），结束后执行；倒计时期间防抖忽略新手势
@@ -1873,6 +2047,12 @@ class MainActivity : ComponentActivity() {
                 viewModel.onButtonExtend = {
                     requireCamera("onButtonExtend") { capture ->
                         takePhotoAndUploadExtend(capture, viewModel)
+                    }
+                }
+
+                viewModel.onButtonAnnotation = {
+                    requireCamera("onButtonAnnotation") { capture ->
+                        takePhotoAndUploadAnnotation(capture, viewModel)
                     }
                 }
 
@@ -2115,6 +2295,27 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun takePhotoAndUploadAnnotation(capture: ImageCapture, viewModel: MainViewModel) {
+        val photoFile = java.io.File(externalCacheDir, "annotate_${System.currentTimeMillis()}.jpg")
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        Log.d(TAG, "批注照片已保存: ${photoFile.absolutePath}")
+                        viewModel.requestAnnotation(photoFile)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "拍照失败: ${exception.message}")
+                    }
+                }
+        )
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         gestureRecognizerState.value?.close()
@@ -2170,8 +2371,6 @@ fun MainScreen(
     val showOcr by viewModel.showOcrConfirmDialog.collectAsState()
     val ocrConfirmTitle by viewModel.ocrConfirmTitle.collectAsState()
     val ocrConfirmText by viewModel.ocrConfirmText.collectAsState()
-    val showGeoGebra by viewModel.showGeoGebraScreen.collectAsState()
-    val geogebraUrl by viewModel.geoGebraUrl.collectAsState()
     val reportDays by viewModel.reportDays.collectAsState()
 
     Box(modifier = Modifier.fillMaxSize().background(tC(Color(0xFF0A0A1A), Color(0xFFF2F4F8)))) {
@@ -2183,8 +2382,8 @@ fun MainScreen(
         }
 
         if (hasCameraPermission) {
-            // 非主页面或弹层（历史/设置/OCR确认/欢迎/GeoGebra）时关闭相机，避免右上角小绿点
-            val cameraActive = isMainScreen && !showHistory && !showSettings && !showWelcome && !showOcr && !showGeoGebra
+            // 非主页面或弹层（历史/设置/OCR确认/欢迎）时关闭相机，避免右上角小绿点
+            val cameraActive = isMainScreen && !showHistory && !showSettings && !showWelcome && !showOcr
             CameraPreviewView(
                 modifier = if (isMainScreen) Modifier.fillMaxSize() else Modifier.fillMaxSize().alpha(0f),
                 gestureRecognizer = if (gestureEnabled && isMainScreen) gestureRecognizer else null,
@@ -2209,6 +2408,7 @@ fun MainScreen(
                     error = state.error,
                     onLogin = { username, password -> viewModel.login(username, password) },
                     onRegister = { username, password -> viewModel.register(username, password) },
+                    onGuest = { viewModel.enterGuestMode() },
                 )
             is AppState.Tracking ->
                 MainMenuScreen(
@@ -2270,6 +2470,11 @@ fun MainScreen(
                             onAskQuestion = { viewModel.askQuestion(it) },
                             onBack = { viewModel.backToTracking() },
                             viewModel = viewModel,
+                    )
+            is AppState.Annotation ->
+                    AnnotationScreen(
+                            state = state,
+                            onBack = { viewModel.backToTracking() },
                     )
         }
 
@@ -2338,14 +2543,6 @@ fun MainScreen(
             )
         }
 
-        // Feature 20: GeoGebra图形页面（生成该题的交互式数学图形）
-        if (showGeoGebra) {
-            GeoGebraScreen(
-                url = geogebraUrl,
-                onBack = { viewModel.showGeoGebraScreen.value = false }
-            )
-        }
-
         // ② 报告时间范围弹窗（生成报告前先询问）
         val showReportRange by viewModel.showReportRangeDialog.collectAsState()
         if (showReportRange) {
@@ -2411,6 +2608,20 @@ fun CameraPreviewView(
     val imageCaptureRef = remember { mutableStateOf<ImageCapture?>(null) }
     val isBound = remember { mutableStateOf(false) }
     val previewView = remember { PreviewView(context) }
+    // 取景画面要“完整适应屏幕”而不是被裁切放大：
+    // PreviewView 默认是 FILL_CENTER（保持比例填满、超出部分裁剪），
+    // 在竖屏满屏场景下会明显放大；改成 FIT_CENTER 让整幅预览都落在屏幕内。
+    // 用 DisposableEffect 而非直接在 remember 里设置，以便重组时属性稳定。
+    DisposableEffect(previewView) {
+        try {
+            previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+            previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            previewView.clipToOutline = true
+        } catch (e: Throwable) {
+            Log.w("CameraPreview", "设置预览缩放模式失败: ${e.message}")
+        }
+        onDispose { }
+    }
 
     LaunchedEffect(Unit) {
         var retryCount = 0
@@ -2699,6 +2910,7 @@ fun LoginScreen(
     error: String = "",
     onLogin: (String, String) -> Unit,
     onRegister: (String, String) -> Unit,
+    onGuest: () -> Unit = {},
 ) {
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -2827,6 +3039,17 @@ fun LoginScreen(
                         fontSize = 14.sp
                     )
                 }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                // 「先随便看看」：以游客身份进入（只能浏览，不能解题）
+                TextButton(onClick = onGuest) {
+                    Text(
+                        text = "先随便看看（不登录）",
+                        color = tC(Color.Gray, Color(0xFF5C6470)),
+                        fontSize = 14.sp,
+                        textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
+                    )
+                }
             }
         }
     }
@@ -2945,6 +3168,17 @@ fun SolvingScreen(
             val usageInfo by (viewModel?.aiUsage ?: MutableStateFlow(emptyMap())).collectAsState()
             if (usageInfo.isNotEmpty()) {
                 AiUsageFooter(usageInfo)
+            }
+
+            // ⑯ 边解答边设问：思考题答题卡（服务端下发 quiz 事件后显示）
+            if (solveState.quiz.isNotEmpty() && viewModel != null) {
+                QuizPanel(
+                        quiz = solveState.quiz,
+                        idx = solveState.quizIdx,
+                        onPick = { optIdx -> viewModel.answerQuiz(optIdx) },
+                        onNext = { viewModel.nextQuiz() },
+                        onRestart = { viewModel.restartQuiz() }
+                )
             }
 
             if (solveState.solutionSteps.isNotEmpty()) {
@@ -3274,19 +3508,6 @@ fun SolvingScreen(
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
                     ) { Text("发送", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                 }
-
-                // Feature 20: GeoGebra（仅数学题可用；点击生成该题的交互式数学图形）
-                val isMath = solveState.subject.contains("数学") || solveState.subject.contains("几何") ||
-                        solveState.subject.contains("代数") || solveState.subject.contains("函数")
-                if (isMath) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(
-                            onClick = { viewModel?.generateGeoGebra() },
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
-                            enabled = !isAskingQuestion
-                    ) { Text("📐 查看GeoGebra图形", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp) }
-                }
             }
 
             // 掌握程度：解答完成后显示标题 + 三个选项横向排布；点击后保留区块并高亮所选，可重新选择
@@ -3351,12 +3572,6 @@ fun SolvingScreen(
 
             Spacer(modifier = Modifier.height(32.dp))
             }
-        }
-
-        // ③ GeoGebra生成时锁屏等待AI回复（② 追问已流式输出，不再锁屏）
-        val isGeneratingGeoGebra by (viewModel?.isGeneratingGeoGebra ?: MutableStateFlow(false)).collectAsState()
-        if (isGeneratingGeoGebra) {
-            LoadingOverlay("正在生成数学图形...")
         }
     }
 }
@@ -3793,6 +4008,213 @@ fun ReportScreen(
             }
         } else if (report.isLoading) {
             LoadingOverlay("正在生成报告...")
+        }
+    }
+}
+
+/**
+ * ⑯ 边解答边设问答题卡（与网页端 renderQuizBox 行为对齐）
+ * 一次一题、点选项即即时判定；答对照常推进，答错标红并显示正确答案与解析。
+ */
+@Composable
+fun QuizPanel(
+        quiz: List<QuizItem>,
+        idx: Int,
+        onPick: (Int) -> Unit,
+        onNext: () -> Unit,
+        onRestart: () -> Unit,
+) {
+    if (quiz.isEmpty()) return
+    val i = idx.coerceIn(0, quiz.size - 1)
+    val q = quiz[i]
+    val done = q.picked >= 0
+    val correct = quiz.count { it.picked == it.answerIndex }
+    val answered = quiz.count { it.picked >= 0 }
+
+    Card(
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+            shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("✋ 边学边问", color = Color(0xFF00D2FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("${i + 1}/${quiz.size} · 已答对 $correct",
+                     color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(q.question, color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
+            Spacer(Modifier.height(10.dp))
+
+            q.options.forEachIndexed { k, opt ->
+                val isAnswer = (k == q.answerIndex)
+                val isPicked = (k == q.picked)
+                val bg = when {
+                    done && isAnswer -> Color(0xFF2E7D32)
+                    done && isPicked -> Color(0xFFB71C1C)
+                    else -> tC(Color(0xFF2D2D44), Color(0xFFE9EDF4))
+                }
+                Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
+                                .then(if (!done) Modifier.clickable { onPick(k) } else Modifier),
+                        colors = CardDefaults.cardColors(containerColor = bg),
+                        shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                            "${('A'.code + k).toChar()}. $opt",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+
+            if (done) {
+                Spacer(Modifier.height(8.dp))
+                val ok = q.picked == q.answerIndex
+                Text(
+                        if (ok) "✅ 答对了！"
+                        else "❌ 再想想～ 正确答案是 ${('A'.code + q.answerIndex).toChar()}. ${q.options.getOrElse(q.answerIndex) { "" }}",
+                        color = if (ok) Color(0xFF4CAF50) else Color(0xFFFF9800),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                )
+                if (q.explanation.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("💡 ${q.explanation}", color = tC(Color(0xFFB0B8C4), Color(0xFF3A4048)), fontSize = 12.sp)
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (done && i < quiz.size - 1) {
+                    Button(onClick = onNext) { Text("下一个思考题 →") }
+                    Spacer(Modifier.width(8.dp))
+                }
+                if (answered == quiz.size) {
+                    Button(onClick = onRestart) { Text("重新作答") }
+                }
+                Spacer(Modifier.weight(1f))
+                Text("$answered/${quiz.size} 已作答",
+                     color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+/**
+ * ⑰ AI批注结果页：展示带批注的图片 + 批注明细
+ * 与网页端 showAnnotation 保持一致（图片在上、明细在下）
+ */
+@Composable
+fun AnnotationScreen(
+        state: AppState.Annotation,
+        onBack: () -> Unit,
+) {
+    Column(
+            modifier = Modifier.fillMaxSize()
+                    .background(tC(Color(0xFF1A1A2E), Color(0xFFF2F4F8)))
+    ) {
+        Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = tC(Color(0xFF16213E), Color(0xFFFFFFFF)),
+                shadowElevation = 4.dp
+        ) {
+            Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onBack) { Text("← 返回") }
+                Text("🖍️ AI批注", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(60.dp))
+            }
+        }
+
+        Column(
+                modifier = Modifier.fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp)
+        ) {
+            when {
+                state.isLoading -> LoadingOverlay("正在生成批注...")
+                state.error.isNotEmpty() -> {
+                    Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                            shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("⚠️ 批注失败", color = Color(0xFFFF9800), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(state.error, color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
+                        }
+                    }
+                }
+                else -> {
+                    val chanText = if (state.channel == "vision") "视觉模型直出（带像素刻度尺）" else "PaddleOCR 坐标 + 大模型定位"
+                    Card(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                            shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("🖍️ 批注结果", color = Color(0xFF00D2FF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(8.dp))
+                            if (state.imageUrl.isNotEmpty()) {
+                                MarkdownView(content = "![](${state.imageUrl})", fontSize = 13f)
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Text("生成通道：$chanText · 共 ${state.annotations.size} 条批注",
+                                 color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp)
+                        }
+                    }
+
+                    Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                            shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("📋 批注明细", color = Color(0xFF00D2FF), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(8.dp))
+                            if (state.annotations.isEmpty()) {
+                                Text("无", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp)
+                            }
+                            state.annotations.forEachIndexed { i, a ->
+                                val label = when (a["type"]) {
+                                    "circle" -> "圈出"
+                                    "line" -> "划线"
+                                    "highlight" -> "荧光"
+                                    "text" -> "文字"
+                                    else -> a["type"].orEmpty()
+                                }
+                                val x = a["x"].orEmpty().toDoubleOrNull()?.let { Math.round(it).toString() } ?: "?"
+                                val y = a["y"].orEmpty().toDoubleOrNull()?.let { Math.round(it).toString() } ?: "?"
+                                val x2 = a["x2"].orEmpty().toDoubleOrNull()?.let { Math.round(it).toString() }
+                                val y2 = a["y2"].orEmpty().toDoubleOrNull()?.let { Math.round(it).toString() }
+                                val pos = if (x2 != null && y2 != null) "($x, $y) → ($x2, $y2)" else "($x, $y)"
+                                Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                                    Text("${i + 1}. $label  $pos",
+                                         color = tC(Color.White, Color(0xFF16181D)), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                    val txt = a["text"].orEmpty()
+                                    if (txt.isNotEmpty()) {
+                                        Text("💬 $txt", color = tC(Color(0xFFB0B8C4), Color(0xFF3A4048)), fontSize = 12.sp)
+                                    }
+                                    val reason = a["reason"].orEmpty()
+                                    if (reason.isNotEmpty()) {
+                                        Text(reason, color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -4867,6 +5289,7 @@ fun MainMenuScreen(
                 FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800), { viewModel.loadDataReport() }),
                 FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50), { viewModel.loadAiReport() }),
                 FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4), { viewModel.onButtonExtend() }),
+                FunctionButtonData("🖍️ AI批注", "像老师一样批改", Color(0xFFE91E63), { viewModel.onButtonAnnotation() }),
                 FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548), { viewModel.showHistory() }),
             )
 
@@ -5140,6 +5563,7 @@ fun FunctionGrid(viewModel: MainViewModel) {
         FunctionButtonData("📊 数据报告", "伸出3根手指", Color(0xFFFF9800)) { viewModel.loadDataReport() },
         FunctionButtonData("🤖 AI报告", "伸出2根手指", Color(0xFF4CAF50)) { viewModel.loadAiReport() },
         FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4)) { viewModel.onButtonExtend() },
+        FunctionButtonData("🖍️ AI批注", "像老师一样批改", Color(0xFFE91E63)) { viewModel.onButtonAnnotation() },
         FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548)) { viewModel.showHistory() },
         FunctionButtonData("⚙️ 设置", "个性化配置", Color(0xFF607D8B)) { viewModel.showSettings() },
     )
@@ -5219,7 +5643,7 @@ FontScaleScope {
   1. 将题目对准屏幕中央（手离开摄像头）拍照
   2. 自动OCR识别 → 确认/修改识别结果
   3. AI 分步解题（思路/解析/图解/导图）
-  4. 可追问、查看GeoGebra图形、记录掌握程度
+  4. 可追问、记录掌握程度
 
 🖐️ 手势操作（主页伸出对应手指保持1秒）：
   · 5指 → AI解题    · 4指 → AI动画
@@ -6749,6 +7173,8 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val themeMode by viewModel.themeMode.collectAsState()
     val dialect by viewModel.dialect.collectAsState()
     val grade by viewModel.grade.collectAsState()
+    // ② 回答风格：必须 collectAsState 才能点击后立即变色（直接读 .value 不会触发重组）
+    val answerStyle by viewModel.answerStyle.collectAsState()
     val personality by viewModel.personality.collectAsState()
     val detail by viewModel.detail.collectAsState()
     val subject by viewModel.subject.collectAsState()
@@ -6787,7 +7213,40 @@ FontScaleScope {
 
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
 
-                    // ② 回答风格已移除：仅保留方言口吻（人格在下方单独设置）
+                    // ② 回答风格（正式/鼓励/幽默）
+                    Text(
+                            "🎭 回答风格",
+                            color = tC(Color.White, Color(0xFF16181D)),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                            "影响讲解的语气与措辞",
+                            color = tC(Color.Gray, Color(0xFF5C6470)),
+                            fontSize = 11.sp
+                    )
+                    Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("formal" to "正式", "encouraging" to "鼓励", "humorous" to "幽默").forEach { (id, label) ->
+                            FilterChip(
+                                    selected = answerStyle == id,
+                                    onClick = {
+                                        viewModel.answerStyle.value = id
+                                        viewModel.saveExtraSettings()
+                                    },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF7E57C2)
+                                    )
+                            )
+                        }
+                    }
+
+                    Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
+
+                    // ③ 讲解口吻（方言，人格在下方单独设置）
                     Text(
                             "🗣️ 讲解口吻（方言）",
                             color = tC(Color.White, Color(0xFF16181D)),
@@ -6954,15 +7413,13 @@ FontScaleScope {
                             fontSize = 11.sp
                     )
 
-                    // ④ 搜题开关
+                    // ④ 搜题开关（⑲ 已全局停用：好未来额度将尽，开关置灰不可点）
                     SettingSwitch(
-                            title = "🔍 题库搜索",
-                            subtitle = "解题时自动在题库中搜索相似题目（耗时会增加）",
-                            checked = searchEnabled,
-                            onCheckedChange = {
-                                viewModel.searchEnabled.value = it
-                                viewModel.saveExtraSettings()
-                            }
+                            title = "🔍 题库搜索（已停用）",
+                            subtitle = "因题库平台额度限制，该功能已全局停用，暂不可开启",
+                            checked = false,
+                            enabled = false,
+                            onCheckedChange = { /* 已停用，不响应 */ }
                     )
 
                     // 十一 思考模式（off/on/auto；auto 按难度“较难/难”自动开启）
@@ -7164,6 +7621,26 @@ FontScaleScope {
                                         selectedContainerColor = Color(0xFF00BCD4)
                                 )
                         )
+                    }
+                    if (llmProvider == "deepseek") {
+                        Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf("deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner").forEach { m ->
+                                FilterChip(
+                                        selected = llmModel == m,
+                                        onClick = {
+                                            viewModel.llmModel.value = m
+                                            viewModel.saveAiSettings()
+                                        },
+                                        label = { Text(m, fontSize = 10.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF2196F3)
+                                        )
+                                )
+                            }
+                        }
                     }
                     if (llmProvider == "qwen") {
                         Row(
@@ -7888,104 +8365,6 @@ FontScaleScope {
         containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
     )
 }
-
-// ==================== Feature 20: GeoGebra 图形绘制 ====================
-
-@Composable
-fun GeoGebraScreen(url: String = "", onBack: () -> Unit) {
-    Column(modifier = Modifier.fillMaxSize().background(tC(Color(0xFF1A1A2E), Color(0xFFF2F4F8)))) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = tC(Color(0xFF16213E), Color(0xFFFFFFFF)),
-            shadowElevation = 4.dp
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Button(onClick = onBack) { Text("← 返回") }
-                Text("📐 数学图形", color = tC(Color.White, Color(0xFF16181D)), fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.width(60.dp))
-            }
-        }
-
-        if (url.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Color(0xFF00D2FF))
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text("正在生成数学图形...", color = tC(Color.White, Color(0xFF16181D)), fontSize = 14.sp)
-                }
-            }
-            return@Column
-        }
-
-        // WebView引用，供缩放按钮控制（JS缩放，避免页面user-scalable=no导致缩放失效）
-        var webViewRef by remember { mutableStateOf<android.webkit.WebView?>(null) }
-        var zoomScale by remember { mutableStateOf(1f) }
-
-        Box(modifier = Modifier.weight(1f)) {
-            AndroidView(
-                    factory = { ctx ->
-                        android.webkit.WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.allowFileAccess = true
-                            settings.domStorageEnabled = true
-                            settings.useWideViewPort = true
-                            settings.loadWithOverviewMode = true
-                            settings.builtInZoomControls = false
-                            settings.displayZoomControls = false
-                            settings.setSupportZoom(false)
-                            loadUrl(url)
-                            webViewRef = this
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        // 缩放控制条
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = tC(Color(0xFF16213E), Color(0xFFFFFFFF)),
-            shadowElevation = 4.dp
-        ) {
-            Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
-            ) {
-                Button(
-                        onClick = {
-                            zoomScale = (zoomScale * 0.8f).coerceAtLeast(0.5f)
-                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
-                        },
-                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
-                ) { Text("−", color = tC(Color.White, Color(0xFF16181D)), fontSize = 20.sp) }
-                Text("缩放", color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp))
-                Button(
-                        onClick = {
-                            zoomScale = (zoomScale * 1.25f).coerceAtMost(5f)
-                            webViewRef?.evaluateJavascript("document.body.style.zoom = '${zoomScale}';", null)
-                        },
-                        modifier = Modifier.size(width = 64.dp, height = 40.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = tC(Color(0xFF2D2D44), Color(0xFFE9EDF4)))
-                ) { Text("+", color = tC(Color.White, Color(0xFF16181D)), fontSize = 20.sp) }
-                Spacer(modifier = Modifier.width(12.dp))
-                TextButton(onClick = {
-                    zoomScale = 1f
-                    webViewRef?.evaluateJavascript("document.body.style.zoom = '1';", null)
-                    webViewRef?.reload()
-                }) {
-                    Text("🔄 适应", color = Color(0xFF00D2FF), fontSize = 13.sp)
-                }
-            }
-        }
-    }
-}
-
 
 // ==================== ④ 截图 / 导出（PDF/Word 由服务端生成） ====================
 /** 把当前 Activity 画面截图为 PNG 存到相册，返回保存路径（失败返回null） */

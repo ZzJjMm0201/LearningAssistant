@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 os.environ.setdefault('FLAGS_use_mkldnn', '0')
 os.environ.setdefault('FLAGS_use_onednn', '0')
 os.environ.setdefault('FLAGS_enable_pir_api', '0')  # 禁用PIR新执行器，使用旧版执行器
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 
 from server.config import APIConfig, FEATURE_FLAGS
 
@@ -28,9 +28,13 @@ class OCRService:
     def __init__(self):
         self.api_url = APIConfig.OCR_API_URL
         self.token = APIConfig.OCR_TOKEN
+        # 云端 OCR 偶发挂起，超时可配置（默认 15s，避免用户干等 60s）
+        self._api_timeout = getattr(APIConfig, "OCR_API_TIMEOUT", 15)
         self._local_ocr = None
         self._local_ready = False
         self._local_lock = threading.Lock()
+        # 预加载完成标志：避免启动期本地通道被误跳过
+        self._preload_done = False
         # 线程池用于并行OCR
         self._executor = ThreadPoolExecutor(max_workers=2)
     
@@ -38,6 +42,7 @@ class OCRService:
         """预加载本地PaddleOCR模型（服务启动时调用一次）"""
         self._init_paddle_env()
         print("[OCR] 正在预加载本地PaddleOCR模型...")
+        self._preload_done = True
         try:
             from paddleocr import PaddleOCR
             start = time.time()
@@ -108,8 +113,12 @@ class OCRService:
         futures[self._executor.submit(self._recognize_via_api, image_path)] = "api"
         
         # 通道2: 本地（默认关闭，可在config中开启）
-        if self._local_ready and FEATURE_FLAGS.get("enable_local_ocr", False):
+        # 注意：启动时是异步预加载；不在请求路径里阻塞等待（避免首请求干等），
+        # 就绪则并行参与，未就绪则本次仅走 API 通道，后续请求自然用上本地。
+        if FEATURE_FLAGS.get("enable_local_ocr", False) and self._local_ready:
             futures[self._executor.submit(self._recognize_local, image_path)] = "local"
+        elif FEATURE_FLAGS.get("enable_local_ocr", False):
+            print("[OCR] 本地通道加载中，本次仅使用API通道")
         elif self._local_ready:
             print("[OCR] 本地通道已按配置关闭（enable_local_ocr=False），仅使用API通道")
         
@@ -131,8 +140,8 @@ class OCRService:
         local_text = results.get("local", ("", 0))[0]
         
         if api_text and local_text:
-            # 两者都成功：合并（去重、互补）
-            merged = self._merge_ocr_results(api_text, local_text)
+            # 两者都成功：合并（本地 PaddleOCR 对公式/符号识别通常更准，故先本地后 API）
+            merged = self._merge_ocr_results(local_text, api_text)
             total_time = time.time() - start_total
             print(f"[OCR] 双通道合并完成，总耗时{total_time:.1f}s，合并长度={len(merged)}")
             return merged, round(total_time, 2), "merged"
@@ -198,7 +207,7 @@ class OCRService:
                 self.api_url, 
                 json=payload, 
                 headers=headers,
-                timeout=60
+                timeout=self._api_timeout
             )
             
             if response.status_code != 200:
@@ -219,6 +228,61 @@ class OCRService:
         except Exception as e:
             print(f"[OCR] API失败: {e}")
             return "", time.time() - start_time
+
+    def recognize_with_boxes(self, image_path: str) -> Tuple[str, List[Dict], int, int, float]:
+        """⑰ AI批注专用：返回 (文本, 文本块列表, 宽, 高, 耗时)
+
+        文本块形如 {"text": "...", "bbox": [l, t, r, b]}，供批注定位使用。
+        优先走 PaddleOCR API（它带回 layout 坐标）；失败时返回空块列表。
+        """
+        start_time = time.time()
+        blocks: List[Dict] = []
+        width = height = 0
+
+        # 图片尺寸（用于给 LLM 提供坐标系）
+        try:
+            from PIL import Image as _Image
+            with _Image.open(image_path) as _im:
+                width, height = _im.size
+        except Exception:
+            pass
+
+        try:
+            with open(image_path, "rb") as f:
+                file_data = base64.b64encode(f.read()).decode("ascii")
+            headers = {"Authorization": f"token {self.token}", "Content-Type": "application/json"}
+            payload = {
+                "file": file_data,
+                "fileType": 1,
+                "useDocOrientationClassify": False,
+                "useDocUnwarping": False,
+                "useChartRecognition": False,
+            }
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=self._api_timeout)
+            if response.status_code != 200:
+                raise Exception(f"OCR API错误: {response.status_code}")
+            result = response.json()["result"]
+
+            texts = []
+            for res in result.get("layoutParsingResults", []):
+                md_text = res.get("markdown", {}).get("text", "")
+                if md_text:
+                    texts.append(md_text)
+                pruned = res.get("prunedResult") or {}
+                if not width or not height:
+                    width = int(pruned.get("width") or width or 0)
+                    height = int(pruned.get("height") or height or 0)
+                # parsing_res_list 里带 block_content + block_bbox，最适合做批注定位
+                for blk in (pruned.get("parsing_res_list") or []):
+                    txt = str(blk.get("block_content") or "").strip()
+                    bb = blk.get("block_bbox")
+                    if txt and isinstance(bb, (list, tuple)) and len(bb) >= 4:
+                        blocks.append({"text": txt, "bbox": [float(v) for v in bb[:4]]})
+            elapsed = time.time() - start_time
+            return "\n\n".join(texts), blocks, width, height, round(elapsed, 2)
+        except Exception as e:
+            print(f"[OCR] 带坐标识别失败: {e}")
+            return "", [], width, height, round(time.time() - start_time, 2)
     
     def _recognize_local(self, image_path: str) -> Tuple[str, float]:
         """本地PaddleOCR识别"""

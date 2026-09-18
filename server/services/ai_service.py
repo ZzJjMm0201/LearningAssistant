@@ -73,13 +73,35 @@ ASK_DRAW_RULE = ("回答要求：直接回答学生最新问题本身，用自�
                  "并把代码块放在对应讲解文字之后。若题目本身不含图形也可不输出。")
 
 
+# ② 回答风格（正式/鼓励/幽默；另保留历史值 plain/concise/lively）
+STYLE_INSTRUCTIONS: Dict[str, str] = {
+    "formal": "回答风格：正式。用规范、严谨、条理清晰的书面化表达，不使用网络用语、玩笑和夸张修辞。",
+    "encouraging": "回答风格：鼓励。多肯定学生的思路与进步，指出问题前先肯定做得对的地方，用正向、温暖的语言给出改进建议。",
+    "humorous": "回答风格：幽默。在保证知识准确的前提下，用轻松风趣的比喻、类比和小玩笑让讲解更有意思；不要过度玩梗，不能影响严谨性。",
+    "plain": "回答风格：平实。用朴素直白的语言讲解，少用修辞。",
+    "concise": "回答风格：简洁。只讲要点，句子短，不铺陈。",
+    "lively": "回答风格：生动。多用类比和场景化描述让抽象概念具体起来。",
+}
+
+# ② 回答风格的 temperature（正式更稳定、幽默更活泼）
+STYLE_TEMPERATURE: Dict[str, float] = {
+    "formal": 0.2, "plain": 0.3, "concise": 0.2, "lively": 0.7,
+    "encouraging": 0.7, "humorous": 0.9,
+}
+
+
 def style_instruction(style: Optional[str], dialect: str = "") -> str:
-    """原“回答风格”已移除；此处仅保留方言口吻（非普通话时生效）"""
+    """② 回答风格（正式/鼓励/幽默）+ ③ 方言口吻；两者可叠加生效"""
+    parts = []
+    s = (style or "").strip().lower()
+    ins = STYLE_INSTRUCTIONS.get(s)
+    if ins:
+        parts.append("（" + ins + "）")
     d = (dialect or "").strip()
-    if not d or d == "普通话":
-        return ""
-    return (f"（讲解口吻：用{d}的口吻讲解，语气、用词、口头禅都贴近{d}本地说话方式；"
-            f"但专业术语、公式、数字必须保持准确，不因口吻影响正确性。）")
+    if d and d != "普通话":
+        parts.append(f"（讲解口吻：用{d}的口吻讲解，语气、用词、口头禅都贴近{d}本地说话方式；"
+                     f"但专业术语、公式、数字必须保持准确，不因口吻影响正确性。）")
+    return "\n".join(parts)
 
 
 def _resolve_personality(personality: Optional[str], subject: str = "") -> Optional[str]:
@@ -123,8 +145,8 @@ def detail_instruction(detail: Optional[str], weak_count: int = 0) -> str:
 
 
 def style_temperature(style: Optional[str]) -> Optional[float]:
-    """旧回答风格已删除：不再有风格温度"""
-    return None
+    """② 回答风格 temperature：正式→0.2、鼓励→0.7、幽默→0.9；未识别返回 None(用模型默认)"""
+    return STYLE_TEMPERATURE.get((style or "").strip().lower())
 
 
 def personality_temperature(personality: Optional[str], subject: str = "") -> Optional[float]:
@@ -290,7 +312,8 @@ class AIService:
     
     def solve_problem_stream(self, ocr_text: str, search_result: Optional[str] = None, engine: Optional[str] = None, model: Optional[str] = None,
                              style: Optional[str] = None, thinking: bool = False, dialect: str = "", grade: str = "",
-                             personality: Optional[str] = None, subject: str = "", detail: Optional[str] = None, weak_count: int = 0, latex_helper=None) -> Generator[Dict, None, None]:
+                             personality: Optional[str] = None, subject: str = "", detail: Optional[str] = None, weak_count: int = 0, latex_helper=None,
+                             interactive_quiz: bool = False) -> Generator[Dict, None, None]:
         """
         多轮解题对话 - 流式返回各阶段结果
         
@@ -304,6 +327,7 @@ class AIService:
         subject: 学科（⑧，personality=auto 时用于推荐）
         detail: 详细度 very_detailed/detailed/brief/auto（⑨）
         weak_count: 薄弱知识点数（⑨，detail=auto 时用于决定详细度）
+        interactive_quiz: ⑯ 边解答边设问开关；开启则在 steps 阶段后额外下发 quiz 事件
         """
         start_time = time.time()
         self.reset_usage(engine, model)
@@ -402,6 +426,68 @@ class AIService:
         steps_response = accumulated_steps
         
         yield {"stage": "steps", "content": steps_response}
+
+        # === ⑯ 边解答边设问：基于“题目 + 解题思路”生成 2~5 个简单、顺应思路的小问题 ===
+        # 客户端在展示完整解析的过程中插入这些提问，用户作答后判定正误并继续讲解。
+        if interactive_quiz:
+            try:
+                quiz_prompt = """请基于上面的题目与解题思路，设计 2~5 个“边讲解边提问”的小问题，用于检查学生是否跟上思路。
+    要求：
+    1. 题目要简单，是顺着解题思路的自然小步（如“这一步为什么要移项？”“符号说明了什么？”），不要求学生算复杂结果
+    2. 难易递进：第一个只考“看懂没”，后面的逐渐深一点
+    3. 每题必须是可判定的：给出 2~4 个选项，并标明哪一个是正确答案
+    4. 每题配一句简短解析（答对或答错都能看懂为什么）
+    5. 按以下 JSON 输出，只输出 JSON，不要其他内容：
+    {
+      "quiz": [
+        {
+          "question": "问题文本",
+          "options": ["选项A", "选项B", "选项C"],
+          "answer_index": 0,
+          "explanation": "为什么选它"
+        }
+      ]
+    }
+    answer_index 是 options 里正确选项的下标（从 0 开始）。"""
+                messages.append({"role": "assistant", "content": steps_response})
+                messages.append({"role": "user", "content": quiz_prompt})
+                quiz_raw = self._call_api(messages, engine=engine, model=model)
+                quiz_data = self._parse_json_response(quiz_raw) if quiz_raw else None
+                quiz_list = []
+                if isinstance(quiz_data, dict):
+                    quiz_list = quiz_data.get("quiz") or []
+                elif isinstance(quiz_data, list):
+                    quiz_list = quiz_data
+                norm = []
+                for q in (quiz_list or []):
+                    if not isinstance(q, dict):
+                        continue
+                    text = str(q.get("question") or "").strip()
+                    opts = q.get("options") or []
+                    if not text or not isinstance(opts, list):
+                        continue
+                    opts = [str(o).strip() for o in opts if str(o).strip()]
+                    if len(opts) < 2:
+                        continue
+                    opts = opts[:4]
+                    try:
+                        ai_idx = int(q.get("answer_index", 0))
+                    except Exception:
+                        ai_idx = 0
+                    if ai_idx < 0 or ai_idx >= len(opts):
+                        ai_idx = 0
+                    norm.append({
+                        "question": text,
+                        "options": opts,
+                        "answer_index": ai_idx,
+                        "explanation": str(q.get("explanation") or "").strip(),
+                    })
+                    if len(norm) >= 5:
+                        break
+                if norm:
+                    yield {"stage": "quiz", "content": {"questions": norm}}
+            except Exception as e:
+                print(f"[边解答边设问] 生成失败（不影响解题）: {e}")
         
         # === 第三阶段：完整解析（流式输出；可开思考模式；末尾不再附年级/学科/难度——⑩） ===
         solution_prompt = """请给出完整的解题过程和答案。
@@ -512,17 +598,26 @@ class AIService:
         yield {"stage": "complete", "content": {"total_time": elapsed, "messages": messages, "usage": self.get_usage()}}
     
     def generate_ai_report(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
-                           style: Optional[str] = None, dialect: str = "", grade: str = "") -> str:
+                           style: Optional[str] = None, dialect: str = "", grade: str = "",
+                           personality: Optional[str] = None, detail: Optional[str] = None,
+                           subject: str = "", weak_count: int = 0) -> str:
         """生成AI版学情报告（非流式，兼容旧调用）"""
-        return "".join(self.generate_ai_report_stream(stats_summary, engine=engine, model=model, style=style, dialect=dialect, grade=grade))
+        return "".join(self.generate_ai_report_stream(
+            stats_summary, engine=engine, model=model, style=style, dialect=dialect, grade=grade,
+            personality=personality, detail=detail, subject=subject, weak_count=weak_count))
 
     def generate_ai_report_stream(self, stats_summary: str, engine: Optional[str] = None, model: Optional[str] = None,
-                                  style: Optional[str] = None, dialect: str = "", grade: str = ""):
-        """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）"""
+                                  style: Optional[str] = None, dialect: str = "", grade: str = "",
+                                  personality: Optional[str] = None, detail: Optional[str] = None,
+                                  subject: str = "", weak_count: int = 0):
+        """生成AI版学情报告（流式，逐步yield增量文本；旧客户端按增量累加）
+        6.2：报告必须与解题使用同一套用户偏好（风格/方言/年级/人格/详细度），
+        否则用户在设置里选了“四川话/高中/幽默”却在报告里看不到任何变化。"""
         st_ins = style_instruction(style, dialect)
         g_ins = grade_instruction(grade)
-        if g_ins:
-            st_ins = (st_ins + "\n" + g_ins) if st_ins else g_ins
+        p_ins = personality_instruction(personality, subject)
+        d_ins = detail_instruction(detail, weak_count)
+        extra_ins = "\n".join([x for x in (g_ins, p_ins, d_ins) if x])
         prompt = f"""你是一位经验丰富的教育顾问。请根据以下学生的学习数据，生成一份温暖的学情报告。
 
     {stats_summary}
@@ -535,6 +630,8 @@ class AIService:
     5. 500字左右"""
         if st_ins:
             prompt += "\n" + st_ins
+        if extra_ins:
+            prompt += "\n" + extra_ins
         prompt += "\n\n" + COLOR_RULES
         
         messages: List[ChatCompletionMessageParam] = [
@@ -542,9 +639,13 @@ class AIService:
             {"role": "user", "content": prompt}
         ]
         
+        # ② 风格/人格温度：优先人格温度，其次风格温度
+        temp = personality_temperature(personality, subject)
+        if temp is None:
+            temp = style_temperature(style)
         prev_sent = ""
         for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
-                                            temperature=style_temperature(style)):
+                                            temperature=temp):
             if evt["stage"] != "content":
                 continue
             chunk = evt["content"]
@@ -859,12 +960,22 @@ class AIService:
     def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None) -> Tuple[str, float]:
         """使用视觉模型识别图片（OCR/图表描述）
         模型名以 deepseek 开头 → DeepSeek客户端；否则走千问客户端
-        ③ 提示词：手写内容转 *斜体* Markdown；流程图/统计图用自然语言描述（不输出纯文本）
+        ③ 提示词：手写内容转 *斜体* Markdown；④ 手写颜色用 [[#RRGGBB]] 标注；
+        ① 只在彼此独立的大题之间插入 %%%（跨栏/同篇阅读/同一大题不切分）
         """
         import base64 as _b64
         start = time.time()
         try:
-            model = model or APIConfig.QWEN_DEFAULT_VISION
+            # ⑬ 默认视觉模型：优先用 VISION_PROVIDER 指定的 provider
+            # （千问欠费后直接用不了，默认改为与 LLM 同源的 DeepSeek 视觉）
+            if not model:
+                _vp = str(getattr(APIConfig, "VISION_PROVIDER", "deepseek") or "deepseek").lower()
+                if _vp == "qwen":
+                    model = APIConfig.QWEN_DEFAULT_VISION
+                elif _vp == "deepseek":
+                    model = getattr(APIConfig, "DEEPSEEK_DEFAULT_VISION", "deepseek-v4-flash-vision-exp")
+                else:
+                    model = APIConfig.QWEN_DEFAULT_VISION
             is_deepseek_model = str(model).lower().startswith("deepseek")
             client = self.client if is_deepseek_model else self.qwen_client
             if client is None:
@@ -874,7 +985,16 @@ class AIService:
             prompt = prompt or (
                 "请识别这张图片中的全部文字并完整输出（保持原有顺序和格式）。"
                 "③ 手写的内容（包括手写解题过程、批注）请在输出中改用 *斜体*（Markdown斜体，单个星号包裹）表示，以与印刷体区分；印刷体保持原样。"
-                "① 如果图片里包含多道独立的题目（通常每题有单独题号和选项），请在每两道题目之间输出一个分隔符 %%%（单独一行的三个百分号），以便区分不同的题。"
+                "④ 颜色标注：手写内容如果有特殊字体颜色（红笔、蓝笔、荧光笔等区别于普通黑色的颜色），"
+                "请在对应文字前后各加一个【相同的】颜色标记，写成 [[#RRGGBB]]这段文字[[#RRGGBB]]，"
+                "其中 RRGGBB 换成你在图里实际看到的颜色的十六进制值（例如红笔用 [[#E53935]]、蓝笔用 [[#1E88E5]]、"
+                "绿笔用 [[#43A047]]、橙色用 [[#FB8C00]]）。颜色标记只包住有颜色的文字，普通黑色/灰度文字不要加；不要嵌套使用。"
+                "① 分题：只有当图片里包含【多道彼此独立的大题】时，才在两道大题之间输出一个分隔符 %%%（单独一行的三个百分号）。"
+                "以下情况【绝对不能】加 %%%（它们都属于同一道题）："
+                "(a) 分栏排版时同一道题从左边一栏续到右边一栏（跨栏）；"
+                "(b) 同一篇阅读材料/短文及其下面的全部小题（同篇阅读）；"
+                "(c) 同一道大题下面的各个小问，如 (1)(2)(3)、①②③、第(1)问 等（同一大题）；"
+                "(d) 题干、选项与附图属于同一道题的情况。"
                 "⑥ 如果图片模糊、严重反光、文字根本无法辨认，无法完成识别，请只输出一行 ---end---，不要输出其他内容。"
                 "如果图片中包含流程图、统计图、几何图形等非纯文字内容，请用自然语言描述其内容，不要尝试把图形转成文字列表。"
                 "只输出识别/描述结果，不要任何额外解释。"

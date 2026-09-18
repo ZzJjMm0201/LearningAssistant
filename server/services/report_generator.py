@@ -167,31 +167,51 @@ class ReportGenerator:
     def __init__(self, db_session):
         self.db = db_session
     
-    def generate_data_report_html(self, days: int = 30, user_id: Optional[int] = None, theme: str = "dark") -> str | None:
+    def generate_data_report_html(self, days: int = 30, user_id: Optional[int] = None, theme: str = "dark",
+                                  grade: str = "", subject: str = "") -> str | None:
         """
         生成数据版学情报告（HTML 格式）
         
         Args:
             days: 统计最近几天的数据（<=0 表示全部）
             user_id: 用户ID（多用户隔离）
+            grade: ③ 筛选年级（空=不限；支持逗号分隔多选）
+            subject: ③ 筛选学科（空=不限；支持逗号分隔多选）
         
         Returns:
             HTML 文件路径，失败返回 None
         """
-        from sqlalchemy import or_
         cutoff_date = datetime.utcnow() - timedelta(days=days)
         
         query = self.db.query(SubmissionRecord)
         if days and days > 0:
             query = query.filter(SubmissionRecord.timestamp >= cutoff_date)
         if user_id is not None:
-            query = query.filter(
-                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
-            )
+            query = query.filter(SubmissionRecord.user_id == user_id)
         else:
-            # 未登录用户只能统计公共(NULL)记录
-            query = query.filter(SubmissionRecord.user_id.is_(None))
+            # 未登录/游客：没有个人记录可统计
+            query = query.filter(SubmissionRecord.id == -1)
         records = query.all()
+
+        # ③ 年级/学科筛选（在 Python 侧做，因为两者存在 question_info JSON 里）
+        def _split(v):
+            return {x.strip() for x in str(v or "").split(",") if x.strip()}
+        want_grades = _split(grade)
+        want_subjects = _split(subject)
+        if want_grades or want_subjects:
+            kept = []
+            for r in records:
+                qi = r.question_info if isinstance(r.question_info, dict) else {}
+                rg = str(qi.get("grade") or "").strip()
+                rs = str(qi.get("subject") or "").strip()
+                if want_grades:
+                    # 年级用包含匹配（如选“高中”要能匹配到“高一”）
+                    if not any(w in rg or rg in w for w in want_grades if w):
+                        continue
+                if want_subjects and rs not in want_subjects:
+                    continue
+                kept.append(r)
+            records = kept
         
         if not records:
             return None
@@ -302,9 +322,10 @@ class ReportGenerator:
         focus_times = {}
         focus_records = self.db.query(TrackingRecord).all()
         if user_id is not None:
-            focus_records = [t for t in focus_records if t.user_id == user_id or t.user_id is None]
+            focus_records = [t for t in focus_records if t.user_id == user_id]
         else:
-            focus_records = [t for t in focus_records if t.user_id is None]
+            # 未登录/游客：不统计任何人的专注度
+            focus_records = []
         if days and days > 0:
             focus_records = [t for t in focus_records if t.timestamp and t.timestamp >= cutoff_date]
         for t in focus_records:
@@ -484,42 +505,8 @@ class ReportGenerator:
             fig8.update_xaxes(fixedrange=True)
             fig8.update_yaxes(fixedrange=True)
 
-        # 9. 掌握程度（横向条形图，每题一行从上到下，按日期排序；图例在底部、清晰可见）
+        # 9. 已按用户要求删除「掌握程度（每道题，自上而下）」图表
         fig9 = None
-        if mastery_timeline:
-            _level_name = {1.0: "完全掌握", 0.5: "部分掌握", 0.0: "完全没掌握"}
-            _lvl_color = {1.0: "#4CAF50", 0.5: "#FF9800", 0.0: "#F44336"}
-            # 每道题一行；行标签=日期+学科；按日期升序（最新在下）
-            _rows = mastery_timeline[:40]  # 最多 40 条，避免过长
-            _y_labels = [f"{d}  {s}" for d, _, s in _rows]
-            _scores = [sc for _, sc, _ in _rows]
-            fig9 = go.Figure()
-            # 按掌握等级分组绘制（保证图例只出现 3 项）
-            for _sc in (1.0, 0.5, 0.0):
-                _xs = [sc if sc == _sc else None for sc in _scores]
-                fig9.add_trace(go.Bar(
-                    x=_xs, y=_y_labels, orientation='h',
-                    marker_color=_lvl_color[_sc], name=_level_name[_sc],
-                    text=[_level_name[_sc] if sc == _sc else "" for sc in _scores],
-                    textposition='inside', insidetextanchor='middle',
-                    textfont=dict(color='white', size=11),
-                    hoverinfo='skip',
-                ))
-            fig9.update_layout(
-                title="掌握程度（每道题，自上而下）",
-                barmode='stack',
-                margin=dict(l=10, r=20, t=50, b=90),
-                height=max(280, 34 * len(_y_labels) + 130),
-                dragmode=False,
-                hovermode=False,
-                bargap=0.28,
-                xaxis=dict(range=[0, 1], tickvals=[0, 0.5, 1.0],
-                           ticktext=["完全没掌握", "部分掌握", "完全掌握"], fixedrange=True),
-                yaxis=dict(autorange='reversed', fixedrange=True, tickfont=dict(size=11)),
-                legend=dict(orientation="h", yanchor="top", y=-0.08, x=0.5, xanchor="center",
-                            font=dict(size=12, color=FCOL)),
-            )
-            fig9.update_layout(template=TPL, paper_bgcolor=PBG, plot_bgcolor=PBG, font=dict(color=FCOL))
 
         # 10. 学科掌握率（算法统计：按学科聚合加权平均）
         fig10 = None
@@ -646,11 +633,9 @@ class ReportGenerator:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
             query = query.filter(SubmissionRecord.timestamp >= cutoff_date)
         if user_id is not None:
-            query = query.filter(
-                or_(SubmissionRecord.user_id == user_id, SubmissionRecord.user_id.is_(None))
-            )
+            query = query.filter(SubmissionRecord.user_id == user_id)
         else:
-            query = query.filter(SubmissionRecord.user_id.is_(None))
+            query = query.filter(SubmissionRecord.id == -1)
         records = query.all()
         
         if not records:

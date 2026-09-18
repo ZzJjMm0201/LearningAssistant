@@ -35,6 +35,10 @@ class APIConfig:
     # DeepSeek API
     DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY", "sk-3178b37524bf4a36a74fa8873d1ebdb5")
     DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+    # 16.1 DeepSeek 可选模型名（客户端“具体模型”可选；不传时用 API 默认模型）
+    # 已按本环境 deepseek 提供方实际可用的模型 ID 核实：
+    #   deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner
+    DEEPSEEK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
     
     # 千问 API（阿里云百炼 OpenAI 兼容端点；Key 放 .env）
     QWEN_API_KEY = _env("QWEN_API_KEY", "")
@@ -43,6 +47,11 @@ class APIConfig:
     # 千问默认模型（客户端可在设置中选择）
     QWEN_DEFAULT_LLM = "qwen3.8-max"
     QWEN_DEFAULT_VISION = "qwen3.8-max"
+
+    # 默认视觉模型（⑬ 已改用 DeepSeek 视觉，与 LLM 同源、API 互通；千问欠费后不可用）
+    # 客户端设置里仍可选千问，只是默认走这个；若要换回把值改成 "qwen3.8-max" 即可。
+    VISION_PROVIDER = _env("VISION_PROVIDER", "deepseek")
+    DEEPSEEK_DEFAULT_VISION = _env("DEEPSEEK_DEFAULT_VISION", "deepseek-v4-flash-vision-exp")
 
     # 豆包（火山方舟，OpenAI 兼容 /api/v3）
     DOUBAO_API_KEY = _env("DOUBAO_API_KEY", "")
@@ -61,12 +70,19 @@ class APIConfig:
     # PaddleOCR API
     OCR_API_URL = "https://74y4w193tej2z706.aistudio-app.com/layout-parsing"
     OCR_TOKEN = _env("OCR_TOKEN", "adf8faf595a1aa8baf581d19a565c2776b94843c")
+    # OCR 快速失败：云端服务偶发挂起（实测 60s 超时），缩短超时避免用户干等
+    OCR_API_TIMEOUT = int(_env("OCR_API_TIMEOUT", "15"))
+    # 默认 OCR 模式：paddle=本地/API 双通道；qwen=视觉大模型
+    OCR_DEFAULT_MODE = _env("OCR_DEFAULT_MODE", "qwen")
 
 # 功能开关
+# ⚠️ 好未来题库搜题：体验次数已用尽且平台可能随时禁用，**全局关闭**。
+#    关闭后服务端不再发起搜题请求（不消耗额度），客户端开关也一并禁用不可点。
+#    若要恢复：把 enable_question_search 改回 True，并同步改前端 SEARCH_DISABLED。
 FEATURE_FLAGS = {
-    "enable_question_search": True,  # 题库搜索开关 (节约费用)
+    "enable_question_search": False,  # 题库搜索开关（⑲ 已禁用：好未来额度将尽）
     "enable_ai_animation": True,      # AI动画功能
-    "enable_local_ocr": False,        # 本地PaddleOCR默认关闭（慢/占资源）；API OCR默认开启
+    "enable_local_ocr": True,         # 本地PaddleOCR兜底：云端 PaddleOCR API 已不可用（60s超时），开启本地通道
     "enable_latex_review": False,     # ⑦ 视觉模型审核LaTeX图形（默认关闭，耗时）
 }
 
