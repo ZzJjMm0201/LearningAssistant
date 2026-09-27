@@ -111,7 +111,7 @@ function mindmapTree(text) {
     if (!line.trim()) return;
     const l = line.replace(/\t/g, '    ').replace(/\u3000/g, '  ');
     const prefix = (l.match(/^[\s\u2500-\u257F]+/) || [''])[0];
-    const depth = Math.floor(prefix.replace(BRANCH, '  ').length / 2);
+    let depth = Math.floor(prefix.replace(BRANCH, '  ').length / 2);
     let body = l.slice(prefix.length)
       .replace(/^[-*+•·]\s*/, '')
       .replace(/^#{1,6}\s*/, '')
@@ -121,6 +121,12 @@ function mindmapTree(text) {
     let title = body, desc = '';
     const m = body.match(/^(.{1,40}?)\s*[：:]\s*(.+)$/);
     if (m) { title = m[1]; desc = m[2]; }
+    // 【修复】防“缩进错乱/严重缩进”：box 字符与空格混排时会算出 3→5→7 这种跳级，
+    // 每级 16px 内边距叠起来观感极差（实测真实记录最大 depth=8、跳级 10~14 次）。
+    // 约束为“相对上一行最多 +1 级”，保留层级关系同时消除异常跳跃。
+    if (nodes.length && depth > nodes[nodes.length - 1].depth + 1) {
+      depth = nodes[nodes.length - 1].depth + 1;
+    }
     nodes.push({ depth: depth, title: title, desc: desc });
   });
   if (!nodes.length) return '';
@@ -204,7 +210,12 @@ function bindAskBox(sessionId, contextText) {
 function renderQAList(list, qIcon, aIcon) {
   let b = '';
   (list || []).forEach((x) => {
-    b += `<div class="bubble q"><b>${qIcon} ${esc(x.q)}</b>${x.a ? `<div class="muted" style="margin-top:6px">${aIcon} ${esc(x.a)}</div>` : ''}</div>`;
+    // 【修复】服务端存的是 {question, answer}（见 aux_records.extra_json），
+    // 原实现只读 {q, a} → 明明有数据却渲染成 "undefined"，看起来“模块没显示”。两种键名都兼容。
+    const q = (x && (x.question != null ? x.question : x.q)) || '';
+    const a = (x && (x.answer != null ? x.answer : x.a)) || '';
+    if (!q) return;
+    b += `<div class="bubble q"><b>${qIcon} ${esc(q)}</b>${a ? `<div class="muted" style="margin-top:6px">${aIcon} ${esc(a)}</div>` : ''}</div>`;
   });
   return b;
 }
@@ -544,6 +555,11 @@ async function openMultiPageRecorder() {
 
 /* ---------- 上传弹层（拍照/选图/文字） ---------- */
 function openFn(fn) {
+  // 【修复】首页“📊 学情报告”卡片会调 openFn('report')，但下面的 cfg 映射表里没有 report 键，
+  // cfg 就是 undefined，紧接着读 cfg.t 抛 TypeError: Cannot read properties of
+  // undefined (reading 't') —— 报告页根本打不开（无头浏览器已复现同一条报错）。
+  // 报告不是上传页，直接切到 report 视图即可。
+  if (fn === 'report') { S.view = 'report'; render(); return; }
   const cfg = {
     solve:  { t: '📷 拍照解题', text: 'startSolveText' },
     extend: { t: '📎 知识延伸', text: 'startExtendText' },
@@ -662,6 +678,8 @@ function showSolveView(rid) {
   v.innerHTML = `
     <div class="subbar"><button class="back" id="bk">← 返回</button><div class="ttl">📷 解题结果</div></div>
     <div class="progress" id="prog"><span class="dot"></span><span id="progText">正在准备…</span></div>
+    <div id="qTabs" class="chips hidden" style="margin:4px 0"></div>
+    <div id="qSplit"></div>
     <div id="infoTags"></div>
     <div id="solveBody"></div>
     <div id="quizBox"></div>
@@ -672,10 +690,12 @@ function showSolveView(rid) {
   bindScrollFab();
 }
 
-let solveAcc = { steps: '', full: '', extras: '', mindmap: '', info: {}, similar: [], qa: [], quiz: [], quizIdx: 0, quizAnswered: 0, quizCorrect: 0 };
+let solveAcc = { steps: '', full: '', extras: '', mindmap: '', info: {}, similar: [], qa: [], quiz: [], quizIdx: 0, quizAnswered: false,
+  byQ: {}, qOrder: [], curQ: 0, qCount: 0 };
 
 function streamSolve(rid) {
-  solveAcc = { steps: '', full: '', extras: '', mindmap: '', info: {}, similar: [], qa: [], quiz: [], quizIdx: 0, quizAnswered: 0, quizCorrect: 0 };
+  solveAcc = { steps: '', full: '', extras: '', mindmap: '', info: {}, similar: [], qa: [], quiz: [], quizIdx: 0, quizAnswered: false,
+    byQ: {}, qOrder: [], curQ: 0, qCount: 0 };
   API.sse('/solve/stream/' + rid, {
     onEvent: (m) => handleSolveEvent(m),
     onDone: () => {
@@ -695,6 +715,18 @@ function streamSolve(rid) {
 function handleSolveEvent(m) {
   const stage = m.stage, content = m.content;
   const progText = $('#progText');
+
+  // ⑥ 多题支持：事件可带 qi（题目序号）。维护 byQ 分桶，
+  //    并把"当前查看题"的桶同步到顶层字段，供 renderSolveBody 复用。
+  const _qi = (typeof m.qi === 'number' && m.qi >= 0) ? m.qi : 0;
+  solveAcc.qCount = Math.max(solveAcc.qCount || 0, _qi + 1);
+  if (solveAcc.qOrder.indexOf(_qi) < 0) solveAcc.qOrder.push(_qi);
+  if (!solveAcc.byQ[_qi]) solveAcc.byQ[_qi] = { steps: '', full: '', extras: '', mindmap: '', info: {}, similar: [], quiz: [] };
+  // 多题首次出现时，自动切到第一题
+  if (solveAcc.qOrder.length === 1 && solveAcc.curQ !== _qi) solveAcc.curQ = _qi;
+
+  // 事件内容先写入"该事件所属题"的桶，保证多题互不覆盖
+  const B = solveAcc.byQ[_qi];
   if (stage === 'info') { if (progText) progText.textContent = content || '处理中…'; return; }
   if (stage === 'blurred') { toast(content || '图片模糊，请重拍'); return; }
   if (stage === 'error') { toast('错误：' + content); if (progText) progText.textContent = '出错：' + content; return; }
@@ -705,40 +737,58 @@ function handleSolveEvent(m) {
     return;
   }
   if (stage === 'question_info') {
-    solveAcc.info = (typeof content === 'object' && content) ? content : {};
+    B.info = (typeof content === 'object' && content) ? content : {};
     renderInfoTags(solveAcc.info);
     if (progText) progText.textContent = '正在生成解题思路…';
     return;
   }
-  if (stage === 'solution_steps_chunk') { solveAcc.steps = content || ''; renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 2/6 · 解题思路'; return; }
-  if (stage === 'solution_steps') { solveAcc.steps = content || ''; renderSolveBodyThrottled(); return; }
-  if (stage === 'solution_chunk') { solveAcc.full = content || ''; renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 3/6 · 完整解析'; return; }
-  if (stage === 'solution' || stage === 'solution_rendered') { solveAcc.full = content || ''; renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 3/6 · 完整解析'; return; }
-  if (stage === 'latex_extras_rendered') { solveAcc.extras = content || ''; renderSolveBodyThrottled(); return; }
-  if (stage === 'mindmap_chunk') { solveAcc.mindmap = content || ''; renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 5/6 · 思维导图'; return; }
-  if (stage === 'mindmap') { solveAcc.mindmap = content || ''; renderSolveBodyThrottled(); return; }
+  // 🧩 【修复】多题分题：服务端发出 question_split 后会【阻塞等待用户选题（最长120秒）】，
+  // 网页端此前完全没有处理这个事件，也没有回传选题 → 表现为“分题失败/页面卡住”。
+  if (stage === 'question_split') {
+    const o = (typeof content === 'object' && content) ? content : {};
+    const qs = Array.isArray(o.questions) ? o.questions : [];
+    const cnt = Number(o.count || qs.length || 0);
+    if (cnt > 1) {
+      if (progText) progText.textContent = '检测到 ' + cnt + ' 道题，请选择要解答的题目…';
+      renderQuestionSplitPicker(qs);
+    } else if (progText) {
+      progText.textContent = '正在逐题解答…';
+    }
+    return;
+  }
+  if (stage === 'solution_steps_chunk') { B.steps = asText(content); renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 2/6 · 解题思路'; return; }
+  if (stage === 'solution_steps') { B.steps = asText(content); renderSolveBodyThrottled(); return; }
+  if (stage === 'solution_chunk') { B.full = asText(content); renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 3/6 · 完整解析'; return; }
+  if (stage === 'solution' || stage === 'solution_rendered') { B.full = asText(content); renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 3/6 · 完整解析'; return; }
+  if (stage === 'latex_extras_rendered' || stage === 'latex_extras' || stage === 'latex_chunk') { B.extras = asText(content); renderSolveBodyThrottled(); return; }
+  if (stage === 'mindmap_chunk') { B.mindmap = asText(content); renderSolveBodyThrottled(); if (progText) progText.textContent = '阶段 5/6 · 思维导图'; return; }
+  if (stage === 'mindmap') { B.mindmap = asText(content); renderSolveBodyThrottled(); return; }
   if (stage === 'suggested_questions') {
-    solveAcc.similar = parseQA(content);
+    B.similar = parseQA(content);
     renderSolveBodyThrottled();
     if (progText) progText.textContent = '阶段 6/6 · 预判问题';
     return;
   }
-  if (stage === 'ai_usage') { solveAcc.usage = content || {}; renderSolveBodyThrottled(); return; }
+  if (stage === 'ai_usage' || stage === 'usage' || stage === 'complete') { if (content && typeof content === 'object' && content.usage) solveAcc.usage = content.usage; else if (content && typeof content === 'object' && content.total_tokens) solveAcc.usage = content; renderSolveBodyThrottled(); if (stage === 'complete') return; return; }
   // ⑯ 边解答边设问：服务端在 steps 之后下发 quiz 事件
   if (stage === 'quiz') {
     const o = (typeof content === 'object' && content) ? content : {};
     const qs = Array.isArray(o.questions) ? o.questions : [];
-    solveAcc.quiz = qs.map((q) => ({
+    B.quiz = qs.map((q) => ({
       question: String(q.question || ''),
       options: Array.isArray(q.options) ? q.options.map(String) : [],
       answer_index: Number(q.answer_index || 0),
       explanation: String(q.explanation || ''),
       picked: -1
     })).filter((q) => q.question && q.options.length >= 2);
-    solveAcc.quizIdx = 0;
-    if (solveAcc.quiz.length) {
-      toast('已生成 ' + solveAcc.quiz.length + ' 个思考题，可在下方作答');
-      renderQuizBox();
+    B.quizIdx = 0;
+    if (B.quiz.length) {
+      toast('已生成 ' + B.quiz.length + ' 个思考题，可在下方作答');
+      // ⑥ 若该题就是当前查看题，需先同步到顶层再渲染（否则读到空）
+      if (_qi === solveAcc.curQ) {
+        syncFromBuckets();
+        renderQuizBox();
+      }
     }
     return;
   }
@@ -750,22 +800,70 @@ function parseQA(content) {
     .filter((x) => x.q);
 }
 
+/* 【修复】把任意内容转成可渲染文本：SSE 某些事件的 content 是对象（如 question_info），
+   直接赋给文本字段再进 Markdown/模板，就会显示成 "[object Object]"。统一在此兜底。 */
+function asText(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'object') {
+    if (typeof v.text === 'string') return v.text;
+    if (typeof v.content === 'string') return v.content;
+    if (typeof v.markdown === 'string') return v.markdown;
+    if (Array.isArray(v)) return v.map(asText).filter(Boolean).join('\n');
+    try { return JSON.stringify(v); } catch (e) { return ''; }
+  }
+  return String(v);
+}
+
+/* 【修复】判断一段文本是否真的是“思维导图”：带木形符号（├ └ ─ │）或显著缩进。
+   老记录里 mind_map 可能是被错位进去的正文（实测有 A项：/B项：… 这种），
+   这类内容原来会被 mindmapTree 渲染成“一列到底”的扁平列表。 */
+function looksLikeMindmap(text) {
+  const s = String(text == null ? '' : text);
+  if (!s) return false;
+  const branch = (s.match(/[\u2500-\u257F]/g) || []).length;
+  if (branch >= 3) return true;
+  return /\n[ \t]{4,}\S/.test(s);
+}
+
 function renderInfoTags(info) {
   const box = $('#infoTags'); if (!box) return;
+  info = (info && typeof info === 'object') ? info : {};
+  // 【修复】原实现里 em / dp / html / 卡片外壳全部丢失（只留了 `const kp = ...` 和后面的使用），
+  // 一调用就抛 ReferenceError（_题信息标签“整块渲染不出来”，并打断后续渲染）。这里补全。
   const kp = Array.isArray(info.knowledge_points) ? info.knowledge_points.join('、') : (info.knowledge_points || '');
-  const em = Array.isArray(info.easy_mistakes) ? info.easy_mistakes.join('、') : (info.easy_mistakes || '');
-  const dp = Array.isArray(info.difficult_points) ? info.difficult_points.join('、') : (info.difficult_points || '');
-  const diffColor = { '易': '#4CAF50', '较易': '#4CAF50', '中': '#FF9800', '较难': '#F44336', '难': '#F44336' }[info.difficulty] || '#607D8B';
-  let html = '<div class="card"><div class="tags">';
-  if (info.grade) html += `<span class="tag" style="background:#7B2FBE">🎓 ${esc(info.grade)}</span>`;
-  if (info.subject) html += `<span class="tag" style="background:#2196F3">📖 ${esc(info.subject)}</span>`;
-  if (info.difficulty) html += `<span class="tag" style="background:${diffColor}">📊 难度：${esc(info.difficulty)}</span>`;
-  html += '</div>';
-  if (kp) html += `<div class="muted" style="color:#00D2FF">🔖 知识点：${esc(kp)}</div>`;
-  if (em) html += `<div class="muted" style="color:#E65100">⚠️ 易错点：${esc(em)}</div>`;
-  if (dp) html += `<div class="muted" style="color:#C62828">🚧 难点：${esc(dp)}</div>`;
+  const em = Array.isArray(info.easy_mistakes) ? info.easy_mistakes.join('；') : (info.easy_mistakes || '');
+  const dp = Array.isArray(info.difficult_points) ? info.difficult_points.join('；') : (info.difficult_points || '');
+  let html = `<div class="card">
+      <div class="card-title">📋 题目信息</div>
+      <div class="muted">学科：${esc(info.subject || '—')} · 年级：${esc(info.grade || '—')} · 难度：${esc(info.difficulty || '—')}</div>
+      ${kp ? `<div class="muted">知识点：${esc(kp)}</div>` : ''}`;
+  if (em) html += `<div class="muted" style="color:#E65100">⚠️ 本题易错点：${esc(em)}</div>`;
+  if (dp) html += `<div class="muted" style="color:#C62828">🚩 难点：${esc(dp)}</div>`;
+  html += '<div id="recentMistakes"></div>';
   html += '</div>';
   box.innerHTML = html;
+  loadRecentMistakes();
+}
+
+/* 🧭 最近易错点梳理：拉取该用户近期易错点并聚类展示 */
+function loadRecentMistakes() {
+  if (typeof API.reportMistakes !== 'function') return;
+  API.reportMistakes(10).then((r) => {
+    const el = document.querySelector('#recentMistakes');
+    if (!el) return;
+    const items = (r && r.items) || [];
+    if (!items.length) { el.innerHTML = ''; return; }
+    const shown = items.slice(0, 8);
+    el.innerHTML = `
+      <div style="margin-top:8px">
+        <span class="muted" style="color:#8E24AA">🧭 最近易错点梳理（近 ${r.records} 次作业）</span>
+        <div style="margin-top:6px">
+          ${shown.map((x) => `<div class="muted" style="color:#E65100;margin:3px 0">• ${esc(x.text)}` + (x.count > 1 ? ` <span class="dim">×${x.count}</span>` : '') + `</div>`).join('')}
+        </div>
+      </div>`;
+  }).catch(() => {});
 }
 
 function foldCard(title, color, bodyHtml, id, collapsed) {
@@ -778,12 +876,14 @@ function foldCard(title, color, bodyHtml, id, collapsed) {
 
 function renderSolveBody() {
   const box = $('#solveBody'); if (!box) return;
+  syncFromBuckets();          // ⑥ 多题：把当前题的桶同步到顶层字段
+  renderQTabs();              // ⑥ 多题：渲染题目标签
   let html = '';
   const sm = Object.assign({}, settings().showModules || {});
   const on = (k) => sm[k] !== false;
   if (solveAcc.steps && on('solution_steps')) html += foldCard('📝 解题思路', '#00D2FF', `<div class="md" data-md></div>`, 'foldSteps', false);
   if (solveAcc.full && on('full_solution')) html += foldCard('📝 完整解析', '#7B2FBE', `<div class="md" data-md></div>`, 'foldFull', false);
-  if (solveAcc.extras && on('full_solution')) html += foldCard('📐 图解辅助', '#00BCD4', `<div class="md" data-md></div>`, 'foldExtras', false);
+  if (solveAcc.extras && on('full_solution')) html += foldCard('📐 图解辅助', '#00BCD4', `<div data-extras></div>`, 'foldExtras', false);
   if (solveAcc.mindmap && on('mind_map')) html += foldCard('🗺️ 思维导图', '#00C853', (mindmapTree(solveAcc.mindmap) || '<div class="muted">思维导图格式无法解析，已按原文显示：</div><pre style="white-space:pre-wrap;font-size:13px">' + esc(solveAcc.mindmap) + '</pre>'), 'foldMind', false);
   if (solveAcc.similar && solveAcc.similar.length && on('suggested_questions')) {
     html += foldCard('💬 预判问题', '#FFB74D', renderQAList(solveAcc.similar, '❓', '💡'), 'foldSim', false);
@@ -794,22 +894,165 @@ function renderSolveBody() {
   if (!html) html = '<div class="card"><div class="muted">正在等待 AI 输出…</div></div>';
   box.innerHTML = html;
   // 填充 Markdown 内容（避免转义问题）
-  const map = { foldSteps: solveAcc.steps, foldFull: solveAcc.full, foldExtras: solveAcc.extras };
+  const map = { foldSteps: solveAcc.steps, foldFull: solveAcc.full };
   Object.keys(map).forEach((id) => {
     const el = box.querySelector('#' + id + ' [data-md]');
     if (el) renderMarkdownInto(el, map[id]);
   });
-  box.querySelectorAll('[data-fold]').forEach((s) => {
-    s.onclick = () => {
-      const t = box.querySelector('#' + s.dataset.fold);
-      t.classList.toggle('hidden');
-      s.textContent = t.classList.contains('hidden') ? '▼ 展开' : '▲ 收起';
-    };
+  // ⑤ 图解辅助：原生 UI 渲染（不走 Markdown）
+  const exEl = box.querySelector('#foldExtras [data-extras]');
+  if (exEl) exEl.innerHTML = renderExtrasUI(solveAcc.extras);
+  bindSolveBodyInteractions(box);
+}
+
+/* 折叠/图解交互：事件委托，避免重渲染后绑定失效 */
+function bindSolveBodyInteractions(box) {
+  if (box.dataset.bound === '1') {
+    bindExtrasZoom(box);
+    return;
+  }
+  box.dataset.bound = '1';
+  box.addEventListener('click', (e) => {
+    const s = e.target.closest('[data-fold]');
+    if (!s) return;
+    const t = box.querySelector('#' + s.dataset.fold);
+    if (!t) return;
+    t.classList.toggle('hidden');
+    s.textContent = t.classList.contains('hidden') ? '▼ 展开' : '▲ 收起';
   });
+  bindExtrasZoom(box);
 }
 
 /* 10.1 解题流式渲染节流：每约 180ms 重绘一次，收尾 flush，兼顾“看得见进度”与“不卡” */
 const renderSolveBodyThrottled = makeThrottle(() => renderSolveBody(), 180);
+
+/* ⑤ 图解辅助：原生 UI 渲染（不走 Markdown）
+   产物格式固定为「**图N：说明** + ![图解](url)」成对出现。
+   解析后渲染成卡片，图片可点击放大。 */
+function parseExtras(text) {
+  if (!text) return [];
+  const items = [];
+  const re = /\*\*(.+?)\*\*[\s\S]*?!\[[^\]]*\]\(([^)]+)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const title = m[1].replace(/\s+/g, ' ').trim();
+    const url = m[2].trim();
+    if (url) items.push({ title: title, url: url });
+  }
+  // 兜底：只有图片没有标题
+  if (!items.length) {
+    const re2 = /!\[[^\]]*\]\(([^)]+)\)/g;
+    while ((m = re2.exec(text)) !== null) items.push({ title: '', url: m[1].trim() });
+  }
+  return items;
+}
+
+function renderExtrasUI(text) {
+  const items = parseExtras(text);
+  if (!items.length) return '<div class="muted">正在生成图解…</div>';
+  return items.map((it, i) => `
+    <div class="extras-card" style="margin:10px 0">
+      ${it.title ? `<div style="font-weight:600;margin-bottom:6px">${esc(it.title)}</div>` : ''}
+      <img src="${esc(it.url)}" alt="图解" loading="lazy"
+           style="width:100%;border-radius:10px;background:#fff;cursor:zoom-in"
+           data-zoom="${esc(it.url)}" />
+    </div>`).join('');
+}
+
+/* 图解图片点击放大 */
+function bindExtrasZoom(root) {
+  (root || document).querySelectorAll('[data-zoom]').forEach((img) => {
+    img.onclick = () => {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:9999;'
+        + 'display:flex;align-items:center;justify-content:center;padding:12px;cursor:zoom-out';
+      const im = document.createElement('img');
+      im.src = img.dataset.zoom;
+      im.style.cssText = 'max-width:100%;max-height:100%;border-radius:8px;background:#fff';
+      ov.appendChild(im);
+      ov.onclick = () => ov.remove();
+      document.body.appendChild(ov);
+    };
+  });
+}
+
+/* ⑥ 多题：把"当前查看题"的桶内容同步到顶层字段，供既有渲染代码复用 */
+function syncFromBuckets() {
+  const q = solveAcc.curQ || 0;
+  const b = (solveAcc.byQ && solveAcc.byQ[q]) || {};
+  solveAcc.steps = b.steps || '';
+  solveAcc.full = b.full || '';
+  solveAcc.extras = b.extras || '';
+  solveAcc.mindmap = b.mindmap || '';
+  solveAcc.info = b.info || {};
+  solveAcc.similar = b.similar || [];
+  solveAcc.quiz = b.quiz || [];
+  solveAcc.quizIdx = b.quizIdx || 0;
+}
+
+/* ⑥ 多题：切换查看的题目 */
+function switchQ(i) {
+  solveAcc.curQ = i;
+  renderSolveBody();
+  renderQuizBox();
+}
+
+/* 🧩 多题选择：服务端发出 question_split 后会阻塞等待选择，客户端必须回传
+   /solve/select_questions，否则要等到 120 秒超时才默认全选（网页端此前完全没处理）。 */
+function renderQuestionSplitPicker(qs) {
+  const host = $('#qSplit'); if (!host) return;
+  const picked = {};
+  qs.forEach((_, i) => { picked[i] = true; });
+  let left = 20;
+  let done = false;
+  host.innerHTML = `
+    <div class="card" id="qSplitCard">
+      <div class="card-title">🧩 检测到 ${qs.length} 道题</div>
+      <div class="muted">勾选要解答的题目（默认全选）；<b id="qSplitLeft">${left}</b> 秒后自动开始</div>
+      <div id="qSplitList" style="margin-top:8px">
+        ${qs.map((q, i) => `<button class="chip qs-item active" data-i="${i}" style="display:block;width:100%;text-align:left;margin:4px 0">第 ${i + 1} 题 · ${esc(String(q).slice(0, 40)).replace(/\n/g, ' ')}…</button>`).join('')}
+      </div>
+      <button class="btn btn-primary btn-block" id="qSplitGo" style="margin-top:10px">开始解答所选题目</button>
+    </div>`;
+  const send = () => {
+    if (done) return;
+    done = true;
+    const idx = Object.keys(picked).filter((k) => picked[k]).map(Number).sort((a, b) => a - b);
+    try { API.selectQuestions(S.activeRequestId, idx.length ? idx : qs.map((_, i) => i)); } catch (e) {}
+    const card = $('#qSplitCard'); if (card) card.remove();
+  };
+  host.querySelectorAll('.qs-item').forEach((b) => {
+    b.onclick = () => {
+      const i = Number(b.dataset.i);
+      picked[i] = !picked[i];
+      b.classList.toggle('active', !!picked[i]);
+    };
+  });
+  const go = $('#qSplitGo'); if (go) go.onclick = send;
+  const timer = setInterval(() => {
+    left -= 1;
+    const el = $('#qSplitLeft'); if (el) el.textContent = String(left);
+    if (left <= 0) { clearInterval(timer); send(); }
+  }, 1000);
+}
+
+/* ⑥ 多题：渲染题目标签栏（仅多题时显示） */
+function renderQTabs() {
+  const bar = $('#qTabs'); if (!bar) return;
+  const order = solveAcc.qOrder || [];
+  if (order.length <= 1) { bar.innerHTML = ''; bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  bar.innerHTML = order.map((qi) => {
+    const active = qi === solveAcc.curQ;
+    const b = (solveAcc.byQ && solveAcc.byQ[qi]) || {};
+    const hasAns = !!(b.full || b.steps);
+    const cls = active ? 'chip qt active' : 'chip qt';
+    return `<button class="${cls}" data-q="${qi}">第 ${qi + 1} 题${hasAns ? ' ✓' : ''}</button>`;
+  }).join('');
+  bar.querySelectorAll('.qt').forEach((btn) => {
+    btn.onclick = () => switchQ(Number(btn.dataset.q));
+  });
+}
 
 function renderAskBox(rid) {
   const box = $('#askBox'); if (!box) return;
@@ -1135,6 +1378,7 @@ function renderHistoryDetail(rec) {
   const st = settings();
   const isAnim = rec.record_type === 'animation';
   const isExt = rec.record_type === 'extension';
+  const isAnno = rec.record_type === 'annotation';
   const extra = (rec.extra_json && typeof rec.extra_json === 'object') ? rec.extra_json : {};
   const parts = isExt ? splitExtension(rec.full_solution || '') : { summary: '', extension: '' };
   let body = '';
@@ -1159,13 +1403,39 @@ function renderHistoryDetail(rec) {
     const qs = Array.isArray(extra.questions) ? extra.questions : [];
     if (qs.length) body += foldCard('💬 延伸思考', '#FFB74D', renderQAList(qs, '❓', '💡'), 'hQ', false);
     if (!parts.summary && !parts.extension && rec.full_solution) body += foldCard('📎 内容', '#7B2FBE', `<div class="md" data-md></div>`, 'hFull', false);
+  } else if (isAnno) {
+    // 【修复】批注记录的 content 就是一张带批注的图片地址（/static/annotations/xxx.png），
+    // 真实标注在 extra_json.annotations。原实现把它归到“完整解析”分支，
+    // 于是历史记录里只看到一串地址。这里改为渲染图片 + 标注说明。
+    const imgUrl = String(rec.full_solution || '').trim();
+    if (imgUrl) {
+      body += `<div class="card"><div class="card-title" style="color:#E53935">🖍️ 批注图片</div>`
+        + `<img class="preview-img" src="${esc(imgUrl)}" alt="AI批注"></div>`;
+    } else {
+      body += `<div class="card"><div class="muted">这条批注记录没有可显示的图片</div></div>`;
+    }
+    const anns = Array.isArray(extra.annotations) ? extra.annotations : [];
+    if (anns.length) {
+      const rows = anns.map((a) => {
+        const t = (a && a.type) || '标注';
+        const txt = (a && (a.text || a.reason)) || '';
+        return `<div class="bubble q">${esc(t)}${txt ? ' · ' + esc(txt) : ''}</div>`;
+      }).join('');
+      body += foldCard('📌 标注说明（共 ' + anns.length + ' 处）', '#E53935', rows, 'hAnno', false);
+    }
   } else {
     if (rec.solution_steps) body += foldCard('📝 解题思路', '#00D2FF', `<div class="md" data-md></div>`, 'hSteps', true);
     if (rec.full_solution) body += foldCard('📝 完整解析', '#7B2FBE', `<div class="md" data-md></div>`, 'hFull', false);
     // 7.5 图解辅助（LaTeX 图形）作为独立模块，历史详情也要有
     if (rec.latex_extras) body += foldCard('📐 图解辅助', '#00BCD4', `<div class="md" data-md></div>`, 'hExtra', false);
-    // 9.1 思维导图用 UI 树形渲染
-    if (rec.mind_map) body += foldCard('🗺️ 思维导图', '#00C853', (mindmapTree(rec.mind_map) || `<div class="muted">思维导图格式无法解析，已按原文显示：</div><pre style="white-space:pre-wrap;font-size:13px">${esc(rec.mind_map)}</pre>`), 'hMind', false);
+    // 9.1 思维导图用 UI 树形渲染；若不是真导图（老记录错位内容）则按 Markdown 正常显示
+    if (rec.mind_map) {
+      if (looksLikeMindmap(rec.mind_map)) {
+        body += foldCard('🗺️ 思维导图', '#00C853', (mindmapTree(rec.mind_map) || `<div class="muted">思维导图格式无法解析，已按原文显示：</div><pre style="white-space:pre-wrap;font-size:13px">${esc(rec.mind_map)}</pre>`), 'hMind', false);
+      } else {
+        body += foldCard('🗺️ 思维导图', '#00C853', `<div class="md" data-md></div>`, 'hMindMd', false);
+      }
+    }
     // 7.4 掌握程度：历史里也要能看到并补记
     body += masteryBoxHtml(rec.mastery_level || '');
   }
@@ -1182,7 +1452,8 @@ function renderHistoryDetail(rec) {
   bindScrollFab();
   const m = {
     hOcr: rec.ocr_text, hSteps: rec.solution_steps, hFull: rec.full_solution,
-    hExtra: rec.latex_extras, hSum: parts.summary, hExt: parts.extension
+    hExtra: rec.latex_extras, hSum: parts.summary, hExt: parts.extension,
+    hMindMd: (rec.mind_map && !looksLikeMindmap(rec.mind_map)) ? rec.mind_map : ''
   };
   Object.keys(m).forEach((id) => {
     const el = $('#hdBody').querySelector('#' + id + ' [data-md]');
@@ -1229,6 +1500,7 @@ function renderReport(v) {
       <div class="row" style="margin-top:12px">
         <button class="btn btn-primary" id="btnData">数据版报告</button>
         <button class="btn btn-ghost" id="btnAi">AI 版报告</button>
+        <button class="btn btn-ghost" id="rptExport">📛 导出报告</button>
       </div>
     </div>
     <div id="reportOut"></div>`;
@@ -1323,6 +1595,24 @@ function renderReport(v) {
     } catch (e) {
       if (!acc) out.innerHTML = `<div class="card"><div class="muted" style="color:#FF9800">生成失败：${esc(e.message)}</div></div>`;
     }
+  };
+
+  // 📛 总体页导出：优先导出已生成的 AI 报告文本
+  const rptExp = $('#rptExport');
+  if (rptExp) rptExp.onclick = async () => {
+    const aiEl = $('#aiRep');
+    const content = (aiEl && aiEl.innerText.trim()) ? aiEl.innerText.trim() : '';
+    if (!content) { toast("请先生成报告再导出"); return; }
+    overlay("正在导出…");
+    try {
+      const r = await API.exportDoc("学习报告", content, "word");
+      overlay(false);
+      if (!r || r.status !== "ok") { toast((r && r.message) || "导出失败"); return; }
+      const a = document.createElement("a");
+      a.href = r.url; a.download = "";
+      document.body.appendChild(a); a.click(); a.remove();
+      toast("导出完成，已开始下载");
+    } catch (e) { overlay(false); toast("导出失败：" + e.message); }
   };
 }
 
@@ -1447,7 +1737,7 @@ function renderSettings(v) {
 
     <div class="card">
       <div class="card-title">ℹ️ 关于</div>
-      <div class="muted">学习助手 学生端（网页版）v2.1.2<br>服务端：${location.host || '本机'}</div>
+      <div class="muted">学习助手 学生端（网页版）v3.0.0<br>服务端：${location.host || '本机'}</div>
       <div class="row" style="margin-top:10px">
         <button class="btn btn-ghost" id="btnGuide">📖 使用说明</button>
         <button class="btn btn-ghost" id="btnPrivacy">🔒 隐私政策</button>
@@ -1693,7 +1983,7 @@ function showReportIssue() {
       method: 'POST',
       body: JSON.stringify({
         description: desc,
-        version: '2.1.2-web',
+        version: '3.0.0-web',
         page: location.href,
         user_agent: navigator.userAgent,
       })

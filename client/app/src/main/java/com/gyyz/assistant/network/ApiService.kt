@@ -13,7 +13,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 
-class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
+class ApiService(private var BASE_URL: String = "http://121.199.23.213:8000") {
 
     companion object {
         private const val PREFS_NAME = "learning_assistant_prefs"
@@ -28,6 +28,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         // ②④十一⑦ 新增设置
         private const val KEY_ANSWER_STYLE = "answer_style"
         private const val KEY_SEARCH_ENABLED = "search_enabled"
+    private const val KEY_INTERACTIVE_QUIZ = "interactive_quiz"
         private const val KEY_THINKING_ENABLED = "thinking_enabled"
     private const val KEY_LATEX_HELPER = "latex_helper"
         private const val KEY_THEME_MODE = "theme_mode"
@@ -53,16 +54,52 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         // 服务端地址：优先用户已保存的地址，其次 assets/server_ip.txt（随项目 server_ip.txt 打包），最后默认值
         val saved = sharedPreferences?.getString(KEY_SERVER_ADDRESS, null)
         if (!saved.isNullOrEmpty()) {
-            BASE_URL = saved
+            // 🔁 自动纠偏：若保存的是内网地址（10.x / 192.168.x / 172.16-31.x），
+            //    而当前默认地址已是公网，则升级为默认地址。
+            //    否则老设备会永远卡在过时的内网地址上（换网/出门即失效）。
+            BASE_URL = if (isLanAddress(saved) && !isLanAddress(defaultBaseUrl(context))) {
+                val upgraded = defaultBaseUrl(context)
+                sharedPreferences?.edit()?.putString(KEY_SERVER_ADDRESS, upgraded)?.apply()
+                upgraded
+            } else {
+                saved
+            }
         } else {
-            val assetIp = try {
-                context.assets.open("server_ip.txt").bufferedReader().use { it.readText() }.trim()
-            } catch (e: Exception) {
-                ""
+            BASE_URL = defaultBaseUrl(context)
+        }
+    }
+
+    /**
+     * 读取打包在 assets/server_ip.txt 的默认地址；缺失时回退到类默认值。
+     */
+    private fun defaultBaseUrl(context: Context): String {
+        val assetIp = try {
+            context.assets.open("server_ip.txt").bufferedReader().use { it.readText() }.trim()
+        } catch (e: Exception) {
+            ""
+        }
+        return if (assetIp.isNotEmpty()) {
+            if (assetIp.startsWith("http")) assetIp else "http://$assetIp"
+        } else {
+            BASE_URL
+        }
+    }
+
+    /**
+     * 判断是否内网/局域网地址。
+     * 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16
+     */
+    private fun isLanAddress(url: String): Boolean {
+        val host = url.removePrefix("http://").removePrefix("https://")
+            .substringBefore("/").substringBefore(":")
+        return when {
+            host.startsWith("10.") -> true
+            host.startsWith("192.168.") -> true
+            host.startsWith("172.") -> {
+                val second = host.split(".").getOrNull(1)?.toIntOrNull() ?: -1
+                second in 16..31
             }
-            if (assetIp.isNotEmpty()) {
-                BASE_URL = if (assetIp.startsWith("http")) assetIp else "http://$assetIp"
-            }
+            else -> false
         }
     }
 
@@ -131,6 +168,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     // ② 回答风格 formal(正式)/encouraging(鼓励)/humorous(幽默)（④⑦十一 相关请求头）
     var answerStyle: String = "formal"
     var searchEnabled: Boolean = true
+    /** ⑤ 边解答边设问：开启后解题过程中插入小问（对应 X-Interactive-Quiz 头） */
+    var interactiveQuiz: Boolean = false
     var thinkingMode: String = "off"        // 十一 思考模式：off / on / auto（auto按难度）
     var latexHelper: String = "auto"       // 图解辅助：off / on / auto（auto: 数学/物理且较难/难）
     var themeMode: String = "system"       // system / light / dark（纯客户端，不发服务器）
@@ -143,6 +182,55 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     /**
      * 为任意请求追加认证头 + AI模型头（统一入口）
      */
+    /**
+     * 统一解析"启动解题"类响应。
+     *
+     * 服务端失败时返回 {"status":"error","code":401,"message":"..."}，不含 request_id。
+     * 以前直接 getString("request_id") 会抛 JSONException，用户只看到
+     * "No value for request_id"，无从判断是登录过期还是别的问题。
+     */
+    /**
+     * 解析 JSON 响应；若响应不是 JSON（常见于公共 WiFi 的强制认证门户
+     * 把请求劫持成 HTML 登录页），转为用户可以照着做的提示。
+     */
+    private fun parseJsonOrExplain(body: String): JSONObject {
+        val trimmed = body.trimStart()
+        if (trimmed.startsWith("<")) {
+            // 典型的强制门户 / 网关错误页
+            throw Exception(
+                "当前网络需要先登录认证（检测到网页登录页）。\n" +
+                    "请先用浏览器打开任意网页完成 WiFi 登录，或切换到移动数据后重试。"
+            )
+        }
+        if (trimmed.isEmpty()) {
+            throw Exception("服务器没有返回内容，请稍后重试")
+        }
+        return try {
+            JSONObject(trimmed)
+        } catch (e: Exception) {
+            throw Exception("服务器返回了无法识别的内容，请检查网络或稍后重试")
+        }
+    }
+
+    private fun parseSolveResponse(json: JSONObject): String {
+        // 1) 未登录 / 无权限：给出明确提示
+        val code = json.optInt("code", 0)
+        val status = json.optString("status", "")
+        if (code == 401 || code == 403) {
+            throw Exception(json.optString("message").ifBlank { "登录已过期，请重新登录" })
+        }
+        if (status == "error") {
+            throw Exception(
+                json.optString("message").ifBlank { json.optString("detail").ifBlank { "解题失败" } }
+            )
+        }
+        // 2) 正常情况：取 request_id（缺失也要给可读提示）
+        if (!json.has("request_id") || json.isNull("request_id")) {
+            throw Exception(json.optString("message").ifBlank { "服务端未返回任务号，请稍后重试" })
+        }
+        return json.getString("request_id")
+    }
+
     private fun Request.Builder.withAuth(): Request.Builder {
         authToken?.let { addHeader("Authorization", "Bearer $it") }
         addHeader("X-Engine", llmProvider)
@@ -156,6 +244,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         if (latexHelper == "on") addHeader("X-Latex-Helper", "1")
         else if (latexHelper == "auto") addHeader("X-Latex-Helper", "auto")
         if (!searchEnabled) addHeader("X-Search-Enabled", "0")
+        // ⑤ 边解答边设问：仅开启时发送该头（服务端默认关闭）
+        if (interactiveQuiz) addHeader("X-Interactive-Quiz", "1")
         // 中文值需 URL 编码，否则 OkHttp 报 "Unexpected char"（HTTP 头仅允许 ASCII）
         // 方言：非普通话才发送（以前要选“方言风格”才发，导致选了方言不生效）
         if (dialect.isNotEmpty() && dialect != "普通话") addHeader("X-Dialect", java.net.URLEncoder.encode(dialect, "UTF-8"))
@@ -189,6 +279,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         visionModel = sharedPreferences?.getString(KEY_VISION_MODEL, "") ?: ""
         answerStyle = sharedPreferences?.getString(KEY_ANSWER_STYLE, "formal") ?: "formal"
         searchEnabled = sharedPreferences?.getBoolean(KEY_SEARCH_ENABLED, true) ?: true
+        interactiveQuiz = sharedPreferences?.getBoolean(KEY_INTERACTIVE_QUIZ, false) ?: false
         // 十一 思考模式：新版存字符串 off/on/auto；兼容旧版 bool（直接按原始类型取，避免 getString 转换抛 ClassCastException）
         var tm: String? = null
         try {
@@ -214,19 +305,21 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
     /**
      * 持久化 ②④⑦十一 扩展设置（风格/搜题/思考模式/主题）
      */
-    fun saveExtraSettings(style: String, search: Boolean, thinking: String, theme: String, latexHelper: String = "auto") {
+    fun saveExtraSettings(style: String, search: Boolean, thinking: String, theme: String, latexHelper: String = "auto", interactiveQuiz: Boolean = false) {
         sharedPreferences?.edit()
             ?.putString(KEY_ANSWER_STYLE, style)
             ?.putBoolean(KEY_SEARCH_ENABLED, search)
             ?.putString(KEY_THINKING_ENABLED, thinking)
             ?.putString(KEY_THEME_MODE, theme)
             ?.putString(KEY_LATEX_HELPER, latexHelper)
+            ?.putBoolean(KEY_INTERACTIVE_QUIZ, interactiveQuiz)
             ?.apply()
         answerStyle = style
         searchEnabled = search
         thinkingMode = thinking
         themeMode = theme
         this.latexHelper = latexHelper
+        this.interactiveQuiz = interactiveQuiz
     }
 
     /** 持久化 ⑧ 人格/详细度/学科 */
@@ -274,11 +367,34 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: throw Exception("Empty response")
             val json = JSONObject(body)
-            json.getString("request_id")
+            parseSolveResponse(json)
         }
     }
 
-    /** ⑧ 文字输入解题：跳过OCR与分题 */
+    /** 📷 多页拍摄（多图版）：一次上传多张页面图，服务端逐页 OCR 后合并分题 */
+    suspend fun startSolveMultipageImages(images: List<ByteArray>): String {
+        return withContext(Dispatchers.IO) {
+            val builder = MultipartBody.Builder().setType(MultipartBody.FORM)
+            images.forEachIndexed { i, bytes ->
+                builder.addFormDataPart(
+                    "files", "page_${i + 1}.jpg",
+                    bytes.toRequestBody("image/jpeg".toMediaType())
+                )
+            }
+            val request = Request.Builder()
+                .url("$BASE_URL/solve/multipage-images")
+                .post(builder.build())
+                .withAuth()
+                .build()
+
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: throw Exception("Empty response")
+            val json = JSONObject(body)
+            parseSolveResponse(json)
+        }
+    }
+
+    /** ⑧ 文字输入解题：跳过OCR和分题 */
     suspend fun startSolveText(text: String): String {
         return withContext(Dispatchers.IO) {
             val json = JSONObject().put("text", text)
@@ -291,9 +407,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: throw Exception("Empty response")
             val respJson = JSONObject(body)
-            val status = respJson.optString("status", "")
-            if (status == "error") throw Exception(respJson.optString("message", "文字解题失败"))
-            respJson.getString("request_id")
+            parseSolveResponse(respJson)
         }
     }
     
@@ -451,8 +565,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val request = Request.Builder().url("$BASE_URL/extend/text").post(body).withAuth().build()
             val response = client.newCall(request).execute()
             val respJson = JSONObject(response.body?.string() ?: "{}")
-            if (respJson.optString("status") == "error") throw Exception(respJson.optString("message", "提交失败"))
-            respJson.optString("request_id")
+            parseSolveResponse(respJson)
         }
     }
 
@@ -578,7 +691,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: throw Exception("Empty response")
             val json = JSONObject(body)
-            json.getString("request_id")
+            parseSolveResponse(json)
         }
     }
 
@@ -594,6 +707,34 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
             if (!response.isSuccessful) {
                 throw Exception("清除历史记录失败: ${response.code}")
             }
+        }
+    }
+
+    /** 📣 上报问题：提交描述 + 环境信息（不消耗 AI 额度、不受权限限制） */
+    suspend fun reportIssue(description: String, version: String = "3.0.0"): Boolean {
+        return withContext(Dispatchers.IO) {
+            val payload = JSONObject().apply {
+                put("description", description)
+                put("version", version)
+                put("page", "android")
+                put(
+                    "user_agent",
+                    "Android ${android.os.Build.VERSION.RELEASE} / ${android.os.Build.MODEL}"
+                )
+            }
+            val request = Request.Builder()
+                .url("$BASE_URL/report-issue")
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .withAuth()
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                throw Exception("提交失败: ${response.code}")
+            }
+            val body = response.body?.string() ?: ""
+            val obj = runCatching { JSONObject(body) }.getOrNull()
+            obj?.optString("status") == "ok"
         }
     }
 
@@ -697,6 +838,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
                     fullSolution = obj.optString("full_solution"),
                     imageUrl = obj.optString("image_url", ""),
                     masteryLevel = obj.optString("mastery_level", ""),
+                    mindMap = obj.optString("mind_map", ""),
+                    latexExtras = obj.optString("latex_extras", ""),
                 )
             }
             HistoryResult(
@@ -723,6 +866,8 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
         val fullSolution: String = "",
         val imageUrl: String = "",
         val masteryLevel: String = "",
+        val mindMap: String = "",
+        val latexExtras: String = "",
     )
 
     data class AuthResult(val token: String, val user: AuthUser)
@@ -745,7 +890,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: throw Exception("Empty response")
-            val respJson = JSONObject(body)
+            val respJson = parseJsonOrExplain(body)
             if (respJson.optString("status") != "ok") {
                 throw Exception(respJson.optString("detail", "注册失败"))
             }
@@ -783,7 +928,7 @@ class ApiService(private var BASE_URL: String = "http://10.100.55.231:8000") {
 
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: throw Exception("Empty response")
-            val respJson = JSONObject(body)
+            val respJson = parseJsonOrExplain(body)
             if (respJson.optString("status") != "ok") {
                 throw Exception(respJson.optString("detail", "登录失败"))
             }

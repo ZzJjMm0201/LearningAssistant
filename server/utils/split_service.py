@@ -85,7 +85,10 @@ def split_by_model(ocr_text: str, ai_service, engine: Optional[str] = None, mode
         + ocr_text
     )
     try:
-        resp = ai_service.generate_response(prompt, engine=engine, model=model) if hasattr(ai_service, "generate_response") else None
+        resp = ai_service.generate_response(
+                prompt, engine=engine, model=model,
+                system="你是题目切分助手。只输出 JSON，不要任何解释文字。",
+            )
         if not resp:
             return [ocr_text]
         import re, json as _json
@@ -145,21 +148,23 @@ def _apply_splits(ocr_text: str, splits: List[dict]) -> List[str]:
 
 
 def split_questions(ocr_text: str, ocr_source: str = "", ai_service=None, engine: Optional[str] = None, model: Optional[str] = None) -> List[str]:
-    """统一分题入口（结果统一过一遍 merge_related：跨栏/同篇阅读/同一大题 视为一题）"""
+    """统一分题入口：完全信任 AI 给出的题目边界（视觉用 %%%、Paddle 用 LLM 锚点），
+    程序不再做二次合并。跨栏/同篇阅读/同一大题的判定由 OCR 提示词约束 AI。
+    （merge_related 仍保留定义，供需要时调用。）"""
     if not ocr_text or not ocr_text.strip():
         return []
-    # 视觉模型：直接按 %%%
+    # 视觉模型：AI 已用 %%% 明确标注独立题边界，直接采用
     if "vision" in ocr_source or "%%%" in ocr_text:
         parts = split_by_separator(ocr_text)
         if len(parts) > 1:
-            return merge_related(parts)
-    # Paddle / 无分隔：优先 %%%，否则 LLM
+            return parts
+    # Paddle：无分隔符时交由 LLM 识别边界
     if "%%%" in ocr_text:
         parts = split_by_separator(ocr_text)
         if len(parts) > 1:
-            return merge_related(parts)
+            return parts
     if ai_service is not None:
         parts = split_by_model(ocr_text, ai_service, engine, model)
         if len(parts) > 1:
-            return merge_related(parts)
+            return parts
     return [ocr_text]

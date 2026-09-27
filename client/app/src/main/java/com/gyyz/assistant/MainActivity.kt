@@ -147,7 +147,12 @@ sealed class AppState {
             val suggestedQuestions: List<QAItem> = emptyList(),
             val summaryStreaming: Boolean = false,
             val extensionStreaming: Boolean = false,
-            val imageUrl: String = ""
+            val imageUrl: String = "",
+            // ⑤ 知识延伸也支持继续追问：需要会话标识与问答记录
+            val sessionId: String = "",
+            val qaList: List<QAItem> = emptyList(),
+            val pendingAnswer: String = "",
+            val isAnswering: Boolean = false
     ) : AppState()
 }
 
@@ -629,6 +634,18 @@ class MainViewModel : ViewModel() {
         showQuestionSelectDialog.value = false
         // ② 按实际选中数量更新，选中1题时不显示顶部切换器（服务端也会按单题处理）
         multiQuestionCount.value = indices.size
+        // 预填每题槽位：保证用户可立即切换到任意一题（切换时读到占位状态而非空白）
+        val slotCount = if (indices.isNotEmpty()) indices.size else 0
+        if (slotCount > 0) {
+            multiSolveStates.value = List(slotCount) {
+                AppState.Solving(
+                    stage = SolveStage.ANALYZING,
+                    requestId = rid,
+                    ocrText = multiQuestionTexts.value.getOrElse(it) { "" }
+                )
+            }
+            currentQuestionIndex.value = 0
+        }
         if (rid.isNotEmpty()) {
             viewModelScope.launch(Dispatchers.IO) {
                 try {
@@ -691,6 +708,50 @@ class MainViewModel : ViewModel() {
     fun onPhotoError(error: String) {
         _statusText.value = "拍照失败: $error"
         _appState.value = AppState.Tracking
+    }
+
+    /** 📷 多页拍摄（多图版）：一次提交多张已拍好的页面图 */
+    fun solveMultipageImages(files: List<java.io.File>) {
+        if (files.isEmpty()) {
+            _statusText.value = "没有可提交的页面"
+            return
+        }
+        cancelCurrentSSE = false
+        masteryVisible.value = false
+        masterySaved.value = false
+        masteryLevel.value = ""
+        solveSearchResults.value = emptyList()
+        solveQuestionInfo.value = emptyMap()
+        solveThinkingText.value = ""
+        solvingThinkingVisible.value = false
+        aiUsage.value = emptyMap()
+        multiQuestionCount.value = 0
+        multiQuestionTexts.value = emptyList()
+        currentQuestionIndex.value = 0
+        multiSolveStates.value = emptyList()
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+                    _statusText.value = "正在上传 ${files.size} 页..."
+                }
+                val bytes = files.map { it.readBytes() }
+                val requestId = apiService.startSolveMultipageImages(bytes)
+                currentSolvingRequestId.value = requestId
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.ANALYZING)
+                    _statusText.value = "正在逐页识别并分析..."
+                }
+                connectAndReceiveSSE(requestId)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "多页解题失败: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "多页解题失败: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
     }
 
     // ⑧ 文字输入解题：跳过OCR与分题，直接提交文本解题
@@ -780,6 +841,7 @@ class MainViewModel : ViewModel() {
             var lastSolutionUpdate = 0L
             var lastStepsUpdate = 0L
             var lastMindmapUpdate = 0L
+            var lastLatexUpdate = 0L
 
             fun cur(key: Int): Int = if (key >= 0) key else 0
 
@@ -790,8 +852,11 @@ class MainViewModel : ViewModel() {
                     while (list.size <= qiKey) list.add(AppState.Solving(stage = SolveStage.ANALYZING, requestId = requestId, ocrText = ocrMap[qiKey] ?: ""))
                     list[qiKey] = s
                     multiSolveStates.value = list
-                    currentQuestionIndex.value = qiKey
-                    _appState.value = s
+                    // 方案A：不修改 currentQuestionIndex，避免各题并发时互相抢页；
+                    // 只有正在查看的那道题才刷新界面。
+                    if (currentQuestionIndex.value == qiKey) {
+                        _appState.value = s
+                    }
                 } else {
                     _appState.value = s
                 }
@@ -998,6 +1063,28 @@ class MainViewModel : ViewModel() {
                                             }
                                         }
                                     }
+                                    "latex_chunk" -> {
+                                        // ②A 边生成边显示图解内容（服务端流式推送），
+                                        // 避免只能等到最后的 latex_extras_rendered 才出现。
+                                        val chunk = json.optString("content", "")
+                                        if (chunk.isNotEmpty()) {
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastLatexUpdate >= 100) {
+                                                lastLatexUpdate = now
+                                                val cur = (latexExtrasMap[cur(qiKey)] ?: "") + chunk
+                                                latexExtrasMap[cur(qiKey)] = cur
+                                                emit(qiKey, AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_FULL,
+                                                        requestId = requestId,
+                                                        ocrText = ocrMap[cur(qiKey)] ?: "",
+                                                        solutionSteps = stepsMap[cur(qiKey)] ?: "",
+                                                        fullSolution = fullMap[cur(qiKey)] ?: "",
+                                                        mindMap = mindMapMap[cur(qiKey)] ?: "",
+                                                        latexExtras = cur
+                                                ))
+                                            }
+                                        }
+                                    }
                                     "mindmap_chunk" -> {
                                         val chunk = json.optString("content", "")
                                         if (chunk.isNotEmpty()) {
@@ -1030,7 +1117,8 @@ class MainViewModel : ViewModel() {
                                                 solutionSteps = stepsMap[cur(qiKey)] ?: "",
                                                 fullSolution = fullMap[cur(qiKey)] ?: "",
                                                 latexExtras = latexExtrasMap[cur(qiKey)] ?: "",
-                                                mindMap = mm
+                                                mindMap = mm,
+                                                mindmapStreaming = false
                                         ))
                                     }
                                     "suggested_questions" -> {
@@ -1686,6 +1774,23 @@ class MainViewModel : ViewModel() {
     val showSettingsDialog = MutableStateFlow(false)
     val showWelcomeDialog = MutableStateFlow(true)
     val showHistoryScreen = MutableStateFlow(false)
+    // 第四轮补充：隐私政策 / 上报问题弹窗
+    val showPrivacyDialog = MutableStateFlow(false)
+    val showReportIssueDialog = MutableStateFlow(false)
+    val reportIssueSubmitting = MutableStateFlow(false)
+    val reportIssueHint = MutableStateFlow("")
+    // 📷 多页拍摄：连拍界面与已拍页面
+    val showMultipageCapture = MutableStateFlow(false)
+    val multipageFiles = MutableStateFlow<List<java.io.File>>(emptyList())
+    // 📲 多页拍摄：标记"相机快门结果应归入多页列表"，以及拍照触发回调
+    val multipageCapturing = MutableStateFlow(false)
+    var onMultipageCapture: (() -> Unit)? = null
+
+    /** 📲 追加一页到多页列表 */
+    fun appendMultipagePage(file: java.io.File) {
+        multipageFiles.value = multipageFiles.value + file
+        _statusText.value = "已拍 ${multipageFiles.value.size} 页"
+    }
 
     val gestureEnabled = MutableStateFlow(false)
     val voiceEnabled = MutableStateFlow(false)
@@ -1694,7 +1799,7 @@ class MainViewModel : ViewModel() {
     val showGestureCountdown = MutableStateFlow(false)
     val gesturePendingAction = MutableStateFlow("")   // solve/animation/extend/3/2
     private var gestureDebounceUntil = 0L
-    val serverAddress = MutableStateFlow("10.100.55.231:8000")
+    val serverAddress = MutableStateFlow("121.199.23.213:8000")
     val themeColor = MutableStateFlow(Color(0xFF00D2FF))
     val fontSize = MutableStateFlow(16f)
 
@@ -1739,6 +1844,7 @@ class MainViewModel : ViewModel() {
     // ②④⑦十一⑧ 设置项（持久化到 ApiService）
     val answerStyle = MutableStateFlow("formal")
     val searchEnabled = MutableStateFlow(true)
+    val interactiveQuiz = MutableStateFlow(false)   // ⑤ 边解答边设问
     val thinkingMode = MutableStateFlow("off")   // off / on / auto
     val latexHelper = MutableStateFlow("auto")   // 图解辅助 off / on / auto
     val themeMode = MutableStateFlow("system")   // system / light / dark
@@ -1753,7 +1859,8 @@ class MainViewModel : ViewModel() {
     fun saveExtraSettings() {
         apiService.saveExtraSettings(
             answerStyle.value, searchEnabled.value,
-            thinkingMode.value, themeMode.value, latexHelper.value
+            thinkingMode.value, themeMode.value, latexHelper.value,
+            interactiveQuiz.value
         )
     }
 
@@ -1810,6 +1917,33 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    /** 📣 上报问题：提交描述（不消耗 AI 额度、不受权限限制） */
+    fun submitReportIssue(description: String) {
+        if (reportIssueSubmitting.value) return
+        reportIssueSubmitting.value = true
+        reportIssueHint.value = "提交中…"
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val ok = apiService.reportIssue(description, version = "3.0.0")
+                withContext(Dispatchers.Main) {
+                    reportIssueSubmitting.value = false
+                    if (ok) {
+                        reportIssueHint.value = ""
+                        showReportIssueDialog.value = false
+                        _statusText.value = "已提交，感谢反馈！"
+                    } else {
+                        reportIssueHint.value = "提交失败，请稍后重试"
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    reportIssueSubmitting.value = false
+                    reportIssueHint.value = "提交失败：${e.message}"
+                }
+            }
+        }
+    }
+
     var onButtonTakePhoto: (() -> Unit)? = null
     var onButtonAnimation: (() -> Unit)? = null
     var onButtonExtend: (() -> Unit)? = null
@@ -1839,6 +1973,13 @@ class MainViewModel : ViewModel() {
         if (requireLoginToast()) return
         _statusText.value = "正在拍照..."
         onButtonTakePhoto?.invoke()
+    }
+
+    /** 📷 多页拍摄：进入连拍界面（一次拍多页 → 一起上传） */
+    fun startMultipageCapture() {
+        multipageFiles.value = emptyList()
+        multipageCapturing.value = true
+        showMultipageCapture.value = true
     }
 
     fun onButtonAnimation() {
@@ -2057,6 +2198,13 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // 番茄钟“📷 拍照上传 AI 推荐时长”：相机直拍（不走相册）
+                // 📲 多页拍摄：快门结果归入多页列表
+                viewModel.onMultipageCapture = {
+                    requireCamera("multipage") { capture ->
+                        takePhotoAndUpload(capture, viewModel)
+                    }
+                }
+
                 viewModel.onPomodoroCapture = {
                     requireCamera("pomodoroAi") { capture ->
                         takePhotoForPomodoro(this@MainActivity, capture, viewModel)
@@ -2149,7 +2297,12 @@ class MainActivity : ComponentActivity() {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     mainHandler.removeCallbacks(timeoutRunnable)
                     Log.d(TAG, "照片已保存: ${photoFile.absolutePath}")
-                    viewModel.onPhotoReady(photoFile)
+                    // 📲 多页拍摄模式：仅收集页面，不立刻解题
+                    if (viewModel.multipageCapturing.value) {
+                        viewModel.appendMultipagePage(photoFile)
+                    } else {
+                        viewModel.onPhotoReady(photoFile)
+                    }
                 }
 
                 override fun onError(exception: ImageCaptureException) {
@@ -2489,6 +2642,34 @@ fun MainScreen(
             SettingsDialog(
                     viewModel = viewModel,
                     onDismiss = { viewModel.showSettingsDialog.value = false }
+            )
+        }
+
+        // 第四轮补充：隐私政策 / 上报问题
+        val showPrivacy by viewModel.showPrivacyDialog.collectAsState()
+        if (showPrivacy) {
+            PrivacyPolicyDialog(onDismiss = { viewModel.showPrivacyDialog.value = false })
+        }
+
+        val showReportIssue by viewModel.showReportIssueDialog.collectAsState()
+        val issueSubmitting by viewModel.reportIssueSubmitting.collectAsState()
+        val issueHint by viewModel.reportIssueHint.collectAsState()
+        if (showReportIssue) {
+            ReportIssueDialog(
+                    submitting = issueSubmitting,
+                    hint = issueHint,
+                    version = "3.0.0",
+                    onSubmit = { desc -> viewModel.submitReportIssue(desc) },
+                    onDismiss = { viewModel.showReportIssueDialog.value = false }
+            )
+        }
+
+        // 📷 多页拍摄（连拍界面）
+        val showMultipage by viewModel.showMultipageCapture.collectAsState()
+        if (showMultipage) {
+            MultipageCaptureDialog(
+                    viewModel = viewModel,
+                    onDismiss = { viewModel.showMultipageCapture.value = false }
             )
         }
 
@@ -3811,19 +3992,43 @@ private val MIND_COLORS = listOf(
 private fun parseMindTree(text: String): List<Pair<Int, String>> {
     val out = mutableListOf<Pair<Int, String>>()
     if (text.isBlank()) return out
-    // 若 AI 包了 ``` 围栏，先去掉首尾
-    var t = text.replace("```", "")
-    val lines = t.split("\n")
-    for (raw in lines) {
+    // 若 AI 包了 ``` 围栏，先去围栏
+    val t = text.replace("```", "")
+
+    // ⑧ 层级判定：服务端要求的格式用 └── / ├── 连接符表示层级，
+    //    连接符常在行首（无前导空格），仅看空格数会把所有节点压成同一级。
+    //    这里以「连接符层级」为主、空格缩进为辅，两者取较大者。
+    val branchRe = Regex("^[\\s│]*[├└]")
+    var lastBranchLevel = -1
+    for (raw in t.split("\n")) {
         val line = raw.trimEnd()
-        if (line.isBlank()) { continue }
-        // 计算缩进层级：以每 2 个空格为一档，树符号也算前级并抹掉
-        var level = 0
+        if (line.isBlank()) continue
+
+        // 行首空格数
         var idx = 0
-        while (idx < line.length && (line[idx] == ' ')) { level += (if (line[idx] == ' ') 1 else 0); idx++ }
-        // 树形连字符前缀（├ └ │ ─）不占内容，但它们出现在最前（缩进后）——把整体缩进统一成“空格数/2 向上取整”档
-        level = (idx / 2).coerceAtLeast(0)
-        var body = line.substring(idx).trimStart('│', '├', '└', '━', '─', '┌', '┐', '│', ' ')
+        while (idx < line.length && line[idx] == ' ') idx++
+        val spaceLevel = idx / 2
+
+        val rest = line.substring(idx)
+        // 是否带树形连接符（├ └）；│ 只作缩进参考
+        val head = rest.takeWhile { it == '│' || it == ' ' }
+        val hasBranch = rest.length > head.length &&
+                (rest[head.length] == '├' || rest[head.length] == '└')
+        val barDepth = head.count { it == '│' }
+
+        var level = spaceLevel
+        if (hasBranch) {
+            // 连接符层级：竖线数量 + 1（有连接符即至少比根深一层）
+            val branchLevel = barDepth + 1
+            level = maxOf(branchLevel, spaceLevel)
+            lastBranchLevel = branchLevel
+        } else if (lastBranchLevel >= 0 && spaceLevel > 0) {
+            // 无连接符但有缩进的续行
+            level = maxOf(spaceLevel, lastBranchLevel)
+        }
+
+        // 抹掉连接符与空白，取出正文
+        var body = rest.trimStart('│', '├', '└', '┌', '┐', '┬', '┴', '─', ' ')
         body = body.trim().trim('─').trimStart('─').trim()
         if (body.isEmpty()) continue
         out.add(Pair(level, body))
@@ -4901,12 +5106,96 @@ private fun rewriteLatexImageForDark(content: String): String {
     }
 }
 
+/**
+ * ④ 把 \ce{...} 转成可读的化学式文本。
+ *
+ * 支持嵌套花括号（Fe^{3+}、SO4^{2-}、CH3COO^{-} 等常见离子写法），
+ * 并把 ^{...} / _{...} 转为上标数字，保证在 JLatexMath 之外也能正确显示。
+ * 旧实现用 [^{}]* 正则，遇到嵌套即失败，导致界面残留裸 \ce。
+ */
+private fun replaceCeCommand(input: String): String {
+    if (!input.contains("\\ce")) return input
+    val sb = StringBuilder()
+    var i = 0
+    while (i < input.length) {
+        val idx = input.indexOf("\\ce", i)
+        if (idx < 0) {
+            sb.append(input, i, input.length)
+            break
+        }
+        sb.append(input, i, idx)
+        var j = idx + 3
+        while (j < input.length && input[j].isWhitespace()) j++
+        if (j >= input.length || input[j] != '{') {
+            sb.append(input, idx, minOf(j, input.length))
+            i = j
+            continue
+        }
+        // 平衡花括号扫描
+        var depth = 0
+        var k = j
+        var end = -1
+        while (k < input.length) {
+            when (input[k]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) { end = k; break }
+                }
+            }
+            k++
+        }
+        if (end < 0) {
+            sb.append(input, idx, input.length)
+            break
+        }
+        val inner = input.substring(j + 1, end)
+        sb.append(simplifyChem(inner))
+        i = end + 1
+    }
+    return sb.toString()
+}
+
+/** 化学式美化：^{...} -> 上标数字，_{...} -> 下标数字，箭头等符号中文化 */
+private fun simplifyChem(s: String): String {
+    var t = s
+    // 上下标：^{2-} / _{2} 等
+    t = Regex("""\^\{([^{}]*)\}""").replace(t) { m -> toSuperscript(m.groupValues[1]) }
+    t = Regex("""_\{([^{}]*)\}""").replace(t) { m -> toSubscript(m.groupValues[1]) }
+    t = Regex("""\^([0-9+\-])""").replace(t) { m -> toSuperscript(m.groupValues[1]) }
+    t = Regex("""_([0-9])""").replace(t) { m -> toSubscript(m.groupValues[1]) }
+    // 箭头与常见符号
+    t = t.replace("<=>", "⇌").replace("<->", "↔")
+    t = t.replace("->", "→").replace("<-", "←")
+    return t
+}
+
+private val SUPERSCRIPTS = mapOf(
+    '0' to '⁰', '1' to '¹', '2' to '²', '3' to '³', '4' to '⁴',
+    '5' to '⁵', '6' to '⁶', '7' to '⁷', '8' to '⁸', '9' to '⁹',
+    '+' to '⁺', '-' to '⁻', 'n' to 'ⁿ'
+)
+
+private val SUBSCRIPTS = mapOf(
+    '0' to '₀', '1' to '₁', '2' to '₂', '3' to '₃', '4' to '₄',
+    '5' to '₅', '6' to '₆', '7' to '₇', '8' to '₈', '9' to '₉',
+    '+' to '₊', '-' to '₋'
+)
+
+private fun toSuperscript(s: String): String =
+    s.map { SUPERSCRIPTS[it] ?: it }.joinToString("")
+
+private fun toSubscript(s: String): String =
+    s.map { SUBSCRIPTS[it] ?: it }.joinToString("")
+
 private fun prepareMarkdownContent(content: String): String {
     if (content.isEmpty()) return ""
     var processed = content
     // 处理 JLatexMath 不支持的命令，转成可读形式（\ce 化学方程式、\mathrm 字体包裹、rac 分数等）
     // \ce{...}（mhchem 化学方程式）→ 内容
-    processed = processed.replace(Regex("""\\ce\s*\{([^{}]*)\}""")) { m -> m.groupValues[1] }
+    // ④ 注意：化学式常含嵌套花括号（如 \ce{Fe^{3+}}、\ce{SO4^{2-}}），
+    //    普通正则 [^{}]* 会匹配失败导致界面残留裸 \ce，故用平衡括号扫描。
+    processed = replaceCeCommand(processed)
     // 字体包裹命令 \mathrm{}/\mathbf{}/	ext{}/oldsymbol{}/\mathsf{}/\mathit{} → 内容
     processed = processed.replace(Regex("""\\(?:mathrm|mathbf|boldsymbol|text|mathsf|mathit|qquad|quad|hspace\*?\{[^{}]*\})\s*\{([^{}]*)\}""")) { m -> m.groupValues[1] }
     // 分数 rac{a}{b}/\dfrac{a}{b}/	frac{a}{b} → (a/b)
@@ -5291,6 +5580,7 @@ fun MainMenuScreen(
                 FunctionButtonData("📎 知识延伸", "伸出1根手指", Color(0xFF00BCD4), { viewModel.onButtonExtend() }),
                 FunctionButtonData("🖍️ AI批注", "像老师一样批改", Color(0xFFE91E63), { viewModel.onButtonAnnotation() }),
                 FunctionButtonData("📋 历史记录", "点击查看", Color(0xFF795548), { viewModel.showHistory() }),
+                FunctionButtonData("📷 多页拍摄", "一次拍多页题目", Color(0xFF607D8B), { viewModel.startMultipageCapture() }),
             )
 
             buttons.chunked(2).forEach { row ->
@@ -6459,7 +6749,7 @@ fun AuxRecordScreen(record: ApiService.HistoryRecord, baseUrl: String, onBack: (
 @Composable
 fun HistoryRecordCard(
     record: ApiService.HistoryRecord,
-    serverAddress: String = "10.100.55.231:8000",
+    serverAddress: String = "121.199.23.213:8000",
     displayIndex: Int = 0,
     isSelectMode: Boolean = false,
     isSelected: Boolean = false,
@@ -6663,7 +6953,7 @@ fun HistoryDetailScreen(
     displayIndex: Int = 0,
     onBack: () -> Unit,
     viewModel: MainViewModel? = null,
-    serverAddress: String = "10.100.55.231:8000",
+    serverAddress: String = "121.199.23.213:8000",
 ) {
     val displayTime = try {
         if (record.timestamp.isNotEmpty()) {
@@ -6738,6 +7028,8 @@ fun HistoryDetailScreen(
                     Toast.makeText(context, "提问失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
+
+
         }
     }
     
@@ -6994,6 +7286,32 @@ fun HistoryDetailScreen(
             }
             
             // ⑥ 掌握程度（读取当时AI解答时的选项，可点击修改）
+            // 📐 图解辅助（LaTeX 渲染图）——与解题界面保持一致
+            if (record.latexExtras.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("📐 图解辅助", color = Color(0xFF00BCD4), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        MarkdownView(content = record.latexExtras, fontSize = 14f)
+                    }
+                }
+            }
+
+            // 🧠 思维导图（层级树形渲染）
+            if (record.mindMap.isNotEmpty()) {
+                MindMapCard(
+                    mindMap = record.mindMap,
+                    title = "🧠 思维导图",
+                    color = Color(0xFF00C853),
+                    initiallyCollapsed = false,
+                    streaming = false,
+                    fontSize = 14f
+                )
+            }
+
             if (record.sessionId.isNotEmpty()) {
                 Card(
                         colors = CardDefaults.cardColors(containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))),
@@ -7147,6 +7465,26 @@ fun HistoryDetailScreen(
             }
             
             Spacer(modifier = Modifier.height(32.dp))
+
+            // ⑥ 导出本条记录（Markdown -> Word/PDF），与网页端历史导出对齐
+            val historyExportContent = buildString {
+                append("## 记录详情\n\n")
+                if (displayTime.isNotEmpty()) append("**时间**：$displayTime\n\n")
+                if (record.subject.isNotEmpty()) append("**学科**：${record.subject}\n\n")
+                if (record.ocrText.isNotEmpty()) append("### 题目\n\n${record.ocrText}\n\n")
+                if (record.solutionSteps.isNotEmpty()) append("### 解题思路\n\n${record.solutionSteps}\n\n")
+                if (record.fullSolution.isNotEmpty()) append("### 完整解析\n\n${record.fullSolution}\n\n")
+                if (record.latexExtras.isNotEmpty()) append("### 图解辅助\n\n${record.latexExtras}\n\n")
+                if (record.masteryLevel.isNotEmpty()) append("**掌握程度**：${record.masteryLevel}\n\n")
+            }
+            if (historyExportContent.isNotBlank()) {
+                ExportActions(
+                        viewModel = viewModel,
+                        title = "学习助手·记录导出",
+                        content = historyExportContent,
+                        allowPdf = true
+                )
+            }
         }
     }
 }
@@ -7170,6 +7508,7 @@ fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
     val searchEnabled by viewModel.searchEnabled.collectAsState()
     val thinkingMode by viewModel.thinkingMode.collectAsState()
     val latexHelper by viewModel.latexHelper.collectAsState()
+    val interactiveQuiz by viewModel.interactiveQuiz.collectAsState()   // ⑤ 边解答边设问
     val themeMode by viewModel.themeMode.collectAsState()
     val dialect by viewModel.dialect.collectAsState()
     val grade by viewModel.grade.collectAsState()
@@ -7212,6 +7551,39 @@ FontScaleScope {
                     )
 
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
+
+                    // 🌐 服务器地址：出门在外（4G/5G）连不上局域网时，手动填公网地址
+                    FontScaleScope {
+                        Text(
+                                "🌐 服务器地址",
+                                color = tC(Color.White, Color(0xFF16181D)),
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                                "家里 WiFi 会自动发现；出门在外请填公网地址，例如 121.199.23.213:8000",
+                                color = tC(Color.Gray, Color(0xFF5C6470)),
+                                fontSize = 11.sp
+                        )
+                    }
+                    var serverInput by remember { mutableStateOf(serverAddress) }
+                    OutlinedTextField(
+                            value = serverInput,
+                            onValueChange = { serverInput = it },
+                            singleLine = true,
+                            label = { Text("服务器地址", fontSize = 12.sp) },
+                            modifier = Modifier.fillMaxWidth()
+                    )
+                    TextButton(
+                            onClick = {
+                                val addr = serverInput.trim()
+                                if (addr.isNotEmpty()) {
+                                    viewModel.updateServerAddress(addr)
+                                }
+                            }
+                    ) {
+                        Text("保存地址", color = Color(0xFF00D2FF))
+                    }
 
                     // ② 回答风格（正式/鼓励/幽默）
                     Text(
@@ -7420,6 +7792,17 @@ FontScaleScope {
                             checked = false,
                             enabled = false,
                             onCheckedChange = { /* 已停用，不响应 */ }
+                    )
+
+                    // ⑤ 边解答边设问：解题过程中插入小问，即时检验理解
+                    SettingSwitch(
+                            title = "🧩 边解答边设问",
+                            subtitle = "开启后，解题过程中会插入小问帮助你及时检验理解",
+                            checked = interactiveQuiz,
+                            onCheckedChange = {
+                                viewModel.interactiveQuiz.value = it
+                                viewModel.saveExtraSettings()
+                            }
                     )
 
                     // 十一 思考模式（off/on/auto；auto 按难度“较难/难”自动开启）
@@ -7787,6 +8170,24 @@ FontScaleScope {
                     Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
 
                     Button(
+                            onClick = { viewModel.showPrivacyDialog.value = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF546E7A))
+                    ) { Text("🔒 隐私政策") }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                            onClick = { viewModel.showReportIssueDialog.value = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00897B))
+                    ) { Text("📣 上报问题") }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Divider(color = tC(Color.White.copy(alpha = 0.2f), Color(0xFF16181D).copy(alpha = 0.2f)))
+
+                    Button(
                             onClick = { viewModel.clearHistory() },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
@@ -7802,6 +8203,181 @@ FontScaleScope {
                 }
             },
             confirmButton = {},
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
+}
+
+/** 🔒 隐私政策（与网页端 showPrivacy 文案一致） */
+@Composable
+fun PrivacyPolicyDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                FontScaleScope {
+                    Text("🔒 隐私政策", color = tC(Color.White, Color(0xFF16181D)))
+                }
+            },
+            text = {
+                Column(
+                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    FontScaleScope {
+                        Text("我们收集什么", color = tC(Color.White, Color(0xFF16181D)), fontWeight = FontWeight.Bold)
+                        Text(
+                                "· 你上传的题目图片，以及由此识别出的文字\n" +
+                                "· 你在本应用内的解题历史，用于生成个人学情报告\n" +
+                                "· 账号名与加密后的密码（密码不可逆加密，我们看不到明文）",
+                                color = tC(Color(0xFFB0BEC5), Color(0xFF5C6470)), fontSize = 14.sp
+                        )
+                        Text("我们怎么用", color = tC(Color.White, Color(0xFF16181D)), fontWeight = FontWeight.Bold)
+                        Text(
+                                "· 图片与文字会发送给 AI 模型服务商，用于生成解答、动画与批注\n" +
+                                "· 解题记录仅保存在本服务端，用于你自己的历史与报告\n" +
+                                "· 我们不会把你的数据卖给任何第三方，也不会用于广告",
+                                color = tC(Color(0xFFB0BEC5), Color(0xFF5C6470)), fontSize = 14.sp
+                        )
+                        Text("你可以怎么做", color = tC(Color.White, Color(0xFF16181D)), fontWeight = FontWeight.Bold)
+                        Text(
+                                "· 在「设置 → 历史与数据」里随时清除全部历史记录\n" +
+                                "· 在「设置 → 历史与数据」里导出自己的数据\n" +
+                                "· 退出登录后，本地只保留无关隐私的界面偏好设置",
+                                color = tC(Color(0xFFB0BEC5), Color(0xFF5C6470)), fontSize = 14.sp
+                        )
+                        Text(
+                                "⚠️ 本应用为学习辅助工具，AI 生成内容请仔细甄别，不要直接作为作业答案提交。",
+                                color = Color(0xFFFFB74D), fontSize = 13.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismiss) { Text("知道了", color = Color(0xFF00D2FF)) }
+            },
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
+}
+
+/** 📣 上报问题（与网页端 showReportIssue 对齐，自动附带版本/账号） */
+@Composable
+fun ReportIssueDialog(
+        submitting: Boolean,
+        hint: String,
+        version: String,
+        onSubmit: (String) -> Unit,
+        onDismiss: () -> Unit
+) {
+    var desc by remember { mutableStateOf("") }
+    AlertDialog(
+            onDismissRequest = { if (!submitting) onDismiss() },
+            title = {
+                FontScaleScope {
+                    Text("📣 上报问题", color = tC(Color.White, Color(0xFF16181D)))
+                }
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    FontScaleScope {
+                        OutlinedTextField(
+                                value = desc,
+                                onValueChange = { desc = it },
+                                modifier = Modifier.fillMaxWidth().height(140.dp),
+                                placeholder = {
+                                    Text(
+                                            "请描述你遇到的问题，例如：点 AI 解题后一直转圈 / 动画打不开 / 批注位置不对…",
+                                            color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 13.sp
+                                    )
+                                },
+                                colors = darkTextFieldColors()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                                "提交时会自动附带当前版本（$version）与账号信息，便于排查。",
+                                color = tC(Color.Gray, Color(0xFF5C6470)), fontSize = 12.sp
+                        )
+                        if (hint.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(hint, color = Color(0xFFFFB74D), fontSize = 12.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                        onClick = { if (!submitting && desc.isNotBlank()) onSubmit(desc.trim()) },
+                        enabled = !submitting && desc.isNotBlank()
+                ) {
+                    Text(if (submitting) "提交中…" else "提交", color = Color(0xFF00D2FF))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss, enabled = !submitting) {
+                    Text("取消", color = tC(Color.Gray, Color(0xFF5C6470)))
+                }
+            },
+            containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
+    )
+}
+
+/** 📷 多页拍摄：连续拍多张 → 一起上传（复用已有 ImageCapture 链路） */
+@Composable
+fun MultipageCaptureDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
+    val pages by viewModel.multipageFiles.collectAsState()
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                FontScaleScope {
+                    Text("📷 多页拍摄", color = tC(Color.White, Color(0xFF16181D)))
+                }
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                    FontScaleScope {
+                        Text(
+                                "一页页拍过去，拍完一起上传。服务端会逐页识别，自动分题。已拍 ${pages.size} 页。",
+                                color = tC(Color(0xFFB0BEC5), Color(0xFF5C6470)), fontSize = 13.sp
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        // 📲 拍照按钮：复用主界面已绑定的 CameraX 快门
+                        Button(
+                                onClick = { viewModel.onMultipageCapture?.invoke() },
+                                enabled = viewModel.onMultipageCapture != null,
+                                modifier = Modifier.fillMaxWidth()
+                        ) { Text("📷 拍一页", color = Color.Black) }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        if (pages.isNotEmpty()) {
+                            pages.forEachIndexed { i, f ->
+                                Text(
+                                        "第 ${i + 1} 页：${f.name}",
+                                        color = tC(Color(0xFFB0BEC5), Color(0xFF5C6470)), fontSize = 12.sp
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                        onClick = {
+                            viewModel.showMultipageCapture.value = false
+                            viewModel.solveMultipageImages(pages)
+                        },
+                        enabled = pages.isNotEmpty()
+                ) {
+                    Text("上传 ${pages.size} 页并解题", color = Color(0xFF00D2FF))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                        onClick = {
+                            viewModel.multipageFiles.value = emptyList()
+                            onDismiss()
+                        }
+                ) {
+                    Text("取消", color = tC(Color.Gray, Color(0xFF5C6470)))
+                }
+            },
             containerColor = tC(Color(0xFF16213E), Color(0xFFFFFFFF))
     )
 }

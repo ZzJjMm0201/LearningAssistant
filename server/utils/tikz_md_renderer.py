@@ -60,6 +60,7 @@ def render_latex_blocks(latex_code: str, output_path: Path, engine: str = "xelat
 \usepackage{pgfplots}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage[version=4]{mhchem}
 \usepackage{ctex}
 \pgfplotsset{compat=1.18}
 \begin{document}

@@ -12,8 +12,8 @@ android {
         applicationId = "com.gyyz.assistant"
         minSdk = 24  // MediaPipe 最低要求 API 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 4
+        versionName = "3.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

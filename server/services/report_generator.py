@@ -458,7 +458,10 @@ class ReportGenerator:
             hovermode=False,
             bargap=0.3,
             xaxis=dict(title="做题数", fixedrange=True, rangemode='tozero'),
-            yaxis=dict(autorange='reversed', fixedrange=True, tickfont=dict(size=11)),
+            # 【修复】日期标签形如 "09-23"（月-日），Plotly 默认会把这类字符串当日期解析，
+            # 轴上会渲染成 Jan/Sep 这种月份名（录屏中即表现为"横轴 2009 年"，与系统 2026 年矛盾）。
+            # 显式为 category，让标签按字面 "MM-DD" 显示。
+            yaxis=dict(type='category', autorange='reversed', fixedrange=True, tickfont=dict(size=11)),
             legend=dict(orientation="h", yanchor="top", y=-0.08, x=0.5, xanchor="center",
                         font=dict(size=12, color=FCOL)),
         )
@@ -549,7 +552,12 @@ class ReportGenerator:
             fig6.update_yaxes(fixedrange=True)
         
         # 组装 HTML
-        period = f"{cutoff_date.strftime('%Y-%m-%d')} 至 {datetime.utcnow().strftime('%Y-%m-%d')}"
+        # 【修复】days<=0 表示"全部历史"，此时 cutoff_date 就等于今天，
+        # 原文案会拼成"2026-09-23 至 2026-09-23"，被误读成只统计了一天。
+        if days and days > 0:
+            period = f"{cutoff_date.strftime('%Y-%m-%d')} 至 {datetime.utcnow().strftime('%Y-%m-%d')}"
+        else:
+            period = f"全部历史（截至 {datetime.utcnow().strftime('%Y-%m-%d')}）"
         plotly_src = ensure_plotly_local()
         
         html = f"""
@@ -657,8 +665,10 @@ class ReportGenerator:
                 all_mistakes.extend(r.question_info.get("easy_mistakes", []))
         top_mistakes = Counter(all_mistakes).most_common(5)
         
+        # 【修复】days<=0 表示全部历史，原文案会输出"学生在过去0天共解答85道题"（录屏中实际出现）。
+        _period_txt = f"在过去{days}天" if (days and days > 0) else "累计"
         return f"""
-学生在过去{days}天共解答{total}道题。
+学生{_period_txt}共解答{total}道题。
 学科分布：{dict(subjects)}
 难度分布：{dict(difficulties)}
 高频知识点：{top_kp}

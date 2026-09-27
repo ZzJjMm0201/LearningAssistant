@@ -10,7 +10,7 @@ for _s in (_sys.stdout, _sys.stderr):
         pass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -108,7 +108,7 @@ async def lifespan(app):
     print("[关闭] 服务关闭")
 
 # 创建FastAPI应用
-app = FastAPI(title="学习助手API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="学习助手API", version="3.0.0", lifespan=lifespan)
 
 # CORS配置
 app.add_middleware(
@@ -460,6 +460,77 @@ async def solve_multipage(request: Request, file: UploadFile = File(...)):
     }
 
 
+@app.post("/solve/multipage-images")
+async def solve_multipage_images(request: Request, files: List[UploadFile] = File(...)):
+    """多页拍摄（多图版）：一次上传多张已拍好的页面图片
+
+    与视频版（/solve/multipage）同一下游：逐页 OCR → 合并长文 → 分题流水线。
+    安卓端用「连续拍多张」而不是录视频，这条路更贴合现有 ImageCapture 链路。
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    if not files:
+        return {"status": "error", "message": "没有收到页面图片"}
+
+    request_id = str(uuid.uuid4())
+    mode = get_ocr_mode(request)
+    vision_model = get_vision_model(request)
+    page_texts = []
+    saved_first = None
+
+    for idx, uf in enumerate(files):
+        try:
+            content = await uf.read()
+            if not content:
+                continue
+            img_path = HISTORY_DIR / f"mp_{request_id}_{idx:02d}.jpg"
+            save_uploaded_image(content, img_path)
+            if saved_first is None:
+                saved_first = img_path
+            txt, _conf, _src = ocr_service.recognize(str(img_path), mode=mode, vision_model=vision_model)
+            if txt and not str(txt).startswith("OCR"):
+                page_texts.append(str(txt).strip())
+        except Exception as e:
+            print(f"[{request_id}] 第{idx + 1}页处理异常: {e}")
+
+    if not page_texts:
+        return {"status": "error", "message": "多页识别失败，请重新拍摄（注意逐页拍清楚）"}
+
+    merged = "\n\n".join(page_texts)
+    _user_id = get_current_user(request)
+    solve_pipeline.start_solve(
+        image_path=saved_first or (HISTORY_DIR / f"{request_id}.jpg"),
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=mode,
+        vision_model=vision_model,
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+        text_input=merged,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "pages": len(page_texts),
+        "total_images": len(files),
+        "message": "多页解题已启动",
+    }
+
+
 @app.post("/solve/text")
 async def solve_text(request: Request, body: SolveTextRequest):
     # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
@@ -570,8 +641,11 @@ async def get_svg(rest_of_path: str):
     return {"detail": "Not Found"}
 
 @app.post("/ask")
-async def ask_question(request: AskRequest):
-    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+async def ask_question(request: Request, body: AskRequest):
+    # 【修复】原签名只有 request: AskRequest（请求体模型），却把 request 直接传给
+    # check_ai_permission() / get_engine() / get_answer_style() 等“读请求头”的辅助函数。
+    # AskRequest 根本没有 .headers 属性 -> AttributeError -> /ask 恒返回 HTTP 500。
+    # 这就是“AI解题/知识延伸追问不了”的真因。现同时注入真正的 Request 与请求体。
     _perm_err = check_ai_permission(request)
     if _perm_err is not None:
         return _perm_err
@@ -583,7 +657,7 @@ async def ask_question(request: AskRequest):
         # 从数据库读取该会话的历史消息作为上下文
         history = (
             db.query(CH)
-            .filter(CH.session_id == request.session_id)
+            .filter(CH.session_id == body.session_id)
             .order_by(CH.id.asc())
             .all()
         )
@@ -592,20 +666,20 @@ async def ask_question(request: AskRequest):
         )
         # 历史记录页追问：该会话没有对话上下文时，用客户端传入的 context 兜底
         # （solve 会保存 ConversationHistory，知识延伸/动画记录不会，需要前端带上正文）
-        if not messages and isinstance(request.context, list):
+        if not messages and isinstance(body.context, list):
             messages = clean_conversation_history(
-                [m for m in request.context if isinstance(m, dict) and m.get("role") and m.get("content")]
+                [m for m in body.context if isinstance(m, dict) and m.get("role") and m.get("content")]
             )
 
-        response = ai_service.continue_conversation(messages, request.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
+        response = ai_service.continue_conversation(messages, body.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
 
         # 保存本次问答到数据库，保证后续追问上下文连续
-        for role, content in (("user", request.question), ("assistant", response)):
-            conv = CH(session_id=request.session_id, role=role, content=content)
+        for role, content in (("user", body.question), ("assistant", response)):
+            conv = CH(session_id=body.session_id, role=role, content=content)
             db.add(conv)
         db.commit()
 
-        return {"answer": response, "session_id": request.session_id}
+        return {"answer": response, "session_id": body.session_id}
     finally:
         db.close()
 
@@ -795,6 +869,60 @@ async def get_animation(filename: str):
     if file_path.exists():
         return FileResponse(file_path, media_type="text/html")
     return {"detail": "Not Found"}
+
+@app.post("/report/mistakes")
+async def report_mistakes(request: Request, body: dict = Body(default={})):
+    """⑨ 最近易错点梳理：汇总该用户最近若干条记录的 easy_mistakes。
+
+    请求体：{"limit": 10}   可选，默认 10 条记录
+    返回：{"items": [{"text": "...", "count": 2}], "records": N}
+    """
+    try:
+        limit = int((body or {}).get("limit") or 10)
+    except Exception:
+        limit = 10
+    limit = max(1, min(limit, 50))
+
+    user_id = get_current_user(request)
+    from server.database.models import SubmissionRecord
+    from collections import Counter
+
+    db = SessionLocal()
+    try:
+        q = db.query(SubmissionRecord)
+        if user_id is not None:
+            q = q.filter(SubmissionRecord.user_id == user_id)
+        rows = q.order_by(SubmissionRecord.id.desc()).limit(limit).all()
+        counter = Counter()
+        records = 0
+        for r in rows:
+            qi = getattr(r, "question_info", None)
+            if not qi:
+                continue
+            try:
+                d = json.loads(qi) if isinstance(qi, str) else qi
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            em = d.get("easy_mistakes")
+            if isinstance(em, str):
+                em = [x for x in re.split(r"[；;、\n]", em) if x.strip()]
+            if not isinstance(em, list):
+                continue
+            got = False
+            for x in em:
+                t = str(x).strip()
+                if t:
+                    counter[t] += 1
+                    got = True
+            if got:
+                records += 1
+        items = [{"text": t, "count": c} for t, c in counter.most_common(20)]
+        return {"status": "ok", "items": items, "records": records}
+    finally:
+        db.close()
+
 
 @app.post("/report/data")
 async def data_report(request: Request, body: ReportRequest):
@@ -1005,9 +1133,13 @@ async def ai_annotate(request: Request, file: UploadFile = File(...)):
             except Exception as e:
                 return {"status": "error", "message": f"绘制刻度尺失败: {e}"}
 
+            # 【修复】批注要输出较长 JSON，而默认视觉模型是推理型（思考过程也计入
+            # completion_tokens）：实测 max_tokens=5000 会被 reasoning_tokens 吃满，
+            # 返回 finish_reason=length 且 content 为空，上层就报“AI 未生成有效批注”。
+            # 这里把额度提到 16000（思考+JSON 都放得下）。
             raw = await asyncio.to_thread(
                 ai_service.recognize_image_with_vision,
-                str(ruler_path), vision_model, anno.VISION_ANNOTATE_PROMPT
+                str(ruler_path), vision_model, anno.VISION_ANNOTATE_PROMPT, 16000
             )
             raw_text = raw[0] if isinstance(raw, tuple) else (raw or "")
             annotations = anno.parse_annotations(raw_text)
@@ -1028,7 +1160,10 @@ async def ai_annotate(request: Request, file: UploadFile = File(...)):
                     width = height = 0
             prompt = anno.build_paddle_annotate_prompt(text, blocks, width, height)
             raw_text = await asyncio.to_thread(
-                ai_service.generate_response, prompt, engine, model
+                ai_service.generate_response, prompt, engine, model,
+                "你是一位批改作业的老师。请严格按要求只输出 JSON，"
+                "形如 {\"annotations\": [...]}，不要任何解释文字。",
+                4000,
             )
             annotations = anno.parse_annotations(raw_text or "")
             channel = "paddle"
@@ -1123,7 +1258,10 @@ async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
             f"学情摘要：{body.summary[:500] or '暂无学情数据'}\n\n"
             "只输出 JSON：{\"duration_minutes\": 建议时长(整数), \"reason\": \"推荐理由(一句话)\"}"
         )
-        resp = ai_service.generate_response(prompt, engine=get_engine(request), model=get_llm_model(request)) or ""
+        resp = ai_service.generate_response(
+            prompt, engine=get_engine(request), model=get_llm_model(request),
+            system="你是学习规划助手。只输出 JSON，不要任何解释文字。",
+        ) or ""
         m = _re.search(r'\{[^{}]*\}', resp, _re.DOTALL)
         data = {}
         if m:
@@ -1163,10 +1301,16 @@ if _WEB_DIR.is_dir():
 
 @app.get("/static/{filename:path}")
 async def get_history_image(filename: str):
-    """获取历史图片等静态文件"""
-    # 检查history目录
-    file_path = HISTORY_DIR / filename
-    if file_path.exists():
+    """获取历史图片等静态文件（已加固：禁止路径穿越）"""
+    # 🔒 只允许访问 HISTORY_DIR 内的文件，拒绝 .. / 绝对路径
+    base = HISTORY_DIR.resolve()
+    try:
+        file_path = (base / filename).resolve()
+    except Exception:
+        return {"detail": "Not Found"}
+    if file_path != base and base not in file_path.parents:
+        return {"detail": "Not Found"}
+    if file_path.exists() and file_path.is_file():
         return FileResponse(file_path)
     return {"detail": "Not Found"}
 
@@ -1282,15 +1426,21 @@ async def get_history(request: Request, body: dict):
         
         query = db.query(SubmissionRecord)
         
+        # 【修复】日期边界只算一次，供"解题记录"与"辅助记录(知识延伸/AI动画)"共用。
+        # 原实现只把日期筛选加在 SubmissionRecord 上，辅助记录整表返回，
+        # 于是出现"筛选 09-20~09-23 却显示 09-16 记录"的越界现象（录屏中实际出现）。
+        start_bound = None
+        end_bound = None
         if start_date:
-            start_dt = datetime.fromisoformat(start_date) - local_offset
-            query = query.filter(SubmissionRecord.timestamp >= start_dt)
+            start_bound = datetime.fromisoformat(start_date) - local_offset
+            query = query.filter(SubmissionRecord.timestamp >= start_bound)
         if end_date:
             end_dt = datetime.fromisoformat(end_date)
             # 只传日期（如"2026-08-26"）时表示包含当天全天，而非当天0点
             if end_dt.time() == dtime(0, 0):
                 end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
-            query = query.filter(SubmissionRecord.timestamp <= end_dt - local_offset)
+            end_bound = end_dt - local_offset
+            query = query.filter(SubmissionRecord.timestamp <= end_bound)
         
         # 多用户隔离：登录用户看自己的+公共(NULL)；未登录只能看公共(NULL)
         if user_id is not None:
@@ -1371,16 +1521,23 @@ async def get_history(request: Request, body: dict):
             if subject:
                 all_subjects.add(subject)
             
-            # 原图URL；显示时间优先使用原图文件的修改时间（即文件“属性”里的日期，本地时区）
+            # 原图URL
             image_url = ""
-            display_ts = ""
             if r.original_image_path:
                 image_path = Path(r.original_image_path)
                 if image_path.exists():
                     image_url = f"/static/{image_path.name}"
-                    display_ts = datetime.fromtimestamp(image_path.stat().st_mtime).isoformat()
-            if not display_ts and r.timestamp is not None:
+            # 【修复】显示时间必须与"日期筛选"同源：筛选用的是数据库 timestamp（UTC），
+            # 原代码却**优先用原图文件的 mtime** 显示（文件被复制/移动后 mtime 会变），
+            # 于是会出现"筛选 09-20~09-23 却显示一条 09-16 记录"的越界现象（录屏中实际出现）。
+            # 改为优先用数据库时间（UTC→本地），仅当其缺失时才回退到文件 mtime。
+            display_ts = ""
+            if r.timestamp is not None:
                 display_ts = (r.timestamp + local_offset).isoformat()
+            if not display_ts and r.original_image_path:
+                image_path = Path(r.original_image_path)
+                if image_path.exists():
+                    display_ts = datetime.fromtimestamp(image_path.stat().st_mtime).isoformat()
             
             # 掌握程度（读取 mastery_records 下按 session_id 保存的选项）
             mastery_label = ""
@@ -1437,6 +1594,11 @@ async def get_history(request: Request, body: dict):
             aux_query = aux_query.filter(AuxRecord.user_id == user_id)
         else:
             aux_query = aux_query.filter(AuxRecord.id == -1)
+        # 【修复】辅助记录必须沿用同一套日期边界，否则会绕过筛选返回越界记录
+        if start_bound is not None:
+            aux_query = aux_query.filter(AuxRecord.timestamp >= start_bound)
+        if end_bound is not None:
+            aux_query = aux_query.filter(AuxRecord.timestamp <= end_bound)
         for a in aux_query.order_by(AuxRecord.timestamp.desc()).all():
             try:
                 a_ts = (a.timestamp + local_offset).isoformat() if a.timestamp else ""
@@ -1570,7 +1732,7 @@ async def render_history_record(record_id: int, request: Request):
             return {"status": "error", "message": "记录不存在或无解析内容"}
         if "```" not in record.full_solution:
             return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
-        svg_dir = Path(record.rendered_svg_dir) if record.rendered_svg_dir else None
+        svg_dir = _svg_dir_from_stored(record.rendered_svg_dir)
         if not svg_dir or not svg_dir.exists():
             svg_dir = HISTORY_DIR / f"svgs_{record.session_id}"
             svg_dir.mkdir(parents=True, exist_ok=True)
@@ -1583,7 +1745,7 @@ async def render_history_record(record_id: int, request: Request):
         rendered = rewrite_rendered_images(rendered, host, f"svgs_{record.session_id}")
         if rendered != record.full_solution:
             record.full_solution = rendered
-            record.rendered_svg_dir = str(svg_dir)
+            record.rendered_svg_dir = _svg_dir_to_stored(svg_dir)
             db.commit()
         return {"status": "ok", "full_solution": rendered, "rendered": True}
     finally:
@@ -1631,15 +1793,68 @@ async def auth_register(request: AuthRequest):
         db.close()
 
 
+# ==================== 登录失败限流（内存版） ====================
+# 目的：阻止公网爆破。同一 用户名+IP 连续失败达阈值后锁定一段时间。
+_LOGIN_FAILS = {}          # key -> [失败次数, 首次失败时间戳]
+_LOGIN_LOCK_SECONDS = 900      # 锁定时长：15 分钟
+_LOGIN_MAX_FAILS = 5           # 允许的连续失败次数
+
+
+def _login_key(request, username: str) -> str:
+    try:
+        ip = request.client.host if request.client else "unknown"
+    except Exception:
+        ip = "unknown"
+    return "%s|%s" % (ip, (username or "").strip().lower())
+
+
+def _login_locked(key: str) -> int:
+    """返回剩余锁定秒数；0 表示未锁定"""
+    import time as _t
+    rec = _LOGIN_FAILS.get(key)
+    if not rec:
+        return 0
+    cnt, ts = rec
+    if cnt < _LOGIN_MAX_FAILS:
+        return 0
+    left = int(_LOGIN_LOCK_SECONDS - (_t.time() - ts))
+    return left if left > 0 else 0
+
+
+def _login_record_fail(key: str) -> None:
+    import time as _t
+    rec = _LOGIN_FAILS.get(key)
+    now = _t.time()
+    if not rec or (now - rec[1]) > _LOGIN_LOCK_SECONDS:
+        _LOGIN_FAILS[key] = [1, now]
+    else:
+        rec[0] += 1
+        rec[1] = now
+
+
+def _login_clear(key: str) -> None:
+    _LOGIN_FAILS.pop(key, None)
+
+
 @app.post("/auth/login")
-async def auth_login(request: AuthRequest):
-    """用户登录"""
+async def auth_login(request: AuthRequest, req: Request):
+    """用户登录（已加固：失败限流）"""
+    key = _login_key(req, request.username)
+    left = _login_locked(key)
+    if left > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="登录失败次数过多，请 %d 分钟后再试" % max(1, left // 60),
+        )
+
     db = SessionLocal()
     try:
         result = login(db, request.username.strip(), request.password)
+        _login_clear(key)
         result["user"]["ai_permission"] = can_use_ai(result["user"]["username"], result["user"]["is_admin"])
         return {"status": "ok", "data": result}
     except ValueError as e:
+        _login_record_fail(key)
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         db.close()
@@ -1664,6 +1879,7 @@ async def health_check():
     """健康检查"""
     return {
         "status": "healthy",
+        "version": "3.0.0",
         "features": FEATURE_FLAGS,
     }
 
@@ -1790,6 +2006,33 @@ def rewrite_static_urls(text: str, host: str) -> str:
     return text
 
 
+def _svg_dir_to_stored(p) -> str:
+    """把 svg 目录写成"相对 history 根"的形式入库。
+
+    以前存绝对路径，项目目录一改名历史图解就全失效；存相对路径后
+    只依赖 HISTORY_DIR，搬迁/改名都不受影响。
+    """
+    try:
+        rel = Path(p).resolve().relative_to(HISTORY_DIR.resolve())
+        return str(rel).replace("\\", "/")
+    except Exception:
+        # 无法相对化（例如已是旧绝对路径且不在当前树内）-> 原样保留
+        return str(p)
+
+
+def _svg_dir_from_stored(v) -> Path:
+    """把库里存的值还原成绝对 Path，兼容旧的绝对路径与新的相对路径。"""
+    if not v:
+        return None
+    s = str(v)
+    p = Path(s)
+    # 旧数据：本身就是绝对路径
+    if p.is_absolute():
+        return p
+    # 新数据：相对 history 根
+    return HISTORY_DIR / s
+
+
 def rewrite_rendered_images(text: str, host: str, svg_rel_dir: str) -> str:
     """② 把LaTeX渲染产物中的相对图片引用(diagram_xxx.png)补全为绝对URL，并把旧host统一到当前host
     svg_rel_dir: 图片所在目录（相对history根），如 svgs_xxx 或 svgs_ask_xxx"""
@@ -1814,8 +2057,9 @@ def _move_record_files_to_recycle_bin(record) -> str:
     candidates = []
     if record.original_image_path and Path(record.original_image_path).exists():
         candidates.append(Path(record.original_image_path))
-    if record.rendered_svg_dir and Path(record.rendered_svg_dir).exists():
-        candidates.append(Path(record.rendered_svg_dir))
+    _sd = _svg_dir_from_stored(record.rendered_svg_dir)
+    if _sd and _sd.exists():
+        candidates.append(_sd)
     md_path = HISTORY_DIR / f"{record.session_id}_solution.md"
     if md_path.exists():
         candidates.append(md_path)

@@ -130,6 +130,41 @@ def add_rulers_rgb(img, step: int = 100, band: int = 46):
 
 # ---------- 批注绘制 ----------
 
+def _load_cjk_font(size: int = 18):
+    """加载【支持中文】的字体。
+
+    修复：原实现用 ImageFont.truetype('arial.ttf', 18) 画批注文字，
+    而 arial 没有中文字形 → 中文会渲染成方框乱码（截图中表现为 "□□□□B"）。
+    兜底的 load_default() 同样不支持中文。这里按优先级找系统中文字体。
+    """
+    from PIL import ImageFont
+    import os as _os
+    candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",    # 黑体
+        r"C:\Windows\Fonts\simsun.ttc",    # 宋体
+        r"C:\Windows\Fonts\Deng.ttf",      # 等线
+        r"C:\Windows\Fonts\msyh.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for c in candidates:
+        try:
+            if _os.path.exists(c):
+                return ImageFont.truetype(c, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+
 def draw_annotations(image_path: str, annotations: List[Dict], out_path: str,
                      origin_offset: int = 0) -> bool:
     """按批注列表在图片上绘制标记
@@ -145,13 +180,9 @@ def draw_annotations(image_path: str, annotations: List[Dict], out_path: str,
     except Exception:
         return False
     d = ImageDraw.Draw(img, 'RGBA')
-    try:
-        font = ImageFont.truetype('arial.ttf', 18)
-    except Exception:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            font = None
+    # 【修复】原来用 arial.ttf（无中文字形）+ load_default() 兜底 → 中文全变方框乱码
+    W, H = img.size
+    font = _load_cjk_font(max(16, int(min(W, H) / 45)))
 
     def P(x, y):
         return (float(x) - origin_offset, float(y) - origin_offset)
@@ -172,6 +203,17 @@ def draw_annotations(image_path: str, annotations: List[Dict], out_path: str,
             y2 = float(y2) if y2 is not None else None
         except Exception:
             x2 = y2 = None
+
+        # 【修复】坐标兜底：模型偶尔给出越界/反向坐标，会让批注显得“误差很大”。
+        # 先夹到图片范围内，再规范 x2>=x、y2>=y。
+        x = min(max(x, 0.0), float(W))
+        y = min(max(y, 0.0), float(H))
+        if x2 is not None:
+            x2 = min(max(x2, 0.0), float(W))
+        if y2 is not None:
+            y2 = min(max(y2, 0.0), float(H))
+        if x2 is not None and y2 is not None and x2 < x and y2 < y:
+            x, x2 = x2, x
 
         if t == 'circle':
             if x2 is None or y2 is None:

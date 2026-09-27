@@ -7,7 +7,7 @@ import requests
 BASE = "http://127.0.0.1:8000"
 
 # ===== ② /ask/stream =====
-con = sqlite3.connect(r"F:\project\programCodeVersion2.1.2_DeepSeek\data\learning_assistant.db")
+con = sqlite3.connect(r"F:\project\programCodeVersion3.0.0_DeepSeek\data\learning_assistant.db")
 row = con.execute("SELECT session_id FROM conversation_history ORDER BY id DESC LIMIT 1").fetchone()
 con.close()
 sid = row[0] if row else None

@@ -220,6 +220,10 @@ const API = (() => {
       timeout: 180000
     });
   }
+  async function reportMistakes(limit = 10) {
+    // 🧭 最近易错点梳理：汇总该用户近期记录的 easy_mistakes
+    return req('/report/mistakes', { method: 'POST', raw: { limit } });
+  }
   async function aiReport(days, opts = {}) {
     const res = await fetch(BASE + '/report/ai', {
       method: 'POST', headers: solveHeaders(Object.assign({ 'Content-Type': 'application/json' }, opts)),
@@ -285,7 +289,7 @@ const API = (() => {
     req, login, register, verify, logout,
     getToken: () => token, getUser: () => user,
     solveImage, solveText, solveMultipage, confirmSolve, selectQuestions, cancelSolve, ask,
-    sse, postSSE, history, deleteHistory, dataReport, aiReport,
+    sse, postSSE, history, deleteHistory, dataReport, aiReport, reportMistakes,
     extendImage, extendText, animateImage, animateText, annotateImage,
     mastery, exportDoc, exportHistory, health
   };

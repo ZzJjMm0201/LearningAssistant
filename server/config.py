@@ -33,7 +33,7 @@ def _env(key: str, default: str) -> str:
 # API配置
 class APIConfig:
     # DeepSeek API
-    DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY", "sk-3178b37524bf4a36a74fa8873d1ebdb5")
+    DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY", "")
     DEEPSEEK_BASE_URL = "https://api.deepseek.com"
     # 16.1 DeepSeek 可选模型名（客户端“具体模型”可选；不传时用 API 默认模型）
     # 已按本环境 deepseek 提供方实际可用的模型 ID 核实：
@@ -64,12 +64,12 @@ class APIConfig:
     HUNYUAN_DEFAULT_LLM = "hy4-preview"
     
     # 好未来题库API
-    SEARCH_ACCESS_KEY_ID = "1481449208266358784"
-    SEARCH_ACCESS_KEY_SECRET = _env("SEARCH_ACCESS_KEY_SECRET", "8c329c183c8f470f9b52d006cb7282c5")
+    SEARCH_ACCESS_KEY_ID = _env("SEARCH_ACCESS_KEY_ID", "")
+    SEARCH_ACCESS_KEY_SECRET = _env("SEARCH_ACCESS_KEY_SECRET", "")
     
     # PaddleOCR API
     OCR_API_URL = "https://74y4w193tej2z706.aistudio-app.com/layout-parsing"
-    OCR_TOKEN = _env("OCR_TOKEN", "adf8faf595a1aa8baf581d19a565c2776b94843c")
+    OCR_TOKEN = _env("OCR_TOKEN", "")
     # OCR 快速失败：云端服务偶发挂起（实测 60s 超时），缩短超时避免用户干等
     OCR_API_TIMEOUT = int(_env("OCR_API_TIMEOUT", "15"))
     # 默认 OCR 模式：paddle=本地/API 双通道；qwen=视觉大模型

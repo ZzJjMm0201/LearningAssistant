@@ -567,7 +567,10 @@ class AIService:
         messages.append({"role": "user", "content": mindmap_prompt})
         # 流式输出思维导图
         accumulated_mindmap = ""
-        for evt in self._call_api_streaming(messages, max_tokens=2000, engine=engine, model=model,
+        # 【修复】max_tokens=2000 对【推理型】模型不够：思考过程也计入 completion_tokens。
+        # 实测思维导图这步会被 reasoning 全程吃满、返回空内容（库里出现过 mindmap 为空，
+        # 进而被按位置取到了别的步骤的正文）。这里给足额度。
+        for evt in self._call_api_streaming(messages, max_tokens=16000, engine=engine, model=model,
                                             temperature=p_temp):
             if evt["stage"] == "content":
                 accumulated_mindmap = evt["content"]
@@ -795,13 +798,24 @@ class AIService:
                 accumulated = evt["content"]
                 yield accumulated
 
-    def generate_response(self, prompt: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
-        """通用单轮生成（GeoGebra命令等）"""
+    def generate_response(self, prompt: str, engine: Optional[str] = None, model: Optional[str] = None,
+                          system: Optional[str] = None, max_tokens: int = 2000) -> str:
+        """通用单轮生成。
+
+        system 缺省时沿用 GeoGebra 专用系统提示（兼容既有调用）；
+        批注 / 番茄钟 / 分题等任务必须显式传入各自的 system，
+        否则模型会被 GeoGebra 提示误导，输出偏离预期格式
+        （这正是批注报"未生成有效批注"的根因）。
+        """
+        sys_prompt = system or (
+            "你是一个GeoGebra命令生成专家，直接输出可以在GeoGebra输入栏中执行的命令，"
+            "每行一个，不要任何解释文字。"
+        )
         messages = [
-            {"role": "system", "content": "你是一个GeoGebra命令生成专家，直接输出可以在GeoGebra输入栏中执行的命令，每行一个命令，不要任何解释文字。"},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prompt},
         ]
-        return self._call_api(messages, max_tokens=2000, engine=engine, model=model)
+        return self._call_api(messages, max_tokens=max_tokens, engine=engine, model=model)
 
     def fix_latex(self, latex_code: str, error_text: str, engine: Optional[str] = None, model: Optional[str] = None) -> str:
         """LaTeX编译失败时，把关键报错发给AI修复代码"""
@@ -957,11 +971,17 @@ class AIService:
                 time.sleep(1)
         return
     
-    def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None) -> Tuple[str, float]:
+    def recognize_image_with_vision(self, image_path: str, model: Optional[str] = None, prompt: Optional[str] = None,
+                                    max_tokens: int = 5000) -> Tuple[str, float]:
         """使用视觉模型识别图片（OCR/图表描述）
         模型名以 deepseek 开头 → DeepSeek客户端；否则走千问客户端
         ③ 提示词：手写内容转 *斜体* Markdown；④ 手写颜色用 [[#RRGGBB]] 标注；
         ① 只在彼此独立的大题之间插入 %%%（跨栏/同篇阅读/同一大题不切分）
+
+        max_tokens（【修复】新增参数）：默认视觉模型是【推理型】，思考过程也计入
+        completion_tokens。实测批注场景下 5000 会被 reasoning_tokens 全部吃满，
+        返回 finish_reason=length 且 content 为空 → 上层误判为“AI 未生成有效批注”。
+        需要长输出的调用方（如批注）应显式给足额度。
         """
         import base64 as _b64
         start = time.time()
@@ -978,8 +998,22 @@ class AIService:
                     model = APIConfig.QWEN_DEFAULT_VISION
             is_deepseek_model = str(model).lower().startswith("deepseek")
             client = self.client if is_deepseek_model else self.qwen_client
+            # ① 视觉通道降级：若指定 provider 不可用（如千问欠费/未配 Key），
+            #    自动回退到本机可用的视觉 provider，避免整条 OCR 链路失败。
             if client is None:
-                return f"OCR识别失败：未配置{'DeepSeek' if is_deepseek_model else '千问'}API Key", round(time.time() - start, 2)
+                _fallback = getattr(APIConfig, "DEEPSEEK_DEFAULT_VISION", "deepseek-v4-flash-vision-exp")
+                if is_deepseek_model or self.client is None:
+                    # DeepSeek 也不可用：尝试反向回退到千问
+                    if not is_deepseek_model and self.qwen_client is not None:
+                        pass
+                    else:
+                        return ("OCR识别失败：未配置可用的视觉模型 API Key"
+                                "（DeepSeek 与千问均不可用）"), round(time.time() - start, 2)
+                else:
+                    print(f"[OCR] 视觉模型 {model} 的 provider 不可用，自动降级为 {_fallback}")
+                    model = _fallback
+                    is_deepseek_model = True
+                    client = self.client
             with open(image_path, "rb") as f:
                 img_b64 = _b64.b64encode(f.read()).decode("ascii")
             prompt = prompt or (
@@ -1009,7 +1043,7 @@ class AIService:
                     ],
                 }],
                 temperature=0.1,
-                max_tokens=5000,
+                max_tokens=max_tokens,
             )
             text = (resp.choices[0].message.content or "").strip()
             if not text:

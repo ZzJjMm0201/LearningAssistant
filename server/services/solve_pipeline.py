@@ -467,6 +467,8 @@ class SolvePipeline:
                     self._emit_event(request_id, "suggested_questions", content)
                 elif stage == "complete":
                     total_time = content.get("total_time", 0)
+                    # ⑤ 下发会话标识，客户端凭此继续追问（与保存记录时同一取值）
+                    self._emit_event(request_id, "session_id", session_id or request_id)
                     # ③ 保存知识延伸记录到历史
                     try:
                         from server.database.models import AuxRecord
@@ -529,37 +531,64 @@ class SolvePipeline:
             full_solution = ""
             mind_map = ""
             
-            # 按消息顺序判断内容类型（assistant 的第2、3、4条回复）
-            assistant_count = 0
-            for msg in messages:
-                content = msg.get("content", "")
-                role = msg.get("role", "")
-                
-                if role == "assistant":
-                    assistant_count += 1
-                    
-                    if assistant_count == 1:
-                        # 第一条 assistant 回复 = 题目信息（JSON）
-                        try:
-                            import re
-                            json_match = re.search(r'\{[^}]+\}', content)
-                            if json_match:
-                                question_info = json.loads(json_match.group())
-                        except:
-                            pass
-                            
-                    elif assistant_count == 2:
-                        # 第二条 assistant 回复 = 解题思路
-                        solution_steps = content
-                        
-                    elif assistant_count == 3:
-                        # 第三条 assistant 回复 = 完整解析
-                        full_solution = content
-                        
-                    elif assistant_count == 4:
-                        # 第四条 assistant 回复 = 思维导图
-                        mind_map = content
-            
+            # 【修复】原实现纯按“第几条 assistant 消息”猜类型，实测会串题/错位：
+            # 解题流程里插入了 LaTeX/TikZ 一步，位置整体后移，于是“第4条”抓到的是
+            # LaTeX 那步的回包（它还可能把完整解析拄一遍）当成思维导图 —— 表现为
+            # “历史记录里的思维导图变成了上一段解题思路”。
+            # 改为按【该条回复前面的用户提问】判定类型，鲁棒得多；位置法仅作兜底。
+            import re as _re
+
+            def _looks_like_mindmap(s):
+                if not s:
+                    return False
+                return (len(_re.findall(r'[\u2500-\u257F]', s)) >= 3) or (s.count("\n    ") >= 3)
+
+            _msgs = list(messages or [])
+            for _i, _m in enumerate(_msgs):
+                if _m.get("role") != "assistant":
+                    continue
+                _content = _m.get("content", "") or ""
+                if not _content.strip():
+                    continue
+                _prev = ""
+                for _j in range(_i - 1, -1, -1):
+                    if _msgs[_j].get("role") == "user":
+                        _prev = _msgs[_j].get("content", "") or ""
+                        break
+                if ('"difficulty"' in _prev) or ("grade" in _prev and "subject" in _prev):
+                    try:
+                        _jm = _re.search(r'\{[\s\S]*\}', _content)
+                        if _jm:
+                            question_info = json.loads(_jm.group())
+                    except Exception:
+                        pass
+                elif "思维导图" in _prev:
+                    if not mind_map:
+                        mind_map = _content
+                elif ("完整" in _prev and ("解题过程" in _prev or "解析" in _prev)):
+                    if not full_solution:
+                        full_solution = _content
+                elif "解题思路" in _prev:
+                    if not solution_steps:
+                        solution_steps = _content
+
+            # 兜底一：思维导图必须真像导图；若不是，用内容特征从其它回复里找
+            if not _looks_like_mindmap(mind_map):
+                for _m in reversed(_msgs):
+                    if _m.get("role") != "assistant":
+                        continue
+                    _c = _m.get("content", "") or ""
+                    if _c and _c not in (solution_steps, full_solution) and _looks_like_mindmap(_c):
+                        mind_map = _c
+                        break
+
+            # 兜底二：关键字段仍为空时，退回位置法（第2/3条）
+            _a = [(_m.get("content", "") or "") for _m in _msgs if _m.get("role") == "assistant"]
+            if not solution_steps and len(_a) >= 2 and _a[1].strip():
+                solution_steps = _a[1]
+            if not full_solution and len(_a) >= 3 and _a[2].strip():
+                full_solution = _a[2]
+
             print(f"[{request_id}] 内容分类: steps={len(solution_steps)}chars, solution={len(full_solution)}chars, mindmap={len(mind_map)}chars")
             
             # 若已渲染（含LaTeX图片），用渲染结果作为完整解析

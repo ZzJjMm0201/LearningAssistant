@@ -5,7 +5,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import requests
 
 BASE = "http://127.0.0.1:8000"
-img = r"F:\project\programCodeVersion2.1.2_DeepSeek\history\03d655d1-38d8-4fcb-ac98-437138370950.jpg"
+img = r"F:\project\programCodeVersion3.0.0_DeepSeek\history\03d655d1-38d8-4fcb-ac98-437138370950.jpg"
 results = []
 
 def check(name, cond, detail=""):

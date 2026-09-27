@@ -8,11 +8,16 @@
 <script src="./js/vendor/marked.min.js"></script>
 <script>
 window.MathJax = {
-  tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+  tex: {
+    packages: {'[+]': ['mhchem']},
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']]
+  },
   svg: { fontCache: 'global' },
   options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
 };
 </script>
+<!-- tex-svg.js 仅登记了 [tex]/mhchem 依赖项，不含实现；须显式引入扩展脚本 -->
 <script id="MathJax-script" async src="./js/vendor/tex-svg.js"></script>
 </head>
 <body data-theme="dark">

@@ -42,10 +42,10 @@ except Exception as e:
     check("注册/登录", False, str(e))
 
 # 3. 解题主流程（SSE流式）
-img = r"F:\project\programCodeVersion2.1.2_DeepSeek\history\03d655d1-38d8-4fcb-ac98-437138370950.jpg"
+img = r"F:\project\programCodeVersion3.0.0_DeepSeek\history\03d655d1-38d8-4fcb-ac98-437138370950.jpg"
 if not os.path.exists(img):
     # 换一个存在的历史图片
-    hdir = r"F:\project\programCodeVersion2.1.2_DeepSeek\history"
+    hdir = r"F:\project\programCodeVersion3.0.0_DeepSeek\history"
     cands = [os.path.join(hdir, f) for f in os.listdir(hdir) if f.endswith(".jpg")]
     img = cands[0] if cands else None
 check("测试图片存在", img is not None and os.path.exists(img), img or "无")
