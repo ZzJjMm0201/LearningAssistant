@@ -1,0 +1,3414 @@
+package com.gyyz.assistant
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.gyyz.assistant.camera.CameraAnalyzer
+import com.gyyz.assistant.gesture.HandGestureRecognizer
+import com.gyyz.assistant.network.ApiService
+import com.gyyz.assistant.network.ServerDiscoverer
+import io.noties.markwon.Markwon
+import io.noties.markwon.ext.latex.JLatexMathPlugin
+import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
+import io.noties.markwon.image.ImagesPlugin
+import io.noties.markwon.image.glide.GlideImagesPlugin
+import io.noties.markwon.ext.tables.TablesPlugin
+import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.*
+import org.json.JSONObject
+
+@Suppress("OPT_IN_IS_NOT_ENABLED")
+@OptIn(ExperimentalMaterial3Api::class)
+
+// ==================== 閻樿埖鈧�浣哥暰娑�?====================
+
+/** 鎼存梻鏁ゆ稉鑽ゅЦ閹�?*/
+sealed class AppState {
+    /** 閻ц�茬秿/濞夈劌鍞芥い鐢告桨 */
+    data class Login(val isLoading: Boolean = false, val error: String = "") : AppState()
+
+    /** 鐠虹喕閲滅�涳缚绡勫Ο鈥崇础 - 姒涙�款吇閻樿埖鈧�?*/
+    object Tracking : AppState()
+
+    /** 鐟欙綁顣藉Ο鈥崇础 */
+    data class Solving(
+            val stage: SolveStage = SolveStage.UPLOADING,
+            val requestId: String = "",
+            val questionInfo: String = "",
+            val solutionSteps: String = "",
+            val fullSolution: String = "",
+            val mindMap: String = "",
+            val suggestedQuestions: List<String> = emptyList()
+    ) : AppState()
+
+    /** 鐎涳附鍎忛幎銉ユ啞濡�鈥崇础 */
+    data class Report(val reportText: String = "", val isLoading: Boolean = true) : AppState()
+
+    /** 閸樺棗褰剁拋鏉跨秿濡�鈥崇础 */
+    object History : AppState()
+
+    /** AI閸斻劎鏁惧Ο鈥崇础 */
+    object Animation : AppState()
+
+    /** 閻�銉ㄧ槕瀵ゆ湹鍑犲Ο鈥崇础 */
+    data class Knowledge(
+            val summary: String = "",
+            val mistakes: String = "",
+            val extension: String = "",
+            val suggestedQuestions: List<String> = emptyList()
+    ) : AppState()
+}
+
+/** 鐟欙綁顣介梼鑸殿唽 */
+enum class SolveStage {
+    UPLOADING, // 娑撳﹣绱舵稉?
+    ANALYZING, // 閸掑棙鐎芥稉?
+    DISPLAY_STEPS, // 閺勫墽銇氱憴锝夘暯閹�婵婄熅
+    DISPLAY_FULL, // 閺勫墽銇氱�瑰本鏆ｇ憴锝嗙��
+    DISPLAY_MINDMAP, // 閺勫墽銇氶幀婵堟樊鐎电厧娴�
+    INTERACTIVE, // 娴溿倓绨伴幓鎰版６
+    COMPLETED // 鐎瑰本鍨�
+}
+
+/** 娑撴挻鏁炴惔锔惧Ц閹�渚婄礄閺夈儴鍤滈張顒�婀撮幒銊ф倞濡�鈥崇�烽敍?*/
+enum class FocusState(val label: String) {
+    WRITING("娑旓箑鍟撴稉"),
+    THINKING("閹�婵娾偓鍐ц厬"),
+    PAGE_TURNING("缂堝�氥��"),
+    SEEKING_HELP("濮瑰倸濮�");
+
+    companion object {
+        fun fromString(s: String): FocusState {
+            return when (s.lowercase()) {
+                "writing" -> WRITING
+                "thinking" -> THINKING
+                "page_turning" -> PAGE_TURNING
+                "seeking_help" -> SEEKING_HELP
+                else -> WRITING
+            }
+        }
+    }
+}
+
+// ==================== ViewModel ====================
+
+class MainViewModel : ViewModel() {
+    private val _appState = MutableStateFlow<AppState>(AppState.Tracking)
+    val appState: StateFlow<AppState> = _appState.asStateFlow()
+
+    private val _statusText = MutableStateFlow("鐠虹喕閲滅�涳缚绡勬稉?..")
+    val statusText: StateFlow<String> = _statusText.asStateFlow()
+
+    private val _pomodoroTime = MutableStateFlow(25 * 60) // 25閸掑棝鎸撻悾顏囧瘲闁�?
+    val pomodoroTime: StateFlow<Int> = _pomodoroTime.asStateFlow()
+
+    private val _pageCount = MutableStateFlow(0)
+    val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
+
+    private val _thinkingTimer = MutableStateFlow(0) // 閹�婵娾偓鍐�顓搁弮璁圭礄缁夋帪绱�
+    val thinkingTimer: StateFlow<Int> = _thinkingTimer.asStateFlow()
+
+    private var thinkingJob: Job? = null
+    private var pomodoroJob: Job? = null
+    private val _animationUrl = MutableStateFlow("")
+    val animationUrl: StateFlow<String> = _animationUrl.asStateFlow()
+
+    // 缂冩垹绮堕張宥呭��
+    private val apiService = ApiService()
+
+    // 閻ц�茬秿閻╃�垮彠
+    private val _isLoggedIn = MutableStateFlow(false)
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    private val _loggedInUsername = MutableStateFlow("")
+    val loggedInUsername: StateFlow<String> = _loggedInUsername.asStateFlow()
+
+    init {
+        // ===== 娣囶喖顦查敍姘�鐨㈤崡蹇曗柤閸氼垰濮╁�ゆ儼绻滄稉鈧�閻�?=====
+        viewModelScope.launch {
+            // 瀵ゆ儼绻滄稉鈧�鐏忓繑顔岄弮鍫曟？绾�顔荤箽閹碘偓閺堝�婂灥婵�瀣�瀵茬�瑰本鍨�
+            delay(100)
+
+            tomatoEnabled.collect { enabled ->
+                if (enabled) {
+                    startTomato()
+                } else {
+                    pomodoroJob?.cancel()
+                }
+            }
+        }
+    }
+
+    /**
+     * 閸掓繂顫愰崠鏈卲iService閿涘牅绱堕崗顧塷ntext閻�銊ょ艾SharedPreferences閿�?
+     */
+    fun initApiService(context: android.content.Context) {
+        apiService.init(context)
+        // 濡�鈧�閺屻儲妲搁崥锔芥箒瀹歌弓绻氱�涙�兼畱token
+        if (apiService.isLoggedIn()) {
+            _isLoggedIn.value = true
+            _loggedInUsername.value = apiService.getUsername() ?: ""
+            _appState.value = AppState.Tracking
+            _statusText.value = "濞嗐垼绻嬮崶鐐存降閿�?{_loggedInUsername.value}"
+        } else {
+            _appState.value = AppState.Login()
+        }
+    }
+
+    /**
+     * 濞夈劌鍞�
+     */
+    fun register(username: String, password: String) {
+        _appState.value = AppState.Login(isLoading = true)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = apiService.register(username, password)
+                withContext(Dispatchers.Main) {
+                    _isLoggedIn.value = true
+                    _loggedInUsername.value = result.user.username
+                    _appState.value = AppState.Tracking
+                    _statusText.value = "濞夈劌鍞介幋鎰�濮涢敍灞绢偨鏉�?${result.user.username}"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Login(error = e.message ?: "濞夈劌鍞芥径杈�瑙�")
+                }
+            }
+        }
+    }
+
+    /**
+     * 閻ц�茬秿
+     */
+    fun login(username: String, password: String) {
+        _appState.value = AppState.Login(isLoading = true)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = apiService.login(username, password)
+                withContext(Dispatchers.Main) {
+                    _isLoggedIn.value = true
+                    _loggedInUsername.value = result.user.username
+                    _appState.value = AppState.Tracking
+                    _statusText.value = "閻ц�茬秿閹存劕濮涢敍灞绢偨鏉╁骸娲栭弶?${result.user.username}"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Login(error = e.message ?: "閻ц�茬秿婢惰精瑙�")
+                }
+            }
+        }
+    }
+
+    /**
+     * 闁�鈧�閸戣櫣娅ヨぐ?
+     */
+    fun logout() {
+        apiService.logout()
+        _isLoggedIn.value = false
+        _loggedInUsername.value = ""
+        _appState.value = AppState.Login()
+        _statusText.value = "瀹告煡鈧�鈧�閸戣櫣娅ヨぐ"
+    }
+
+    private fun startTomato() {
+        pomodoroJob?.cancel()
+        pomodoroJob = viewModelScope.launch {
+            while (isActive && tomatoEnabled.value) {
+                delay(1000)
+                if (_pomodoroTime.value > 0) {
+                    _pomodoroTime.value -= 1
+                } else {
+                    _statusText.value = "鐎瑰本鍨氭稉鈧�娑擃亞鏆橀懠鍕�鎸撻敍浣风搐閹�顖欑�存稉瀣�鎯倊"
+                    _pomodoroTime.value = 25 * 60
+                }
+            }
+        }
+    }
+
+    /** 閸氼垰濮╃捄鐔婚嚋鐎涳缚绡勫Ο鈥崇础 */
+    private fun startTracking() {
+        _appState.value = AppState.Tracking
+
+        // 閻ｎ亣瀵楅柦鐔烘暠 init 娑擃厾娈� tomatoEnabled.collect 缂佺喍绔寸粻锛勬倞
+        if (tomatoEnabled.value) {
+            _pomodoroTime.value = 25 * 60
+            startTomato()
+        }
+    }
+
+    /** 婢跺嫮鎮婃稉鎾存暈鎼达妇濮搁幀浣稿綁閸�?*/
+    fun onFocusStateChanged(focusState: FocusState) {
+        when (focusState) {
+            FocusState.THINKING -> {
+                thinkingJob?.cancel()
+                thinkingJob =
+                        viewModelScope.launch {
+                            _thinkingTimer.value = 0
+                            while (_thinkingTimer.value < 30) {
+                                delay(1000)
+                                _thinkingTimer.value += 1
+                            }
+                            // 閹�婵娾偓鍐�绉存潻?0缁夋帪绱濋懛顏勫З閸氼垰濮╃憴锝夘暯
+                            _statusText.value = "闂団偓鐟曚礁搴滈崝鈺佹偋閿涚喐顒滈崷銊ュ櫙婢跺洩袙妫�?.."
+                            startSolving()
+                            thinkingJob?.cancel()
+                        }
+            }
+            FocusState.PAGE_TURNING -> {
+                _pageCount.value += 1
+                thinkingJob?.cancel()
+                _thinkingTimer.value = 0
+            }
+            FocusState.WRITING -> {
+                thinkingJob?.cancel()
+                _thinkingTimer.value = 0
+            }
+            FocusState.SEEKING_HELP -> {
+                startSolving()
+            }
+        }
+    }
+
+    /** 婢跺嫮鎮婇幍瀣�濞嶉崨鎴掓姢 */
+    fun onGestureDetected(fingerCount: Int) {
+        when (fingerCount) {
+            1 -> {
+                _statusText.value = "閺囨潙顦块崝鐔诲厴..."
+            }
+            2 -> {
+                _appState.value = AppState.Report(isLoading = true)
+                loadAiReport()
+            }
+            3 -> {
+                _appState.value = AppState.Report(isLoading = true)
+                loadDataReport()
+            }
+            4 -> {
+                _appState.value = AppState.Animation
+            }
+        }
+    }
+
+    /** 婢跺嫮鎮婄拠顓㈢叾閸涙垝鎶� */
+    fun handleVoiceCommand(text: String) {
+        when {
+            text.contains("娑撳秳绱�") || text.contains("閹峰秶鍙�") || text.contains("鐟欙綁顣�") -> onButtonSolve()
+            text.contains("閹跺�熻杽") || text.contains("閸斻劎鏁�") -> onButtonAnimation()
+            text.contains("閸嬫矮绨�") || text.contains("婢舵艾鐨�") -> loadDataReport()
+            text.contains("閹哄本褰�") || text.contains("娴滃棜袙") -> loadAiReport()
+            text.contains("鏉╂ɑ鍏傛禍鍡毿�") || text.contains("瀵ゆ湹鍑�") -> onButtonExtend()
+            else -> _statusText.value = "閺堫亣鐦戦崚顐㈠煂閸涙垝鎶�: $text"
+        }
+    }
+
+    /** 閸氼垰濮╃憴锝夘暯濞翠胶鈻� */
+    fun startSolving() {
+        _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+        _statusText.value = "濮濓絽婀�閹峰秶鍙�..."
+    }
+
+    /** 閻撗呭�栫亸杈╁崕閿涘苯绱戞慨瀣╃瑐娴肩姴鑻熺拠閿嬬湴AI鐟欙綁顣� */
+    fun onPhotoReady(photoFile: java.io.File) {
+        Log.d("MainViewModel", "閻撗呭�栫亸杈╁崕閿涘苯绱戞慨瀣╃瑐娴�? ${photoFile.absolutePath}")
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.UPLOADING)
+                    _statusText.value = "濮濓絽婀�娑撳﹣绱舵０妯兼窗..."
+                }
+
+                val photoBytes = photoFile.readBytes()
+                Log.d("MainViewModel", "鐠嬪啰鏁� apiService.startSolve()")
+                val requestId = apiService.startSolve(photoBytes)
+                Log.d("MainViewModel", "娑撳﹣绱堕幋鎰�濮涢敍瀹篹questId=$requestId")
+
+                // 閸掑洦宕查崚棰佸瘜缁捐法鈻奸弴瀛樻煀閻樿埖鈧�?
+                withContext(Dispatchers.Main) {
+                    _appState.value = AppState.Solving(stage = SolveStage.ANALYZING)
+                    _statusText.value = "濮濓絽婀�閸掑棙鐎芥０妯兼窗..."
+                }
+
+                // 鏉╃偞甯碨SE
+                Log.d("MainViewModel", "瀵�鈧�婵�瀣�绻涢幒顧橲E濞�?..")
+                connectAndReceiveSSE(requestId)
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "鐟欙綁顣芥径杈�瑙�: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "鐟欙綁顣芥径杈�瑙�: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    /** 閻撗呭�栭幏宥嗘啔婢惰精瑙� */
+    fun onPhotoError(error: String) {
+        _statusText.value = "閹峰秶鍙庢径杈�瑙�: $error"
+        _appState.value = AppState.Tracking
+    }
+
+    /** 鏉╃偞甯碨SE楠炶埖甯撮弨鎯靶掓０妯肩波閺�?*/
+    private suspend fun connectAndReceiveSSE(requestId: String) {
+        val client =
+                OkHttpClient.Builder()
+                        .connectTimeout(30, TimeUnit.SECONDS)
+                        .readTimeout(0, TimeUnit.MILLISECONDS)
+                        .build()
+
+        val request =
+                Request.Builder()
+                        .url("${apiService.getBaseUrl()}/solve/stream/$requestId")
+                        .header("Accept", "text/event-stream")
+                        .build()
+
+        Log.d("MainViewModel", "SSE鐠囬攱鐪癠RL: ${request.url}")
+
+        try {
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+
+            if (!response.isSuccessful) {
+                Log.e("MainViewModel", "SSE鏉╃偞甯存径杈�瑙�: ${response.code}")
+                withContext(Dispatchers.Main) { _statusText.value = "鏉╃偞甯存径杈�瑙�: ${response.code}" }
+                return
+            }
+
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var eventType = ""
+            var dataBuffer = StringBuilder()
+
+            // 娣囨繂鐡ㄩ崥鍕�妯佸▓闈涘敶鐎�?
+            var solutionSteps = ""
+            var fullSolution = ""
+            var mindMap = ""
+            var suggestedQuestions = emptyList<String>()
+
+            while (true) {
+                val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
+
+                when {
+                    line.startsWith("event:") -> {
+                        eventType = line.substring(6).trim()
+                    }
+                    line.startsWith("data:") -> {
+                        dataBuffer.append(line.substring(5).trim())
+                    }
+                    line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                        val data = dataBuffer.toString()
+                        Log.d("MainViewModel", "SSE娴滃�╂��: $data") // 閳�?閸忔娊鏁�閺冦儱绻�
+                        dataBuffer = StringBuilder()
+
+                        withContext(Dispatchers.Main) {
+                            try {
+                                val json = JSONObject(data)
+                                val stage = json.optString("stage", "")
+
+                                when (stage) {
+                                    "info" ->
+                                            _statusText.value = json.optString("content", "婢跺嫮鎮婃稉?..")
+                                    "ocr_complete" -> _statusText.value = "濮濓絽婀�閹兼粎鍌ㄦ０妯虹氨..."
+                                    "search_complete" -> _statusText.value = "AI濮濓絽婀�閸掑棙鐎�..."
+                                    "question_info" -> _statusText.value = "濮濓絽婀�閻㈢喐鍨氱憴锝夘暯閹�婵婄熅..."
+                                    "solution_steps" -> {
+                                        solutionSteps = json.optString("content", "")
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_STEPS,
+                                                        solutionSteps = solutionSteps
+                                                )
+                                    }
+                                    "solution", "solution_rendered" -> {
+                                        fullSolution = json.optString("content", "")
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_FULL,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution
+                                                )
+                                    }
+                                    "mindmap" -> {
+                                        mindMap = json.optString("content", "")
+                                        mindMap = "```\n" + mindMap + "\n"
+                                        val formattedMindMap = mindMap
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.DISPLAY_MINDMAP,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = formattedMindMap
+                                                )
+                                    }
+                                    "suggested_questions" -> {
+                                        val arr = json.optJSONArray("content")
+                                        if (arr != null) {
+                                            suggestedQuestions =
+                                                    (0 until arr.length()).map { arr.getString(it) }
+                                        }
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.INTERACTIVE,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = mindMap,
+                                                        suggestedQuestions = suggestedQuestions
+                                                )
+                                    }
+                                    "complete" -> {
+                                        _appState.value =
+                                                AppState.Solving(
+                                                        stage = SolveStage.COMPLETED,
+                                                        solutionSteps = solutionSteps,
+                                                        fullSolution = fullSolution,
+                                                        mindMap = mindMap,
+                                                        suggestedQuestions = suggestedQuestions
+                                                )
+                                        _statusText.value = "鐟欙絿鐡熺�瑰本鍨�"
+                                    }
+                                    "error" ->
+                                            _statusText.value = "闁挎瑨顕�: ${json.optString("content")}"
+                                }
+                            } catch (e: Exception) {
+                                Log.e("MainViewModel", "鐟欙絾鐎絊SE娴滃�╂�㈡径杈�瑙�: $data", e)
+                            }
+                        }
+                    }
+                }
+            }
+            reader.close()
+            response.close()
+        } catch (e: Exception) {
+            Log.e("MainViewModel", "SSE鏉╃偞甯存径杈�瑙�: ${e.message}", e)
+            withContext(Dispatchers.Main) { _statusText.value = "SSE婢惰精瑙�: ${e.message}" }
+        }
+    }
+
+    /** 閻�銊﹀煕缂佈呯敾閹绘劙妫� */
+    fun askQuestion(question: String) {
+        val currentState = _appState.value as? AppState.Solving ?: return
+        _statusText.value = "濮濓絽婀�閼惧嘲褰囬崶鐐电摕..."
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 鐠嬪啰鏁� API 閼惧嘲褰囬崶鐐电摕
+                val answer =
+                        apiService.askQuestion(
+                                sessionId = currentState.requestId,
+                                question = question
+                        )
+
+                withContext(Dispatchers.Main) {
+                    // 鐏忓棝妫剁粵鏃囨嫹閸旂姴鍩岀�电�呯樈娑�?
+                    val updatedSolution =
+                            currentState.fullSolution + "\n\n---\n\n**Q: $question**\n\n$answer"
+
+                    _appState.value =
+                            currentState.copy(
+                                    fullSolution = updatedSolution,
+                                    suggestedQuestions = emptyList() // 濞撳懘娅庡�歌尙鍋ｉ崙鑽ゆ畱闂傤噣顣�
+                            )
+                    _statusText.value = "瀹告彃娲栫粵"
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusText.value = "閹绘劙妫舵径杈�瑙�: ${e.message}" }
+            }
+        }
+    }
+
+    /** 娑撳﹣绱堕崶鍓у�栫拠閿嬬湴 AI 閸斻劎鏁� */
+    fun requestAnimation(photoFile: java.io.File) {
+        Log.d("MainViewModel", "鐠囬攱鐪癆I閸斻劎鏁鹃敍灞肩瑐娴肩姴娴橀悧? ${photoFile.absolutePath}")
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { _statusText.value = "濮濓絽婀�閻㈢喐鍨氶崝銊ф暰..." }
+
+                val photoBytes = photoFile.readBytes()
+                val response = apiService.requestAnimation(photoBytes)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        // 鏉╂稑鍙嗛崝銊ф暰鐏炴洜銇氶悩鑸碘偓?
+                        _appState.value = AppState.Animation
+                        _statusText.value = "閸斻劎鏁惧�歌尙鏁撻幋"
+                        // 娣囨繂鐡ㄩ崝銊ф暰 URL 娓�?WebView 娴ｈ法鏁�
+                        _animationUrl.value = "http://10.100.55.167:8000${response.url}"
+                    } else {
+                        _statusText.value = "閸斻劎鏁鹃悽鐔稿灇婢惰精瑙�: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "閸斻劎鏁剧拠閿嬬湴婢惰精瑙�: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    /** 閸旂姾娴嘇I閻楀牆顒熼幆鍛�濮ら崨?*/
+    fun loadAiReport() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { _statusText.value = "濮濓絽婀�閻㈢喐鍨欰I鐎涳附鍎忛幎銉ユ啞..." }
+
+                val response = apiService.getAiReport(7)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        _appState.value =
+                                AppState.Report(reportText = response.report, isLoading = false)
+                        _statusText.value = "AI閹躲儱鎲″�歌尙鏁撻幋"
+                    } else {
+                        _statusText.value = "閹躲儱鎲￠悽鐔稿灇婢惰精瑙�: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "閹躲儱鎲＄拠閿嬬湴婢惰精瑙�: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    /** 閸旂姾娴囬弫鐗堝祦閻楀牆顒熼幆鍛�濮ら崨?*/
+    fun loadDataReport() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { _statusText.value = "濮濓絽婀�閻㈢喐鍨氶弫鐗堝祦鐎涳附鍎忛幎銉ユ啞..." }
+
+                val response = apiService.getDataReport(7)
+
+                withContext(Dispatchers.Main) {
+                    if (response.status == "ok") {
+                        val fullUrl = "${apiService.getBaseUrl()}${response.url}"
+                        _appState.value =
+                                AppState.Report(
+                                        reportText = fullUrl, // 鐎�?URL 閸�?reportText 鐎涙�侇唽
+                                        isLoading = false
+                                )
+                        _statusText.value = "閺佺増宓侀幎銉ユ啞瀹歌尙鏁撻幋"
+                    } else {
+                        _statusText.value = "閹躲儱鎲￠悽鐔稿灇婢惰精瑙�: ${response.message}"
+                        _appState.value = AppState.Tracking
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "閹躲儱鎲＄拠閿嬬湴婢惰精瑙�: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    /** 鐠囬攱鐪伴惌銉ㄧ槕瀵ゆ湹鍑� */
+    fun requestKnowledgeExtension(photoFile: java.io.File) {
+        Log.d("MainViewModel", "鐠囬攱鐪伴惌銉ㄧ槕瀵ゆ湹鍑�: ${photoFile.absolutePath}")
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { _statusText.value = "濮濓絽婀�娑撳﹣绱�..." }
+
+                val photoBytes = photoFile.readBytes()
+                val requestId = apiService.startExtend(photoBytes)
+
+                withContext(Dispatchers.Main) { _statusText.value = "濮濓絽婀�閸掑棙鐎�..." }
+
+                connectExtendSSE(requestId)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusText.value = "鐠囬攱鐪版径杈�瑙�: ${e.message}"
+                    _appState.value = AppState.Tracking
+                }
+            }
+        }
+    }
+
+    private suspend fun connectExtendSSE(requestId: String) {
+        val client =
+                OkHttpClient.Builder()
+                        .connectTimeout(30, TimeUnit.SECONDS)
+                        .readTimeout(0, TimeUnit.MILLISECONDS)
+                        .build()
+
+        val request =
+                Request.Builder()
+                        .url("${apiService.getBaseUrl()}/extend/stream/$requestId")
+                        .header("Accept", "text/event-stream")
+                        .build()
+
+        try {
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+
+            val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+            var dataBuffer = StringBuilder()
+            var summary = ""
+            var mistakes = ""
+            var extension = ""
+            var questions = emptyList<String>()
+
+            while (true) {
+                val line = withContext(Dispatchers.IO) { reader.readLine() } ?: break
+
+                when {
+                    line.startsWith("data:") -> {
+                        dataBuffer.append(line.substring(5).trim())
+                    }
+                    line.isEmpty() && dataBuffer.isNotEmpty() -> {
+                        val data = dataBuffer.toString()
+                        dataBuffer = StringBuilder()
+
+                        withContext(Dispatchers.Main) {
+                            val json = JSONObject(data)
+                            val stage = json.optString("stage")
+
+                            when (stage) {
+                                "info" -> _statusText.value = json.optString("content", "婢跺嫮鎮婃稉?..")
+                                "ocr_complete" -> _statusText.value = "濮濓絽婀�閸掑棙鐎介崘鍛�顔�..."
+                                "question_info" -> {
+                                    _appState.value = AppState.Knowledge()
+                                    _statusText.value = "濮濓絽婀�閹�鑽ょ波閻�銉ㄧ槕閻�?.."
+                                }
+                                "mistakes" -> {
+                                    mistakes = json.optString("content", "")
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes
+                                            )
+                                    _statusText.value = "閺勬捇鏁婇悙鐟板嚒閻㈢喐鍨�"
+                                }
+                                "extension" -> {
+                                    extension = json.optString("content", "")
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension
+                                            )
+                                    _statusText.value = "閻�銉ㄧ槕閹锋挸鐫嶅�歌尙鏁撻幋"
+                                }
+                                "suggested_questions" -> {
+                                    val arr = json.optJSONArray("content")
+                                    if (arr != null) {
+                                        questions = (0 until arr.length()).map { arr.getString(it) }
+                                    }
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension,
+                                                    suggestedQuestions = questions
+                                            )
+                                    _statusText.value = "瀵ゆ湹鍑犵�瑰本鍨�"
+                                }
+                                "complete" -> {
+                                    _appState.value =
+                                            AppState.Knowledge(
+                                                    summary = summary,
+                                                    mistakes = mistakes,
+                                                    extension = extension,
+                                                    suggestedQuestions = questions
+                                            )
+                                    _statusText.value = "瀵ゆ湹鍑犵�瑰本鍨�"
+                                }
+                                "error" -> _statusText.value = "闁挎瑨顕�: ${json.optString("content")}"
+                            }
+                        }
+                    }
+                }
+            }
+            reader.close()
+            response.close()
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) { _statusText.value = "鏉╃偞甯存径杈�瑙�: ${e.message}" }
+        }
+    }
+
+    /** 鏉╂柨娲栫捄鐔婚嚋濡�鈥崇础 */
+    fun backToTracking() {
+        _appState.value = AppState.Tracking
+        _statusText.value = "鐠虹喕閲滅�涳缚绡勬稉?.."
+    }
+
+    private val _detectedFingerCount = MutableStateFlow(0)
+    val detectedFingerCount: StateFlow<Int> = _detectedFingerCount.asStateFlow()
+
+    fun setFingerCount(count: Int) {
+        _detectedFingerCount.value = count
+    }
+
+    // ===== 鐠佸墽鐤嗛棃銏℃緲 =====
+    val showSettingsDialog = MutableStateFlow(false)
+    val showWelcomeDialog = MutableStateFlow(true)
+    val showHistoryScreen = MutableStateFlow(false)
+
+    // 鐠佸墽鐤嗘い?
+    val gestureEnabled = MutableStateFlow(false)
+    val voiceEnabled = MutableStateFlow(false)
+    val tomatoEnabled = MutableStateFlow(false)
+    val serverAddress = MutableStateFlow("10.100.55.167:8000")
+    val themeColor = MutableStateFlow(Color(0xFF00D2FF))
+    val fontSize = MutableStateFlow(16f)
+
+    val showModules =
+            MutableStateFlow(
+                    mapOf(
+                            "solution_steps" to true,
+                            "full_solution" to true,
+                            "mind_map" to true,
+                            "suggested_questions" to true,
+                            "mistakes" to true,
+                            "extension" to true,
+                    )
+            )
+
+    val aiEngine = MutableStateFlow("deepseek")
+    val historyStartDate = MutableStateFlow("")
+    val historyEndDate = MutableStateFlow("")
+
+    /**
+     * 閺囧瓨鏌婇張宥呭�熺粩顖氭勾閸р偓閿涘牐鍤滈崝銊ュ絺閻滄澘鎮楃拫鍐�鏁ら敍?
+     */
+    fun updateServerAddress(address: String) {
+        serverAddress.value = address.removePrefix("http://")
+        apiService.updateServerAddress(address)
+        Log.d("MainViewModel", "閺堝秴濮熺粩顖氭勾閸р偓瀹稿弶娲块弬? $address")
+    }
+
+    fun showSettings() {
+        showSettingsDialog.value = true
+    }
+    fun showHistory() {
+        showHistoryScreen.value = true
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                apiService.clearHistory()
+                withContext(Dispatchers.Main) { _statusText.value = "閸樺棗褰剁拋鏉跨秿瀹稿弶绔婚梽" }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusText.value = "濞撳懘娅庢径杈�瑙�: ${e.message}" }
+            }
+        }
+    }
+
+    // ===== 閹稿�愭尦鐟欙箑褰傞惃鍕�濯块悡褍娲栫拫?=====
+    var onButtonTakePhoto: (() -> Unit)? = null
+    var onButtonAnimation: (() -> Unit)? = null
+    var onButtonExtend: (() -> Unit)? = null
+
+    /** 閹稿�愭尦鐟欙箑褰傞敍姘�濯块悡褑袙妫�?*/
+    fun onButtonSolve() {
+        // 閸忓牐袝閸欐垶濯块悡褝绱欏�濄倖妞傞惄鍛婃簚娴犲秴婀�鏉╂劘顢戦敍澶涚礉閹峰秶鍙庨幋鎰�濮涢崥搴ｆ暠 onPhotoReady 閺�鐟板綁閻樿埖鈧�?
+        _statusText.value = "濮濓絽婀�閹峰秶鍙�..."
+        onButtonTakePhoto?.invoke()
+    }
+
+    /** 閹稿�愭尦鐟欙箑褰傞敍娆癐閸斻劎鏁� */
+    fun onButtonAnimation() {
+        _statusText.value = "濮濓絽婀�閸戝棗顦�閸斻劎鏁�..."
+        onButtonAnimation?.invoke()
+    }
+
+    /** 閹稿�愭尦鐟欙箑褰傞敍姘辩叀鐠囧棗娆㈡导?*/
+    fun onButtonExtend() {
+        _statusText.value = "濮濓絽婀�閸戝棗顦�閻�銉ㄧ槕瀵ゆ湹鍑�..."
+        onButtonExtend?.invoke()
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        thinkingJob?.cancel()
+        pomodoroJob?.cancel()
+    }
+}
+
+// ==================== 娑撶眲ctivity ====================
+
+class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val TAG = "LearningAssistant"
+    }
+
+    private lateinit var cameraExecutor: java.util.concurrent.ExecutorService
+
+    // ===== 閻╁憡婧�閻╃�垮彠 =====
+    private var imageCapture: ImageCapture? = null
+    private val gestureRecognizerState = MutableStateFlow<HandGestureRecognizer?>(null)
+    private val isCameraReady = MutableStateFlow(false)
+
+
+    // 鏉╁�熼嚋閺夊啴妾洪悩鑸碘偓?
+    private val hasCameraPermission = MutableStateFlow(false)
+
+    // ViewModel 瀵�鏇犳暏
+    private lateinit var mainViewModel: MainViewModel
+
+    // ===== 閻╁憡婧�闁插秴鎯庣拋鈩冩殶閸ｎ煉绱欓悽銊ょ艾瀵�鍝勫煑rebind閿�?=====
+    private val cameraRebindTrigger = MutableStateFlow(0)
+
+    // ===== 閺傛澘顤冮敍姘�濯块悡褍娲栫拫?=====
+    var onTakePhoto: ((ImageCapture) -> Unit)? = null
+
+    // 閺夊啴妾虹拠閿嬬湴閿涘牅绗夐崣姗堢礆
+    private val requestPermissionLauncher =
+            registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                    permissions ->
+                val granted = permissions.values.all { it }
+                if (granted) {
+                    Log.d(TAG, "閹碘偓閺堝�嬫綀闂勬劕鍑￠幒鍫滅埃")
+                    hasCameraPermission.value = true
+                } else {
+                    Log.w(TAG, "閺夊啴妾虹悮顐ｅ珕缂�")
+                    Toast.makeText(this, "闂団偓鐟曚胶娴夐張鐑樻綀闂勬劖澧犻懗鑺ヮ劀鐢�闀愬▏閻�", Toast.LENGTH_LONG).show()
+                    hasCameraPermission.value = false
+                }
+            }
+
+    private val serverDiscoverer = ServerDiscoverer()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        discoverAndConnect()
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        initGestureRecognizer()
+
+        val hasCamera =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                    PackageManager.PERMISSION_GRANTED
+        val hasInternet =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) ==
+                    PackageManager.PERMISSION_GRANTED
+        Log.d(TAG, "閺夊啴妾洪悩鑸碘偓?- 閻╁憡婧�:$hasCamera, 缂冩垹绮�:$hasInternet")
+
+        if (hasCamera) {
+            hasCameraPermission.value = true
+            Log.d(TAG, "閻╁憡婧�閺夊啴妾哄�稿弶宸挎禍鍫�绱濋惄瀛樺复鐠佸墽鐤�")
+        } else {
+            Log.d(TAG, "閻╁憡婧�閺夊啴妾洪張顏呭房娴滃牞绱濇稉璇插З鐠囬攱鐪�")
+            requestPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.INTERNET,
+                    Manifest.permission.ACCESS_NETWORK_STATE,
+                    Manifest.permission.RECORD_AUDIO,
+                )
+            )
+        }
+
+        setContent {
+            LearningAssistantTheme {
+                val viewModel = viewModel<MainViewModel>()
+                mainViewModel = viewModel
+
+                // 閸掓繂顫愰崠鏈卲iService閿涘湯haredPreferences + 閼奉亜濮╅惂璇茬秿濡�鈧�閺屻儻绱�
+                LaunchedEffect(Unit) {
+                    viewModel.initApiService(this@MainActivity)
+                }
+
+                // 缂佹垵鐣鹃幐澶愭尦閸ョ偠鐨熼弮鑸殿梾閺屻儳娴夐張铏瑰Ц閹�?
+                // ===== 閻╁憡婧�閹稿�愭尦閸ョ偠鐨熼柅姘辨暏婢跺嫮鎮� =====
+                fun requireCamera(action: String, takeAction: (ImageCapture) -> Unit) {
+                    Log.d(TAG, "$action: imageCapture=${imageCapture}, isCameraReady=${isCameraReady.value}")
+                    if (!isCameraReady.value) {
+                        Toast.makeText(this@MainActivity, "閻╁憡婧�閺堫亜姘ㄧ紒顏庣礉鐠囬�庘棦閸氬骸鍟�鐠�", Toast.LENGTH_SHORT).show()
+                        return
+                    }
+                    imageCapture?.let { capture ->
+                        takeAction(capture)
+                    } ?: run {
+                        Log.e(TAG, "imageCapture 娑�?null")
+                        Toast.makeText(this@MainActivity, "閻╁憡婧�閺堫亜姘ㄧ紒顏庣礉鐠囬�庘棦閸氬骸鍟�鐠�", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                viewModel.onButtonTakePhoto = {
+                    requireCamera("onButtonTakePhoto") { capture ->
+                        takePhotoAndUpload(capture, viewModel)
+                    }
+                }
+
+                viewModel.onButtonAnimation = {
+                    requireCamera("onButtonAnimation") { capture ->
+                        takePhotoAndUploadAnimation(capture, viewModel)
+                    }
+                }
+
+                viewModel.onButtonExtend = {
+                    requireCamera("onButtonExtend") { capture ->
+                        takePhotoAndUploadExtend(capture, viewModel)
+                    }
+                }
+
+                MainScreen(
+                    hasCameraPermission = hasCameraPermission.collectAsState().value,
+                    gestureRecognizer = gestureRecognizerState.collectAsState().value,
+                    viewModel = viewModel,
+                    onImageCaptureReady = { capture ->
+                        imageCapture = capture
+                        isCameraReady.value = true  // 閻╁憡婧�鐏忚京鍗�
+                        Log.d(TAG, "ImageCapture 瀹告彃姘ㄧ紒")
+                    },
+                    cameraRebindTrigger = cameraRebindTrigger.collectAsState().value
+                )
+            }
+        }
+    }
+
+    private fun discoverAndConnect() {
+        lifecycleScope.launch {
+            // 瀵ゆ儼绻滄稉鈧�娑撳�剁礉缁涘�婄窡 setContent 娑�?mainViewModel 閸掓繂顫愰崠鏍х暚閹�?
+            delay(500)
+            val address = serverDiscoverer.discover()
+            if (address != null) {
+                Log.d(TAG, "閼奉亜濮╅崣鎴犲箛閹存劕濮�: $address")
+                mainViewModel.updateServerAddress(address)
+            } else {
+                Log.w(TAG, "閺堫亜褰傞悳鐗堟箛閸旓紕顏�閿涘苯鐨㈡担璺ㄦ暏姒涙�款吇閸︽澘娼�")
+            }
+        }
+    }
+
+    private fun takePhotoAndUpload(capture: ImageCapture, viewModel: MainViewModel) {
+        // 濞ｈ�插�為惄鍛婃簚閻樿埖鈧�浣诡梾閺�?
+        if (!isCameraReady.value) {
+            viewModel.onPhotoError("閻╁憡婧�閺堫亜姘ㄧ紒")
+            return
+        }
+
+        val photoFile = java.io.File(externalCacheDir, "solve_${System.currentTimeMillis()}.jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        // 鐠佸墽鐤嗙搾鍛�妞傞敍宀勪缉閸忓秵妫ら梽鎰�鐡戝��?
+        val mainHandler = Handler(Looper.getMainLooper())
+        val timeoutRunnable = Runnable {
+            Log.e(TAG, "閹峰秶鍙庣搾鍛�妞�")
+            viewModel.onPhotoError("閹峰秶鍙庣搾鍛�妞�")
+        }
+        mainHandler.postDelayed(timeoutRunnable, 5000)
+
+        capture.takePicture(
+            outputOptions,
+            cameraExecutor,
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    Log.d(TAG, "閻撗呭�栧�歌弓绻氱��? ${photoFile.absolutePath}")
+                    viewModel.onPhotoReady(photoFile)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    mainHandler.removeCallbacks(timeoutRunnable)
+                    Log.e(TAG, "閹峰秶鍙庢径杈�瑙�: ${exception.message}")
+                    // 婵″倹鐏夐惄鍛婃簚瀹告彃鍙ч梻顓ㄧ礉鐏忔繆鐦�闁插秵鏌婄紒鎴濈暰
+                    if (exception.message?.contains("closed") == true) {
+                        isCameraReady.value = false
+                        imageCapture = null
+                        // 鐟欙箑褰傞惄鍛婃簚闁插秵鏌婄紒鎴濈暰
+                        cameraRebindTrigger.value += 1
+                    }
+                    viewModel.onPhotoError(exception.message ?: "閹峰秶鍙庢径杈�瑙�")
+                }
+            }
+        )
+    }
+
+    private fun takePhotoAndUploadAnimation(capture: ImageCapture, viewModel: MainViewModel) {
+        val photoFile = java.io.File(externalCacheDir, "anim_${System.currentTimeMillis()}.jpg")
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        Log.d(TAG, "閸斻劎鏁鹃悡褏澧栧�歌弓绻氱��? ${photoFile.absolutePath}")
+                        viewModel.requestAnimation(photoFile)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "閹峰秶鍙庢径杈�瑙�: ${exception.message}")
+                    }
+                }
+        )
+    }
+
+    // 閸掓繂顫愰崠鏍ㄥ�滈崝鑳�鐦戦崚顐㈡珤閿涘牆鎮楅崣鏉垮�炴潪鑺ツ侀崹瀣剁礉闁�鍨�鍘ら梼璇差敚娑撹崵鍤庣粙瀣剁礆
+    private fun initGestureRecognizer() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val recognizer = HandGestureRecognizer(
+                    context = this@MainActivity,
+                    onGestureDetected = { fingerCount ->
+                        Log.d(TAG, "閹靛��濞嶇拠鍡楀焼: $fingerCount 閺嶈�勫�滈幐")
+                            runOnUiThread {
+                                when (fingerCount) {
+                                    5 -> {
+                                        // ===== 缁斿��宓嗛幏宥囧弾閿涘奔绗夐棁鈧�鐟曚胶顑囨禍灞绢偧绾�顔款吇 =====
+                                        mainViewModel.startSolving()
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUpload(capture, mainViewModel)
+                                        }
+                                                ?: Log.e(TAG, "imageCapture 娑撹櫣鈹栭敍灞炬￥濞夋洘濯块悡")
+                                    }
+                                    4 -> {
+                                        // AI閸斻劎鏁� - 閹峰秶鍙庨悽鐔稿灇閸斻劎鏁�
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUploadAnimation(capture, mainViewModel)
+                                        }
+                                                ?: Log.e(TAG, "imageCapture 娑撹櫣鈹栭敍灞炬￥濞夋洘濯块悡")
+                                    }
+                                    3 -> {
+                                        // 閺佺増宓侀悧鍫濐劅閹�鍛�濮ら崨?
+                                        mainViewModel.onGestureDetected(3)
+                                    }
+                                    2 -> {
+                                        // AI閻楀牆顒熼幆鍛�濮ら崨?
+                                        mainViewModel.onGestureDetected(2)
+                                    }
+                                    1 -> {
+                                        // 閻�銉ㄧ槕瀵ゆ湹鍑�
+                                        imageCapture?.let { capture ->
+                                            takePhotoAndUploadExtend(capture, mainViewModel)
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        onFingerCountChanged = { fingerCount ->
+                            runOnUiThread { mainViewModel.setFingerCount(fingerCount) }
+                        },
+                        onError = { error ->
+                            Log.e(TAG, "閹靛��濞嶇拠鍡楀焼闁挎瑨顕�: ${error.message}")
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "閹靛��濞嶇拠鍡楀焼婢惰精瑙�: ${error.message}", Toast.LENGTH_SHORT)
+                                        .show()
+                            }
+                        }
+                )
+            
+            // 閸掑洤娲栨稉鑽ゅ殠缁嬪��顔曠純?gestureRecognizer閿涘牅绱扮憴锕�褰� Compose 闁插秶绮嶉敍?
+            withContext(Dispatchers.Main) {
+                gestureRecognizerState.value = recognizer
+                Log.d(TAG, "閹靛��濞嶇拠鍡楀焼閸ｃ劌鍨垫慨瀣�瀵茬�瑰本鍨�")
+            }
+        }
+    }
+
+    private fun requestCameraPermissions() {
+        val permissions =
+                arrayOf(
+                        Manifest.permission.CAMERA,
+                        Manifest.permission.INTERNET,
+                        Manifest.permission.ACCESS_NETWORK_STATE,
+                )
+
+        val needRequest =
+                permissions.any {
+                    val hasIt =
+                            ContextCompat.checkSelfPermission(this, it) ==
+                                    PackageManager.PERMISSION_GRANTED
+                    Log.d(TAG, "閺夊啴妾� $it: ${if (hasIt) "瀹稿弶宸挎禍? else "閺堫亝宸挎禍?}")
+                    !hasIt
+                }
+
+        if (needRequest) {
+            Log.d(TAG, "濮濓絽婀�鐠囬攱鐪伴弶鍐�妾�...")
+            requestPermissionLauncher.launch(permissions)
+        } else {
+            Log.d(TAG, "閹碘偓閺堝�嬫綀闂勬劕鍑￠幒鍫滅埃閿涘本妫ら棁鈧�鐠囬攱鐪�")
+            hasCameraPermission.value = true
+        }
+    }
+
+    private fun takePhotoAndUploadExtend(capture: ImageCapture, viewModel: MainViewModel) {
+        val photoFile = java.io.File(externalCacheDir, "extend_${System.currentTimeMillis()}.jpg")
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+        capture.takePicture(
+                outputOptions,
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        Log.d(TAG, "瀵ゆ湹鍑犻悡褏澧栧�歌弓绻氱��? ${photoFile.absolutePath}")
+                        viewModel.requestKnowledgeExtension(photoFile)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "閹峰秶鍙庢径杈�瑙�: ${exception.message}")
+                    }
+                }
+        )
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        gestureRecognizerState.value?.close()
+        cameraExecutor.shutdown()
+    }
+}
+
+// ==================== 娑撹崵鏅�闂�?====================
+@Composable
+fun MainScreen(
+    hasCameraPermission: Boolean = false,
+    gestureRecognizer: HandGestureRecognizer? = null,
+    viewModel: MainViewModel,
+    onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
+    cameraRebindTrigger: Int = 0,  // 閸旂姴鍩屾潻娆庨嚋閸欏倹鏆熼悽銊ょ艾瀵�鍝勫煑rebind
+) {
+    val appState by viewModel.appState.collectAsState()
+    val statusText by viewModel.statusText.collectAsState()
+    val gestureEnabled by viewModel.gestureEnabled.collectAsState()
+    val isMainScreen = appState is AppState.Tracking
+
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A1A))) {
+        // 閻╁憡婧�妫板嫯顫� - 婵�瀣�绮撴穱婵囧瘮閸︺劌鎮楅崣鎷岀箥鐞涘矉绱欐稉宥夋�㈤悩鑸碘偓浣稿瀼閹广垼鈧�宀勬敘濮�?闁插秴缂撻敍?
+        if (hasCameraPermission) {
+            CameraPreviewView(
+                modifier = if (isMainScreen) Modifier.fillMaxSize() else Modifier.fillMaxSize().alpha(0f),
+                gestureRecognizer = if (gestureEnabled && isMainScreen) gestureRecognizer else null,
+                onImageCaptureReady = onImageCaptureReady,
+                onCameraReady = {
+                    Log.d("MainScreen", "閻╁憡婧�瀹告彃姘ㄧ紒")
+                },
+                rebindKey = cameraRebindTrigger
+            )
+        }
+        // 閸撳秵娅欓崘鍛�顔�
+        when (val state = appState) {
+            is AppState.Login ->
+                LoginScreen(
+                    isLoading = state.isLoading,
+                    error = state.error,
+                    onLogin = { username, password -> viewModel.login(username, password) },
+                    onRegister = { username, password -> viewModel.register(username, password) },
+                )
+            is AppState.Tracking ->
+                MainMenuScreen(
+                    viewModel = viewModel,
+                    statusText = statusText,
+                    gestureEnabled = gestureEnabled,
+                )
+            is AppState.Solving ->
+                SolvingScreen(
+                    solveState = state,
+                    showModules = viewModel.showModules.collectAsState().value,
+                    onAskQuestion = { viewModel.askQuestion(it) },
+                    onBack = { viewModel.backToTracking() },
+                )
+            is AppState.Report -> {
+                val isDataReport = state.reportText.startsWith("http")
+                if (state.isLoading) {
+                    LoadingOverlay("濮濓絽婀�閻㈢喐鍨氶幎銉ユ啞...")
+                } else {
+                    ReportScreen(
+                            report = state,
+                            onBack = { viewModel.backToTracking() },
+                            reportUrl = if (isDataReport) state.reportText else "",
+                            reportText = if (!isDataReport) state.reportText else "",
+                    )
+                }
+            }
+            is AppState.Animation -> {
+                val animUrl = viewModel.animationUrl.collectAsState().value
+                if (animUrl.isEmpty()) {
+                    LoadingOverlay("濮濓絽婀�閻㈢喐鍨氶崝銊ф暰...")
+                } else {
+                    AnimationScreen(
+                            onBack = { viewModel.backToTracking() },
+                            animationUrl = animUrl
+                    )
+                }
+            }
+            is AppState.History ->
+                    HistoryScreen(
+                            onBack = { viewModel.backToTracking() },
+                    )
+            is AppState.Knowledge ->
+                    KnowledgeScreen(
+                            state = state,
+                            showModules = viewModel.showModules.collectAsState().value,
+                            onAskQuestion = { viewModel.askQuestion(it) },
+                            onBack = { viewModel.backToTracking() },
+                    )
+        }
+
+        // 濞嗐垼绻�/鐠佸墽鐤�/閸樺棗褰跺��鍦�鐛�
+        if (viewModel.showWelcomeDialog.collectAsState().value) {
+            WelcomeDialog(onDismiss = { viewModel.showWelcomeDialog.value = false })
+        }
+
+        if (viewModel.showSettingsDialog.collectAsState().value) {
+            SettingsDialog(
+                    viewModel = viewModel,
+                    onDismiss = { viewModel.showSettingsDialog.value = false }
+            )
+        }
+        if (viewModel.showHistoryScreen.collectAsState().value) {
+            HistoryViewScreen(
+                viewModel = viewModel,
+                onBack = { viewModel.showHistoryScreen.value = false }
+            )
+        }
+    }
+}
+
+// ==================== 閻╁憡婧�妫板嫯顫� ====================
+// MainActivity.kt - 閺囨寧宕� CameraPreviewView 閸戣姤鏆�
+
+@Composable
+fun CameraPreviewView(
+    modifier: Modifier = Modifier,
+    gestureRecognizer: HandGestureRecognizer? = null,
+    onImageCaptureReady: ((ImageCapture) -> Unit)? = null,
+    onCameraReady: (() -> Unit)? = null,
+    rebindKey: Int = 0,  // 閸欐ê瀵查弮璺哄繁閸掔�梕bind
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+
+    val hasPermission =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+
+    if (!hasPermission) {
+        Box(modifier = modifier.background(Color.Black))
+        return
+    }
+
+    // 娴ｈ法鏁� remember 娣囨繃瀵旈惄鍛婃簚閻樿埖鈧�渚婄礉闁�鍨�鍘ら柌宥咁槻閸掓繂顫愰崠?
+    val cameraState = remember {
+        mutableStateOf<ProcessCameraProvider?>(null)
+    }
+
+    val imageCaptureRef = remember { mutableStateOf<ImageCapture?>(null) }
+    val isBound = remember { mutableStateOf(false) }
+
+    // 閼惧嘲褰� CameraProvider閿涘牆褰查柌宥堢槸閿涘矂鈧�鍌炲帳濡�鈩冨珯閸�?CameraX 閸掓繂顫愰崠鏍ф�㈡潻鐕傜礆
+    LaunchedEffect(Unit) {
+        var retryCount = 0
+        val maxRetries = 5
+        while (retryCount < maxRetries && cameraState.value == null) {
+            try {
+                val cameraProvider = withContext(Dispatchers.IO) {
+                    val future = ProcessCameraProvider.getInstance(context)
+                    try {
+                        future.get(10, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (e: java.util.concurrent.TimeoutException) {
+                        Log.w("CameraPreview", "閼惧嘲褰� CameraProvider 鐡掑懏妞� (缁�?{retryCount + 1}濞�?")
+                        null
+                    }
+                }
+                if (cameraProvider != null) {
+                    cameraState.value = cameraProvider
+                    Log.d("CameraPreview", "CameraProvider 閼惧嘲褰囬幋鎰�濮�")
+                } else {
+                    retryCount++
+                    if (retryCount < maxRetries) {
+                        delay(2000) // 缁涘�婄窡2缁夋帒鎮楅柌宥堢槸
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("CameraPreview", "閼惧嘲褰� CameraProvider 婢惰精瑙� (缁�?{retryCount + 1}濞�?", e)
+                retryCount++
+                if (retryCount < maxRetries) {
+                    delay(2000)
+                }
+            }
+        }
+        if (cameraState.value == null) {
+            Log.e("CameraPreview", "CameraProvider 閼惧嘲褰囨径杈�瑙﹂敍灞藉嚒闁插秷鐦� $maxRetries 濞�")
+        }
+    }
+
+    // 缂佹垵鐣鹃惄鍛婃簚閿涘潌indToLifecycle 韫囧懘銆忛崷銊ゅ瘜缁捐法鈻肩拫鍐�鏁ら敍?
+    LaunchedEffect(cameraState.value, lifecycleOwner, rebindKey) {
+        val cameraProvider = cameraState.value ?: return@LaunchedEffect
+        val currentLifecycle = lifecycleOwner
+
+        // 閸忓牐袙缂佹垶澧嶉張?
+        cameraProvider.unbindAll()
+        isBound.value = false
+
+        // 閸掓稑缂� Preview
+        val preview = Preview.Builder().build()
+
+        // 閸掓稑缂� ImageCapture
+        val imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .build()
+
+        val useCases = mutableListOf<UseCase>(preview, imageCapture)
+
+        // 濞ｈ�插�為幍瀣�濞嶉崚鍡樼��
+        if (gestureRecognizer != null) {
+            val analyzer = CameraAnalyzer(gestureRecognizer, processIntervalMs = 60)
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also {
+                    it.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
+                }
+            useCases.add(imageAnalysis)
+        }
+
+        try {
+            // bindToLifecycle 韫囧懘銆忔潻鎰�顢戦崷銊ゅ瘜缁捐法鈻奸敍瀛媋meraX 娓氭繆绂嗘稉鑽ゅ殠缁嬪��娈� Looper
+            withContext(Dispatchers.Main) {
+                cameraProvider.bindToLifecycle(
+                    currentLifecycle,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    *useCases.toTypedArray()
+                )
+            }
+
+            imageCaptureRef.value = imageCapture
+            onImageCaptureReady?.invoke(imageCapture)
+            isBound.value = true
+            onCameraReady?.invoke()
+
+            Log.d("CameraPreview", "閻╁憡婧�缂佹垵鐣鹃幋鎰�濮�")
+        } catch (e: Exception) {
+            Log.e("CameraPreview", "閻╁憡婧�缂佹垵鐣炬径杈�瑙�", e)
+        }
+    }
+
+    // 瑜�?gestureRecognizer 閸欐ê瀵查弮璁圭礉閸楁洜瀚�閺囧瓨鏌� ImageAnalysis
+    LaunchedEffect(gestureRecognizer) {
+        val cameraProvider = cameraState.value ?: return@LaunchedEffect
+        if (!isBound.value) return@LaunchedEffect
+        
+        // 缁夊�氭珟閺冄呮畱閹靛��濞嶉崚鍡樼�介崳?
+        cameraProvider.unbindAll()
+        
+        val preview = Preview.Builder().build()
+        val imageCapture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .build()
+        
+        val useCases = mutableListOf<UseCase>(preview, imageCapture)
+
+        if (gestureRecognizer != null) {
+            val analyzer = CameraAnalyzer(gestureRecognizer, processIntervalMs = 60)
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also {
+                    it.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
+                }
+            useCases.add(imageAnalysis)
+        }
+        
+        try {
+            // bindToLifecycle 韫囧懘銆忔潻鎰�顢戦崷銊ゅ瘜缁捐法鈻�
+            cameraProvider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                *useCases.toTypedArray()
+            )
+            imageCaptureRef.value = imageCapture
+            onImageCaptureReady?.invoke(imageCapture)
+            Log.d("CameraPreview", "Gesture: ${if (gestureRecognizer != null) "enabled" else "disabled"}")
+        } catch (e: Exception) {
+            Log.e("CameraPreview", "Failed to update gesture analyzer", e)
+        }
+    }
+
+    // 鐟欙絿绮﹂弮鑸电�婚悶?
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                cameraState.value?.unbindAll()
+                Log.d("CameraPreview", "閻╁憡婧�瀹歌尪袙缂�")
+            } catch (e: Exception) {
+                Log.e("CameraPreview", "鐟欙絿绮﹂惄鍛婃簚婢惰精瑙�", e)
+            }
+        }
+    }
+
+    // 缁岃櫣娈� Composable閿涘奔绗夐棁鈧�鐟曚焦妯夌粈娲�顣╃憴?
+    Box(modifier = modifier)
+}
+
+// ==================== 鐠虹喕閲滅�涳缚绡勯崣鐘插�炵仦?====================
+
+@Composable
+fun TrackingOverlay(
+        statusText: String,
+        pomodoroTime: Int,
+        pageCount: Int,
+        thinkingTimer: Int,
+        fingerCount: Int = 0, // 閳�?閺傛澘顤冮崣鍌涙殶
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // 妞ゅ爼鍎撮悩鑸碘偓浣圭埉
+        Column(
+                modifier =
+                        Modifier.align(Alignment.TopCenter)
+                                .padding(16.dp)
+                                .background(Color(0xAA000000))
+                                .padding(12.dp)
+        ) {
+            Text(
+                    text = statusText,
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(text = "${formatTime(pomodoroTime)}", color = Color.White, fontSize = 14.sp)
+                Text(text = "瀹告彃浠�${pageCount}妞�", color = Color.White, fontSize = 14.sp)
+            }
+
+            if (thinkingTimer > 0) {
+                Text(
+                        text = "閹�婵娾偓鍐ц厬... ${thinkingTimer}s",
+                        color = Color(0xFFFFD700),
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+        }
+
+        // ===== 閹靛��瀵氶弫浼村櫤閺勫墽銇氶敍鍫ｇ殶鐠囨洜鏁ら敍?=====
+        if (fingerCount > 0) {
+            Text(
+                    text = "$fingerCount 閺嶈�勫�滈幐",
+                    color = Color(0xFF00FF00),
+                    fontSize = 48.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier =
+                            Modifier.align(Alignment.Center)
+                                    .background(Color(0xAA000000))
+                                    .padding(16.dp)
+            )
+        }
+
+        // 鎼存洟鍎撮幍瀣�濞嶉幓鎰�銇氶敍鍫滅矌閸︺劍澧滈崝鑳�鐦戦崚顐㈢磻閸氼垱妞傞弰鍓с仛閿�?
+        if (fingerCount > 0) {
+            Text(
+                    text = "閹靛��濞嶉崨鎴掓姢: 5閳�鎺曅掓０?| 4閳�鎺戝З閻�?| 3閳�鎺撴殶閹诡喗濮ら崨?| 2閳�鎵怚閹躲儱鎲� | 1閳�鎺旂叀鐠囧棗娆㈡导",
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 12.sp,
+                    modifier =
+                            Modifier.align(Alignment.BottomCenter)
+                                    .padding(16.dp)
+                                    .background(Color(0x55000000))
+                                    .padding(8.dp)
+            )
+        }
+    }
+}
+
+// ==================== 閻ц�茬秿濞夈劌鍞介悾宀勬桨 ====================
+
+@Composable
+fun LoginScreen(
+    isLoading: Boolean = false,
+    error: String = "",
+    onLogin: (String, String) -> Unit,
+    onRegister: (String, String) -> Unit,
+) {
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var isRegisterMode by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A1A))
+            .padding(32.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // 閺嶅洭顣�
+                Text(
+                    text = "棣冩憥 鐎涳缚绡勯崝鈺傚��",
+                    color = Color(0xFF00D2FF),
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (isRegisterMode) "閸掓稑缂撻弬鎷屽�勯崣" else "閻ц�茬秿",
+                    color = Color.Gray,
+                    fontSize = 14.sp
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // 閻�銊﹀煕閸氬秷绶�閸�?
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("閻�銊﹀煕閸�", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    enabled = !isLoading,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF00D2FF),
+                        unfocusedBorderColor = Color.Gray,
+                        cursorColor = Color(0xFF00D2FF),
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 鐎靛棛鐖滄潏鎾冲弳
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("鐎靛棛鐖�", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    enabled = !isLoading,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF00D2FF),
+                        unfocusedBorderColor = Color.Gray,
+                        cursorColor = Color(0xFF00D2FF),
+                    )
+                )
+
+                // 闁挎瑨顕ら幓鎰�銇�
+                if (error.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = error,
+                        color = Color(0xFFFF5722),
+                        fontSize = 13.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                // 閻ц�茬秿/濞夈劌鍞介幐澶愭尦
+                Button(
+                    onClick = {
+                        if (username.isNotBlank() && password.isNotBlank()) {
+                            if (isRegisterMode) {
+                                onRegister(username.trim(), password)
+                            } else {
+                                onLogin(username.trim(), password)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    enabled = !isLoading && username.isNotBlank() && password.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            color = Color.White,
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text(
+                            text = if (isRegisterMode) "濞夈劌鍞�" else "閻ц�茬秿",
+                            color = Color.Black,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 閸掑洦宕查惂璇茬秿/濞夈劌鍞�
+                TextButton(onClick = { isRegisterMode = !isRegisterMode }) {
+                    Text(
+                        text = if (isRegisterMode) {
+                            "瀹稿弶婀佺拹锕�褰块敍鐔哄仯閸戣崵娅ヨぐ"
+                        } else {
+                            "濞屸剝婀佺拹锕�褰块敍鐔哄仯閸戠粯鏁為崘"
+                        },
+                        color = Color(0xFF00D2FF),
+                        fontSize = 14.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ==================== 鐟欙綁顣介悾宀勬桨 ====================
+
+@Composable
+fun SolvingScreen(
+        solveState: AppState.Solving,
+        showModules: Map<String, Boolean> = emptyMap(),
+        onAskQuestion: (String) -> Unit,
+        onBack: () -> Unit,
+) {
+    Column(
+            modifier =
+                    Modifier.fillMaxSize()
+                            .background(Color(0xFF1A1A2E))
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp)
+    ) {
+        // 妞ゅ爼鍎寸�佃壈鍩�
+        Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(onClick = onBack) { Text("鏉╂柨娲�") }
+            Text(
+                    text =
+                            when (solveState.stage) {
+                                SolveStage.UPLOADING -> "娑撳﹣绱舵稉?.."
+                                SolveStage.ANALYZING -> "閸掑棙鐎芥稉?.."
+                                SolveStage.DISPLAY_STEPS -> "鐟欙綁顣介幀婵婄熅"
+                                SolveStage.DISPLAY_FULL -> "鐎瑰本鏆ｇ憴锝嗙��"
+                                SolveStage.DISPLAY_MINDMAP -> "閹�婵堟樊鐎电厧娴�"
+                                SolveStage.INTERACTIVE -> "娴滄帒濮╅梻顔剧摕"
+                                SolveStage.COMPLETED -> "鐟欙絿鐡熺�瑰本鍨�"
+                            },
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 閹�婵娾偓鍐ㄥЗ閻�?
+        if (solveState.stage == SolveStage.UPLOADING || solveState.stage == SolveStage.ANALYZING) {
+            Box(
+                    modifier = Modifier.fillMaxWidth().height(200.dp),
+                    contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = Color(0xFF00D2FF))
+                Text(
+                        text = "濮濓絽婀�閸掑棙鐎芥０妯兼窗...",
+                        color = Color.White,
+                        modifier = Modifier.padding(top = 80.dp)
+                )
+            }
+        }
+
+        // 鐟欙綁顣介幀婵婄熅
+        if (solveState.solutionSteps.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
+            SolutionCard(
+                    title = "棣冩寱 鐟欙綁顣介幀婵婄熅",
+                    content = solveState.solutionSteps,
+                    color = Color(0xFF00D2FF)
+            )
+        }
+
+        // 鐎瑰本鏆ｇ憴锝嗙��
+        if (solveState.fullSolution.isNotEmpty() && showModules.getOrDefault("full_solution", true)) {
+            SolutionCard(
+                    title = "棣冩憫 鐎瑰本鏆ｇ憴锝嗙��",
+                    content = solveState.fullSolution,
+                    color = Color(0xFF7B2FBE)
+            )
+        }
+
+        // 閹�婵堟樊鐎电厧娴�
+        if (solveState.mindMap.isNotEmpty() && showModules.getOrDefault("mind_map", true)) {
+            SolutionCard(
+                    title = "棣冩�囬敂?閹�婵堟樊鐎电厧娴�",
+                    content = solveState.mindMap,
+                    color = Color(0xFF00C853)
+            )
+        }
+
+        // 瀵ゆ湹鍑犻梻顕�顣�
+        if (solveState.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
+            Text(
+                    text = "棣冩尠 娴ｇ姴褰查懗鍊熺箷閹�鎶芥６閿�",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+            )
+
+            solveState.suggestedQuestions.forEach { question ->
+                Button(
+                        onClick = { onAskQuestion(question) },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text(question, color = Color.White, fontSize = 14.sp) }
+            }
+        }
+    }
+
+    // ===== "娴ｇ姴褰查懗鍊熺箷閹�鎶芥６" 鐎电�呯樈濡楀棴绱欑憴锝夘暯鐎瑰本鍨氶梼鑸殿唽閿�?=====
+    var askDialogDismissed by remember { mutableStateOf(false) }
+    if (solveState.stage == SolveStage.COMPLETED && !askDialogDismissed) {
+        AskDialog(
+            suggestedQuestions = solveState.suggestedQuestions,
+            onAsk = { question ->
+                askDialogDismissed = true
+                onAskQuestion(question)
+            },
+            onDismiss = { askDialogDismissed = true }
+        )
+    }
+}
+
+@Composable
+fun SolutionCard(title: String, content: String, color: Color) {
+    Card(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                    text = title,
+                    color = color,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            MarkdownView(content = content, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+// ==================== 閹躲儱鎲￠悾宀勬桨 ====================
+@Composable
+fun ReportScreen(
+        report: AppState.Report,
+        onBack: () -> Unit,
+        reportUrl: String = "",
+        reportText: String = ""
+) {
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        Row(
+                modifier = Modifier.fillMaxWidth().padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Button(onClick = onBack) { Text("鏉╂柨娲�") }
+            Text("鐎涳附鍎忛幎銉ユ啞", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        }
+
+        if (reportUrl.isNotEmpty()) {
+            // 閺佺増宓侀悧鍫熷Г閸涘﹦鏁� WebView
+            AndroidView(
+                    factory = { ctx ->
+                        android.webkit.WebView(ctx).apply {
+                            settings.javaScriptEnabled = true
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = true
+                            settings.builtInZoomControls = true
+                            settings.displayZoomControls = false
+                            setInitialScale(50)
+                            loadUrl(reportUrl)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+            )
+        } else if (reportText.isNotEmpty()) {
+            // AI 閻楀牊濮ら崨濠勬暏 MarkdownView
+            MarkdownView(content = reportText, modifier = Modifier.fillMaxSize().padding(16.dp))
+        } else if (report.isLoading) {
+            LoadingOverlay("濮濓絽婀�閻㈢喐鍨氶幎銉ユ啞...")
+        }
+    }
+}
+
+// ==================== 瀵ゆ湹鍑犻幏鎾崇潔閻ｅ矂娼� ====================
+@Composable
+fun KnowledgeScreen(
+        state: AppState.Knowledge,
+        showModules: Map<String, Boolean> = emptyMap(),
+        onAskQuestion: (String) -> Unit,
+        onBack: () -> Unit,
+) {
+    Column(
+            modifier =
+                    Modifier.fillMaxSize()
+                            .background(Color(0xFF1A1A2E))
+                            .verticalScroll(rememberScrollState())
+                            .padding(16.dp)
+    ) {
+        Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(onClick = onBack) { Text("鏉╂柨娲�") }
+            Text("棣冩憥 閻�銉ㄧ槕瀵ゆ湹鍑�", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (state.summary.isEmpty() && state.mistakes.isEmpty()) {
+            LoadingOverlay("濮濓絽婀�閸掑棙鐎介崘鍛�顔�...")
+        }
+
+        if (state.summary.isNotEmpty() && showModules.getOrDefault("solution_steps", true)) {
+            SolutionCard("棣冩惖 閻�銉ㄧ槕閻愯�勨偓鑽ょ波", state.summary, Color(0xFF00D2FF))
+        }
+
+        if (state.mistakes.isNotEmpty() && showModules.getOrDefault("mistakes", true)) {
+            SolutionCard("Mistakes", state.mistakes, Color(0xFFFF5722))
+        }
+
+        if (state.extension.isNotEmpty() && showModules.getOrDefault("extension", true)) {
+            SolutionCard("棣冩畬 閻�銉ㄧ槕閹锋挸鐫�", state.extension, Color(0xFF7B2FBE))
+        }
+
+        if (state.suggestedQuestions.isNotEmpty() && showModules.getOrDefault("suggested_questions", true)) {
+            Text(
+                    text = "棣冩尠 瀵ゆ湹鍑犻幀婵娾偓鍐跨窗",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+            )
+
+            state.suggestedQuestions.forEach { question ->
+                Button(
+                        onClick = { onAskQuestion(question) },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text(question, color = Color.White, fontSize = 14.sp) }
+            }
+        }
+    }
+}
+
+// ==================== 閸忔湹绮�閻ｅ矂娼伴敍鍫濆窗娴ｅ稄绱� ====================
+@Composable
+fun AnimationScreen(onBack: () -> Unit, animationUrl: String = "") {
+    val context = LocalContext.current
+
+    if (animationUrl.isEmpty()) {
+        // 閺冪姴濮╅悽缁樻�傞弰鍓с仛閸楃姳缍�
+        Box(
+                modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E)),
+                contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("棣冨箑 AI閸斻劎鏁�", color = Color.White, fontSize = 24.sp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("濮濓絽婀�閸旂姾娴囬崝銊ф暰...", color = Color.Gray, fontSize = 16.sp)
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = onBack) { Text("鏉╂柨娲�") }
+            }
+        }
+        return
+    }
+
+    // 閺堝�婂З閻�?URL 閺冨墎鏁� WebView 鐏炴洜銇�
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E))) {
+        // 妞ゅ爼鍎寸�佃壈鍩�
+        Row(
+                modifier = Modifier.fillMaxWidth().padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Button(onClick = onBack) { Text("鏉╂柨娲�") }
+            Text("棣冨箑 AI閸斻劎鏁�", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+
+        // WebView 鐏炴洜銇氶崝銊ф暰
+        AndroidView(
+                factory = { ctx ->
+                    android.webkit.WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.allowFileAccess = true
+                        settings.domStorageEnabled = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
+                        settings.builtInZoomControls = true
+                        settings.displayZoomControls = false
+                        setInitialScale(50)
+                        loadUrl(animationUrl)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+        )
+    }
+}
+
+@Composable
+fun HistoryScreen(onBack: () -> Unit) {
+    Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xFF1A1A2E)),
+            contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("棣冩憥 閸樺棗褰剁拋鏉跨秿", color = Color.White, fontSize = 24.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("鐠囧嘲婀�鐠佸墽鐤嗘稉顓熷ⅵ瀵�鈧�閸樺棗褰剁拋鏉跨秿", color = Color.Gray, fontSize = 14.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(onClick = onBack) { Text("鏉╂柨娲�") }
+        }
+    }
+}
+
+// ==================== 瀹搞儱鍙块崙鑺ユ殶 ====================
+fun formatTime(seconds: Int): String {
+    val mins = seconds / 60
+    val secs = seconds % 60
+    return "%02d:%02d".format(mins, secs)
+}
+
+@Composable
+fun MarkdownView(
+    content: String,
+    modifier: Modifier = Modifier,
+    fontSize: Float = 18f,
+    onRendered: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+
+    // 妫板嫬顦╅悶?Markdown 閸愬懎顔�
+    val processedContent = remember(content) { prepareMarkdownContent(content) }
+
+    // 閸掓稑缂� Markwon 鐎圭偘绶�
+    val markwon = remember {
+        Markwon.builder(context)
+                .usePlugin(MarkwonInlineParserPlugin.create())
+                .usePlugin(StrikethroughPlugin.create())
+                .usePlugin(TablesPlugin.create(context))
+                .usePlugin(
+                        ImagesPlugin.create { plugin ->
+                            plugin.errorHandler { _, _ ->
+                                android.graphics.drawable.ColorDrawable(android.graphics.Color.RED)
+                            }
+                            plugin.placeholderProvider {
+                                android.graphics.drawable.ColorDrawable(
+                                        android.graphics.Color.DKGRAY
+                                )
+                            }
+                        }
+                )
+                .usePlugin(GlideImagesPlugin.create(context))
+                .usePlugin(
+                        JLatexMathPlugin.create(
+                                50f, // 閺佹澘顒熼崗顒�绱＄�涙ぞ缍嬫径褍鐨�
+                                JLatexMathPlugin.BuilderConfigure { builder ->
+                                    builder.inlinesEnabled(true)
+                                    builder.blocksEnabled(true)
+                                    builder.theme().apply {
+                                        textColor(android.graphics.Color.WHITE)
+                                        backgroundProvider {
+                                            android.graphics.drawable.ColorDrawable(
+                                                    android.graphics.Color.TRANSPARENT
+                                            )
+                                        }
+                                    }
+                                }
+                        )
+                )
+                .build()
+    }
+
+    AndroidView(
+            factory = { ctx ->
+                TextView(ctx).apply {
+                    setTextColor(android.graphics.Color.WHITE)
+                    textSize = fontSize
+                    setPadding(30, 20, 30, 20)
+                    setLineSpacing(8f, 1.3f)
+                    // 閸忎浇顔忛柅澶嬪�ㄦ径宥呭煑
+                    setTextIsSelectable(true)
+                    // 鐠佸墽鐤嗛懗灞炬珯
+                    setBackgroundColor(android.graphics.Color.parseColor("#1A1A2E"))
+                }
+            },
+            update = { textView ->
+                if (processedContent.isNotEmpty()) {
+                    try {
+                        markwon.setMarkdown(textView, processedContent)
+                        onRendered?.invoke()
+                    } catch (e: Exception) {
+                        Log.e("MarkdownView", "濞撳弶鐓嬫径杈�瑙�: ${e.message}")
+                        textView.text = processedContent
+                    }
+                } else {
+                    textView.text = ""
+                }
+            },
+            modifier = modifier
+    )
+}
+
+/** 妫板嫬顦╅悶?Markdown 閸愬懎顔愰敍宀�鈥樻穱婵嗗彆瀵�蹇旂壐瀵�蹇旑劀绾�?*/
+private fun prepareMarkdownContent(content: String): String {
+    if (content.isEmpty()) return ""
+    var processed = content
+    // 缂佺喍绔撮幍鈧�閺堝�庮攽閸愬懎鍙曞��蹇庤礋 $$...$$ 閺嶇厧绱�
+    processed = processed.replace(Regex("(?<!\\$)\\$(?!\\$)")) { "$$" }
+    // 婢跺嫮鎮婇崸妤冮獓閸忣剙绱� \[ ... \]
+    processed =
+            processed.replace(Regex("""\\\[(.*")\\\]""", RegexOption.DOT_MATCHES_ALL)) { match ->
+                "\n\$\$\n${match.groupValues[1].trim()}\n\$\$\n"
+            }
+    // 婢跺嫮鎮婄悰灞藉敶閸忣剙绱� \( ... \)
+    processed =
+            processed.replace(Regex("""\\\((.*")\\\)""")) { match ->
+                "\$\$${match.groupValues[1].trim()}\$\$"
+            }
+    // 绾�顔荤箽濞堜絻鎯ら梻瀛樻箒缁岄缚顢�
+    processed = processed.replace(Regex("([^\n])\n(#{1,6}\\s|>\\s|\\*\\s|\\d+\\.\\s)"), "$1\n\n$2")
+
+    return processed
+}
+
+// ==================== 鎼存梻鏁ゆ稉濠氼暯 ====================
+@Composable
+fun LearningAssistantTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+            colorScheme =
+                    darkColorScheme(
+                            primary = Color(0xFF00D2FF),
+                            secondary = Color(0xFF7B2FBE),
+                            background = Color(0xFF1A1A2E),
+                            surface = Color(0xFF16213E),
+                            onPrimary = Color.White,
+                            onSecondary = Color.White,
+                            onBackground = Color.White,
+                            onSurface = Color.White,
+                    ),
+            typography = Typography(),
+            content = content
+    )
+}
+
+// ==================== 娑撴槒褰嶉崡鏇氱瑢缂佸嫪娆� ====================
+
+// ==================== 鐠囶參鐓剁拠鍡楀焼閹�顒佽癁閹稿�愭尦 ====================
+
+@Composable
+fun VoiceFloatingActionButton(
+    viewModel: MainViewModel,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var isListening by remember { mutableStateOf(false) }
+    var hasAudioPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasAudioPermission = granted
+    }
+
+    val speechRecognizer = remember {
+        SpeechRecognizer.createSpeechRecognizer(context)
+    }
+
+    val recognitionListener = remember {
+        object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {
+                isListening = false
+            }
+            override fun onError(error: Int) {
+                isListening = false
+                val errorMsg = when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH -> "閺堫亜鎯夊〒鍜冪礉鐠囩兘鍣哥拠"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "閺堫亝顥呭ù瀣�鍩岀拠顓㈢叾"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "缂傚搫鐨�瑜版洟鐓堕弶鍐�妾�"
+                    else -> "鐠囶參鐓剁拠鍡楀焼闁挎瑨顕�: $error"
+                }
+                Toast.makeText(context, errorMsg, Toast.LENGTH_SHORT).show()
+            }
+            override fun onResults(results: Bundle?) {
+                isListening = false
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (!matches.isNullOrEmpty()) {
+                    val spokenText = matches[0]
+                    viewModel.handleVoiceCommand(spokenText)
+                }
+            }
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+    }
+
+    // 濞撳懐鎮� SpeechRecognizer
+    DisposableEffect(Unit) {
+        onDispose {
+            speechRecognizer.destroy()
+        }
+    }
+
+    FloatingActionButton(
+        onClick = {
+            if (!hasAudioPermission) {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return@FloatingActionButton
+            }
+            if (!isListening) {
+                isListening = true
+                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN")
+                    putExtra(RecognizerIntent.EXTRA_PROMPT, "鐠囩柉顕╅崙杞扮稑閻ㄥ嫰娓跺Ч?..")
+                }
+                speechRecognizer.setRecognitionListener(recognitionListener)
+                speechRecognizer.startListening(intent)
+            } else {
+                speechRecognizer.stopListening()
+                isListening = false
+            }
+        },
+        modifier = modifier,
+        containerColor = if (isListening) Color(0xFF00D2FF) else Color(0xFF2196F3)
+    ) {
+        Text(if (isListening) "listening" else "mic", fontSize = 24.sp)
+    }
+}
+
+// ==================== "娴ｇ姴褰查懗鍊熺箷閹�鎶芥６" 鐎电�呯樈濡�?====================
+
+@Composable
+fun AskDialog(
+    suggestedQuestions: List<String>,
+    onAsk: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var inputText by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("棣冩尠 娴ｇ姴褰查懗鍊熺箷閹�鎶芥６", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (suggestedQuestions.isNotEmpty()) {
+                    Text("閹恒劏宕橀梻顕�顣介敍", color = Color.Gray, fontSize = 13.sp)
+                    suggestedQuestions.forEach { question ->
+                        TextButton(
+                            onClick = { onAsk(question) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                question,
+                                color = Color(0xFF00D2FF),
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Start,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                // 閼奉亜鐣炬稊澶庣翻閸�?
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("鏉堟挸鍙嗘担鐘垫畱闂傤噣顣�...", color = Color.Gray) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00D2FF),
+                            unfocusedBorderColor = Color.Gray,
+                        )
+                    )
+                    Button(
+                        onClick = {
+                            if (inputText.isNotBlank()) {
+                                onAsk(inputText.trim())
+                                inputText = ""
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00D2FF))
+                    ) {
+                        Text("閸欐垿鈧�", color = Color.White)
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        containerColor = Color(0xFF16213E)
+    )
+}
+
+// ==================== 閺佺増宓佺猾?====================
+data class FunctionButtonData(
+    val title: String,
+    val subtitle: String,
+    val color: Color,
+    val onClick: () -> Unit
+)
+
+@Composable
+fun MainMenuScreen(
+    viewModel: MainViewModel,
+    statusText: String,
+    gestureEnabled: Boolean = false,
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF0A0A1A))
+        ) {
+        // 妞ゅ爼鍎撮悩鑸碘偓浣圭埉
+        TopStatusBar(statusText = statusText, viewModel = viewModel)
+
+        // 閹靛��瀵氶弫浼村櫤閺勫墽銇氶敍鍫滅矌閸︺劍澧滈崝鑳�鐦戦崚顐㈢磻閸氼垱妞傞弰鍓с仛閿�?
+        val fingerCount by viewModel.detectedFingerCount.collectAsState()
+        if (gestureEnabled && fingerCount > 0) {
+            FingerCountHint(fingerCount = fingerCount)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 閸欘垱绮撮崝銊ф畱閹稿�愭尦閸栧搫鐓�
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val buttons = listOf(
+                FunctionButtonData("棣冩懗 閹峰秶鍙庣憴锝夘暯", "娴肩�垮毉5閺嶈�勫�滈幐", Color(0xFF2196F3), { viewModel.onButtonSolve() }),
+                FunctionButtonData("棣冨箑 AI閸斻劎鏁�", "娴肩�垮毉4閺嶈�勫�滈幐", Color(0xFF9C27B0), { viewModel.onButtonAnimation() }),
+                FunctionButtonData("棣冩惓 閺佺増宓侀幎銉ユ啞", "娴肩�垮毉3閺嶈�勫�滈幐", Color(0xFFFF9800), { viewModel.loadDataReport() }),
+                FunctionButtonData("棣冾樆 AI閹躲儱鎲�", "娴肩�垮毉2閺嶈�勫�滈幐", Color(0xFF4CAF50), { viewModel.loadAiReport() }),
+                FunctionButtonData("棣冩憥 閻�銉ㄧ槕瀵ゆ湹鍑�", "娴肩�垮毉1閺嶈�勫�滈幐", Color(0xFF00BCD4), { viewModel.onButtonExtend() }),
+                FunctionButtonData("棣冩惖 閸樺棗褰剁拋鏉跨秿", "閻愮懓鍤�閺屻儳婀�", Color(0xFF795548), { viewModel.showHistory() }),
+                FunctionButtonData("閳挎瑱绗� 鐠佸墽鐤�", "娑擃亝鈧�褍瀵查柊宥囩枂", Color(0xFF607D8B), { viewModel.showSettings() }),
+            )
+
+            buttons.chunked(2).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    row.forEach { data ->
+                        FunctionButton(
+                            title = data.title,
+                            subtitle = data.subtitle,
+                            color = data.color,
+                            onClick = data.onClick,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (row.size == 1) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+
+            // 鎼存洟鍎撮悾娆戞��
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+
+        // 鐠囶參鐓堕幃顒佽癁閹稿�愭尦閿涘牆褰告稉瀣�顫楅敍?
+        VoiceFloatingActionButton(
+            viewModel = viewModel,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp)
+        )
+    }
+}
+
+}
+@Composable
+fun TopStatusBar(statusText: String, viewModel: MainViewModel) {
+    Row(
+            modifier =
+                    Modifier.fillMaxWidth()
+                            .background(Color(0xFF16213E), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(statusText, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(
+                "棣冨磰 ${formatTime(viewModel.pomodoroTime.collectAsState().value)}",
+                color = Color.White,
+                fontSize = 14.sp
+        )
+    }
+}
+
+@Composable
+fun FingerCountHint(fingerCount: Int) {
+    val hintText =
+            when (fingerCount) {
+                5 -> "閴�?閸楀啿鐨㈤幏宥囧弾鐟欙綁顣介敍宀冾嚞鐏忓棙澧滅粔璇茬磻..."
+                4 -> "棣冩灈 閸楀啿鐨㈤悽鐔稿灇閸斻劎鏁鹃敍宀冾嚞鐏忓棙澧滅粔璇茬磻..."
+                1 -> "閳芥繐绗� 閸楀啿鐨㈤惌銉ㄧ槕瀵ゆ湹鍑犻敍宀冾嚞鐏忓棙澧滅粔璇茬磻..."
+                else -> "$fingerCount 閺嶈�勫�滈幐"
+            }
+
+    Text(
+            text = hintText,
+            color = Color(0xFF00FF00),
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier =
+                    Modifier.fillMaxWidth()
+                            .background(Color(0xAA000000), RoundedCornerShape(8.dp))
+                            .padding(16.dp),
+            textAlign = TextAlign.Center
+    )
+}
+
+@Composable
+fun FunctionGrid(viewModel: MainViewModel) {
+    val buttons = listOf(
+        FunctionButtonData("棣冩懗 閹峰秶鍙庣憴锝夘暯", "娴肩�垮毉5閺嶈�勫�滈幐", Color(0xFF2196F3)) { viewModel.onButtonSolve() },
+        FunctionButtonData("棣冨箑 AI閸斻劎鏁�", "娴肩�垮毉4閺嶈�勫�滈幐", Color(0xFF9C27B0)) { viewModel.onButtonAnimation() },
+        FunctionButtonData("棣冩惓 閺佺増宓侀幎銉ユ啞", "娴肩�垮毉3閺嶈�勫�滈幐", Color(0xFFFF9800)) { viewModel.loadDataReport() },
+        FunctionButtonData("棣冾樆 AI閹躲儱鎲�", "娴肩�垮毉2閺嶈�勫�滈幐", Color(0xFF4CAF50)) { viewModel.loadAiReport() },
+        FunctionButtonData("棣冩憥 閻�銉ㄧ槕瀵ゆ湹鍑�", "娴肩�垮毉1閺嶈�勫�滈幐", Color(0xFF00BCD4)) { viewModel.onButtonExtend() },
+        FunctionButtonData("棣冩惖 閸樺棗褰剁拋鏉跨秿", "閻愮懓鍤�閺屻儳婀�", Color(0xFF795548)) { viewModel.showHistory() },
+        FunctionButtonData("閳挎瑱绗� 鐠佸墽鐤�", "娑擃亝鈧�褍瀵查柊宥囩枂", Color(0xFF607D8B)) { viewModel.showSettings() },
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        buttons.chunked(2).forEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                row.forEach { data ->
+                    FunctionButton(
+                        title = data.title,
+                        subtitle = data.subtitle,
+                        color = data.color,
+                        onClick = data.onClick,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (row.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FunctionButton(
+        title: String,
+        subtitle: String,
+        color: Color,
+        onClick: () -> Unit,
+        modifier: Modifier = Modifier
+) {
+    Button(
+            onClick = onClick,
+            modifier = modifier.height(80.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = color.copy(alpha = 0.8f)),
+            shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(subtitle, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun LoadingOverlay(message: String = "婢跺嫮鎮婃稉?..") {
+    Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xCC0A0A1A)),
+            contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(color = Color(0xFF00D2FF))
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(message, color = Color.White, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+fun WelcomeDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("棣冩啟 濞嗐垼绻嬫担璺ㄦ暏鐎涳缚绡勯崝鈺傚�� 2.1", color = Color.White) },
+            text = {
+                Text(
+                        """棣冩惗 娴ｈ法鏁ょ拠瀛樻�戦敍"
+                
+棣冩瀾閿�?閹靛��濞嶉幙宥勭稊閿涘牆婀�娑撳�氥�夐棃顫�鍑犻崙鍝勵嚠鎼存梹澧滈幐鍥ц嫙娣囨繃瀵�1缁夋帪绱氶敍?
+  閳�?5閹�?閳�?閹峰秶鍙庣憴锝夘暯
+  閳�?4閹�?閳�?AI閸斻劎鏁�
+  閳�?3閹�?閳�?閺佺増宓侀幎銉ユ啞
+  閳�?2閹�?閳�?AI閹躲儱鎲�
+  閳�?1閹�?閳�?閻�銉ㄧ槕瀵ゆ湹鍑�
+
+棣冩惖 娑旂喎褰查惄瀛樺复閻愮懓鍤�閹稿�愭尦鐟欙箑褰傞崝鐔诲厴
+
+閳跨媴绗� 閹峰秶鍙庨崜宥堫嚞鐏忓棙澧滅粔璇茬磻閹藉嫬鍎氭径?
+閳挎瑱绗� 閺囨潙顦跨拋鍓х枂閸︺劌褰告稉濠咁潡""",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 14.sp
+                )
+            },
+            confirmButton = { Button(onClick = onDismiss) { Text("瀵�鈧�婵�瀣╁▏閻�") } },
+            containerColor = Color(0xFF16213E)
+    )
+}
+
+@Composable
+fun HistoryViewScreen(
+    viewModel: MainViewModel,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val historyStartDate by viewModel.historyStartDate.collectAsState()
+    val historyEndDate by viewModel.historyEndDate.collectAsState()
+    
+    // 閻樿埖鈧�浣侯吀閻�?
+    var records by remember { mutableStateOf<List<ApiService.HistoryRecord>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf("") }
+    var selectedRecord by remember { mutableStateOf<ApiService.HistoryRecord?>(null) }
+    
+    // 婢舵岸鈧�澶婂灩闂勩倖膩瀵�?
+    var isSelectMode by remember { mutableStateOf(false) }
+    var selectedIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var isDeleting by remember { mutableStateOf(false) }
+    
+    // 閸旂姾娴囬崢鍡楀蕉鐠佹澘缍�
+    fun loadHistory() {
+        isLoading = true
+        errorMessage = ""
+        viewModel.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apiService = ApiService()
+                val result = apiService.getHistory(
+                    startDate = historyStartDate,
+                    endDate = historyEndDate
+                )
+                withContext(Dispatchers.Main) {
+                    records = result
+                    isLoading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = "閸旂姾娴囨径杈�瑙�: ${e.message}"
+                    isLoading = false
+                }
+            }
+        }
+    }
+    
+    // 閹靛綊鍣洪崚鐘绘珟
+    fun batchDelete() {
+        if (selectedIds.isEmpty()) return
+        isDeleting = true
+        viewModel.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apiService = ApiService()
+                apiService.batchDeleteHistory(selectedIds.toList())
+                withContext(Dispatchers.Main) {
+                    isDeleting = false
+                    isSelectMode = false
+                    selectedIds = emptySet()
+                    loadHistory()
+                    Toast.makeText(context, "瀹告彃鍨归梽?${selectedIds.size} 閺壜ゎ唶瑜�", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isDeleting = false
+                    Toast.makeText(context, "閸掔娀娅庢径杈�瑙�: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+    
+    // 妫ｆ牗顐奸崝鐘烘祰
+    LaunchedEffect(Unit) {
+        loadHistory()
+    }
+    
+    // 闁插秵鏌婇崝鐘烘祰閿涘牊妫╅張鐔峰綁閸栨牗妞傞敍?
+    LaunchedEffect(historyStartDate, historyEndDate) {
+        loadHistory()
+    }
+    
+    // 婵″倹鐏夐柅澶夎厬娴滃棔绔撮弶陇顔囪ぐ鏇�绱濋弰鍓с仛鐠囷附鍎�
+    if (selectedRecord != null) {
+        HistoryDetailScreen(
+            record = selectedRecord!!,
+            onBack = { selectedRecord = null }
+        )
+        return
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A2E))
+    ) {
+        // 妞ゅ爼鍎撮弽?
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (isSelectMode) {
+                // 婢舵岸鈧�澶嬆佸��?- 閸欐牗绉烽柅澶嬪��
+                Button(
+                    onClick = {
+                        isSelectMode = false
+                        selectedIds = emptySet()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("閸欐牗绉�", color = Color.White) }
+                
+                Text("瀹告煡鈧�?${selectedIds.size} 妞�", color = Color(0xFF00D2FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                
+                // 绾�顔款吇閸掔娀娅�
+                Button(
+                    onClick = { batchDelete() },
+                    enabled = selectedIds.isNotEmpty() && !isDeleting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                ) {
+                    if (isDeleting) {
+                        CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("棣冩�忛敂?閸掔娀娅�", color = Color.White, fontSize = 14.sp)
+                    }
+                }
+            } else {
+                Button(
+                    onClick = onBack,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+                ) { Text("鏉╂柨娲�", color = Color.White) }
+                
+                Text("棣冩惖 閸樺棗褰剁拋鏉跨秿", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                
+                // 閸掗攱鏌婇幐澶愭尦
+                IconButton(onClick = { loadHistory() }) {
+                    Text("棣冩敡", color = Color.White, fontSize = 20.sp)
+                }
+            }
+        }
+        
+        // 閺冦儲婀℃潻鍥ㄦ姢閸�?
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = historyStartDate,
+                onValueChange = { viewModel.historyStartDate.value = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("瀵�鈧�婵�瀣�妫╅張?(2026-01-01)", color = Color.Gray, fontSize = 12.sp) },
+                singleLine = true,
+                colors = darkTextFieldColors(),
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+            )
+            Text("閼�", color = Color.Gray, fontSize = 12.sp)
+            OutlinedTextField(
+                value = historyEndDate,
+                onValueChange = { viewModel.historyEndDate.value = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("閹搭亝顒涢弮銉︽埂 (2026-12-31)", color = Color.Gray, fontSize = 12.sp) },
+                singleLine = true,
+                colors = darkTextFieldColors(),
+                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp)
+            )
+        }
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        // 閸愬懎顔愰崠鍝勭厵
+        when {
+            isLoading -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Color(0xFF00D2FF))
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("閸旂姾娴囨稉?..", color = Color.Gray, fontSize = 14.sp)
+                    }
+                }
+            }
+            errorMessage.isNotEmpty() -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("閳跨媴绗�", fontSize = 32.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(errorMessage, color = Color(0xFFFF5722), fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(onClick = { loadHistory() }) {
+                            Text("闁插秷鐦�")
+                        }
+                    }
+                }
+            }
+            records.isEmpty() -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("棣冩懃", fontSize = 48.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("閺嗗倹妫ら崢鍡楀蕉鐠佹澘缍�", color = Color.Gray, fontSize = 16.sp)
+                        Text("瀵�鈧�婵�瀣�顒熸稊鐘叉倵鐏忓棜鍤滈崝銊�顔囪ぐ", color = Color.Gray.copy(alpha = 0.6f), fontSize = 13.sp)
+                    }
+                }
+            }
+            else -> {
+                // 鐠佹澘缍嶉崚妤勩��
+                val listState = rememberLazyListState()
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(records, key = { it.id }) { record ->
+                        HistoryRecordCard(
+                            record = record,
+                            isSelectMode = isSelectMode,
+                            isSelected = selectedIds.contains(record.id),
+                            onClick = {
+                                if (isSelectMode) {
+                                    selectedIds = if (selectedIds.contains(record.id)) {
+                                        selectedIds - record.id
+                                    } else {
+                                        selectedIds + record.id
+                                    }
+                                } else {
+                                    selectedRecord = record
+                                }
+                            },
+                            onLongClick = {
+                                if (!isSelectMode) {
+                                    isSelectMode = true
+                                    selectedIds = setOf(record.id)
+                                }
+                            }
+                        )
+                    }
+                }
+                
+                // 鎼存洟鍎撮幙宥勭稊閺�?
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "閸�?${records.size} 閺壜ゎ唶瑜�",
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        modifier = Modifier.align(Alignment.CenterVertically)
+                    )
+                    
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // 鏉╂稑鍙嗘径姘垛偓澶嬆佸��?
+                        Button(
+                            onClick = {
+                                isSelectMode = !isSelectMode
+                                if (!isSelectMode) selectedIds = emptySet()
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isSelectMode) Color(0xFF00D2FF) else Color(0xFF2D2D44)
+                            )
+                        ) {
+                            Text(
+                                if (isSelectMode) "閳芥埊绗� 鐎瑰本鍨�" else "閳芥埊绗� 闁�澶嬪��",
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                        }
+                        
+                        // 濞撳懘娅庨崗銊╁劥
+                        Button(
+                            onClick = {
+                                android.widget.Toast.makeText(context, "濮濓絽婀�濞撳懘娅�...", android.widget.Toast.LENGTH_SHORT).show()
+                                viewModel.clearHistory()
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    loadHistory()
+                                }, 500)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                        ) {
+                            Text("棣冩�忛敂?濞撳懘娅庨崗銊╁劥", color = Color.White, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryRecordCard(
+    record: ApiService.HistoryRecord,
+    isSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit = {}
+) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) Color(0xFF1A3A5C) else Color(0xFF16213E)
+        ),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(modifier = Modifier.padding(12.dp)) {
+            // 婢舵岸鈧�澶愨偓澶嬪�ㄥ��?
+            if (isSelectMode) {
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { onClick() },
+                    colors = CheckboxDefaults.colors(
+                        checkedColor = Color(0xFF00D2FF),
+                        uncheckedColor = Color.Gray
+                    ),
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+            }
+            
+            Column(modifier = Modifier.weight(1f)) {
+                // 閺冨爼妫块幋?+ ID + 楠炲�搁獓鐎涳妇顫栭弽鍥╊劮
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val displayTime = try {
+                        if (record.timestamp.isNotEmpty()) {
+                            record.timestamp.substring(0, 19).replace("T", " ")
+                        } else ""
+                    } catch (e: Exception) { record.timestamp }
+                    
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(displayTime, color = Color.Gray, fontSize = 11.sp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        // 楠炲�搁獓閺嶅洨顒�
+                        if (record.grade.isNotEmpty()) {
+                            Surface(
+                                color = Color(0xFF7B2FBE).copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.grade,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        // 鐎涳妇顫栭弽鍥╊劮
+                        if (record.subject.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Surface(
+                                color = Color(0xFF2196F3).copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.subject,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        // 闂呮儳瀹抽弽鍥╊劮
+                        if (record.difficulty.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            val diffColor = when (record.difficulty) {
+                                "閺�", "鏉堝啯妲�" -> Color(0xFF4CAF50)
+                                "娑�" -> Color(0xFFFF9800)
+                                "鏉堝啴姣�", "闂�" -> Color(0xFFF44336)
+                                else -> Color.Gray
+                            }
+                            Surface(
+                                color = diffColor.copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    record.difficulty,
+                                    color = Color.White,
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
+                    Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 11.sp)
+                }
+                
+                Spacer(modifier = Modifier.height(6.dp))
+                
+                // 閻�銉ㄧ槕閻愯�勭垼缁�"
+                if (record.knowledgePoints.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        record.knowledgePoints.take(3).forEach { kp ->
+                            Surface(
+                                color = Color(0xFF00D2FF).copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    kp,
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.8f),
+                                    fontSize = 9.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        if (record.knowledgePoints.size > 3) {
+                            Text(
+                                "+${record.knowledgePoints.size - 3}",
+                                color = Color.Gray,
+                                fontSize = 9.sp,
+                                modifier = Modifier.align(Alignment.CenterVertically)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                
+                // OCR閸愬懎顔愰敍鍫濈暚閺佹挳顣╃憴鍫�绱濋張鈧�婢舵碍妯夌粈?鐞涘矉绱�
+                if (record.ocrText.isNotEmpty()) {
+                    Text(
+                        text = record.ocrText,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                
+                // 鐟欙綁顣藉�濄儵顎冩０鍕�顫�
+                if (record.solutionSteps.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = record.solutionSteps
+                            .replace(Regex("#+\\s*"), "")  // 缁夊�氭珟Markdown閺嶅洭顣介弽鍥�顔�
+                            .take(150),
+                        color = Color(0xFF00D2FF).copy(alpha = 0.8f),
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    if (isSelectMode) "閻愮懓鍤�閸掑洦宕查柅澶嬪��" else "閻愮懓鍤�閺屻儳婀呯拠锔藉剰 閳�",
+                    color = Color(0xFF00D2FF).copy(alpha = 0.6f),
+                    fontSize = 11.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryDetailScreen(
+    record: ApiService.HistoryRecord,
+    onBack: () -> Unit
+) {
+    val displayTime = try {
+        if (record.timestamp.isNotEmpty()) {
+            record.timestamp.substring(0, 19).replace("T", " ")
+        } else ""
+    } catch (e: Exception) { record.timestamp }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A2E))
+    ) {
+        // 妞ゅ爼鍎撮弽?
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = onBack,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D44))
+            ) { Text("閳�?鏉╂柨娲栭崚妤勩��", color = Color.White) }
+            
+            Text(
+                "棣冩憫 鐠佹澘缍嶇拠锔藉剰",
+                color = Color.White,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Text("#${record.id}", color = Color(0xFF00D2FF).copy(alpha = 0.5f), fontSize = 12.sp)
+        }
+        
+        // 閸愬懎顔愰敍鍫濆讲濠婃艾濮╅敍?
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // 閺冨爼妫� + 楠炲�搁獓鐎涳妇顫栨穱鈩冧紖閸楋紕澧�
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("棣冩櫜 閺冨爼妫�", color = Color.Gray, fontSize = 13.sp)
+                        Text(displayTime, color = Color.White, fontSize = 13.sp)
+                    }
+                    
+                    if (record.grade.isNotEmpty() || record.subject.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (record.grade.isNotEmpty()) {
+                                Text("棣冩憥 楠炲�搁獓:", color = Color.Gray, fontSize = 13.sp)
+                                Text(record.grade, color = Color(0xFF7B2FBE), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                            if (record.subject.isNotEmpty()) {
+                                Text("棣冩憠 鐎涳妇顫�:", color = Color.Gray, fontSize = 13.sp)
+                                Text(record.subject, color = Color(0xFF2196F3), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                    
+                    if (record.difficulty.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row {
+                            Text("棣冩惓 闂呮儳瀹�:", color = Color.Gray, fontSize = 13.sp)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            val diffColor = when (record.difficulty) {
+                                "閺�", "鏉堝啯妲�" -> Color(0xFF4CAF50)
+                                "娑�" -> Color(0xFFFF9800)
+                                "鏉堝啴姣�", "闂�" -> Color(0xFFF44336)
+                                else -> Color.Gray
+                            }
+                            Text(record.difficulty, color = diffColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    
+                    // 閻�銉ㄧ槕閻�?
+                    if (record.knowledgePoints.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("棣冨娇閿�?閻�銉ㄧ槕閻�?", color = Color.Gray, fontSize = 13.sp)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            record.knowledgePoints.forEach { kp ->
+                                Surface(
+                                    color = Color(0xFF00D2FF).copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        kp,
+                                        color = Color(0xFF00D2FF),
+                                        fontSize = 11.sp,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // OCR 閸愬懎顔愰敍鍫濈暚閺佹潙鐫嶇粈鐚寸礆
+            if (record.ocrText.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("棣冩惈 鐠囧棗鍩嗛崘鍛�顔�", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(record.ocrText, color = Color.White, fontSize = 13.sp)
+                    }
+                }
+            }
+            
+            // 鐟欙綁顣介幀婵婄熅閿涘牆鐣�閺佹潙鐫嶇粈鐚寸礆
+            if (record.solutionSteps.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("棣冩寱 鐟欙綁顣介幀婵婄熅", color = Color(0xFF00D2FF), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        MarkdownView(content = record.solutionSteps, fontSize = 14f)
+                    }
+                }
+            }
+            
+            // 鐎瑰本鏆ｇ憴锝嗙�介敍鍫濈暚閺佹潙鐫嶇粈鐚寸礆
+            if (record.fullSolution.isNotEmpty()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF16213E)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("棣冩憫 鐎瑰本鏆ｇ憴锝嗙��", color = Color(0xFF7B2FBE), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        MarkdownView(content = record.fullSolution, fontSize = 14f)
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun SettingsDialog(viewModel: MainViewModel, onDismiss: () -> Unit) {
+    val gestureEnabled by viewModel.gestureEnabled.collectAsState()
+    val voiceEnabled by viewModel.voiceEnabled.collectAsState()
+    val tomatoEnabled by viewModel.tomatoEnabled.collectAsState()
+    val serverAddress by viewModel.serverAddress.collectAsState()
+    val fontSize by viewModel.fontSize.collectAsState()
+    val showModules by viewModel.showModules.collectAsState()
+    val aiEngine by viewModel.aiEngine.collectAsState()
+    val historyStartDate by viewModel.historyStartDate.collectAsState()
+    val historyEndDate by viewModel.historyEndDate.collectAsState()
+
+    AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("閳挎瑱绗� 鐠佸墽鐤�", color = Color.White)
+                    TextButton(onClick = onDismiss) { Text("閸忔娊妫�", color = Color(0xFF00D2FF)) }
+                }
+            },
+            text = {
+                Column(
+                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // 1. 閹靛��濞嶇拠鍡楀焼瀵�鈧�閸�?
+                    SettingSwitch(
+                            title = "棣冩瀾閿�?閹靛��濞嶇拠鍡楀焼",
+                            subtitle = "瀵�鈧�閸氼垰鎮楅崣顖氭躬娑撳�氥�夐棃銏も偓姘崇箖閹靛��濞嶇憴锕�褰傞崝鐔诲厴",
+                            checked = gestureEnabled,
+                            onCheckedChange = { viewModel.gestureEnabled.value = it }
+                    )
+
+                    // 2. 鐠囶參鐓剁拠鍡楀焼瀵�鈧�閸忕�圭礄閻忔媽澹婇敍?
+                    SettingSwitch(
+                            title = "棣冨赋 鐠囶參鐓剁拠鍡楀焼",
+                            subtitle = "閺嗗倹婀�瀵�鈧�閺�鎾呯礉閺侇剝顕�閺堢喎绶�",
+                            checked = voiceEnabled,
+                            onCheckedChange = {},
+                            enabled = false
+                    )
+
+                    // 3. 閻ｎ亣瀵楅柦鐔风磻閸�?
+                    SettingSwitch(
+                            title = "棣冨磰 閻ｎ亣瀵楅柦",
+                            subtitle = "25閸掑棝鎸撶�涳缚绡勯幓鎰板晪",
+                            checked = tomatoEnabled,
+                            onCheckedChange = { viewModel.tomatoEnabled.value = it }
+                    )
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // 4. 閺堝秴濮熺粩?IP
+                    Text(
+                            "棣冨�� 閺堝秴濮熺粩顖氭勾閸р偓",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    OutlinedTextField(
+                            value = serverAddress,
+                            onValueChange = {
+                                viewModel.serverAddress.value = it
+                                viewModel.updateServerAddress("http://$it")
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            colors =
+                                    OutlinedTextFieldDefaults.colors(
+                                            focusedTextColor = Color.White,
+                                            unfocusedTextColor = Color.White,
+                                            focusedBorderColor = Color(0xFF00D2FF),
+                                            unfocusedBorderColor = Color.Gray,
+                                    )
+                    )
+
+                    // 5. 鐎涙ぞ缍嬫径褍鐨�
+                    Text(
+                            "棣冩憫 鐎涙ぞ缍嬫径褍鐨�",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Slider(
+                            value = fontSize,
+                            onValueChange = { viewModel.fontSize.value = it },
+                            valueRange = 12f..24f,
+                            colors = SliderDefaults.colors(thumbColor = Color(0xFF00D2FF))
+                    )
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // 6. 閺勫墽銇氬Ο鈥虫健闁�澶嬪��
+                    Text(
+                            "棣冩憹 閺勫墽銇氬Ο鈥虫健",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    showModules.forEach { (key, value) ->
+                        SettingSwitch(
+                                title =
+                                        when (key) {
+                                            "solution_steps" -> "鐟欙綁顣介幀婵婄熅"
+                                            "full_solution" -> "鐎瑰本鏆ｇ憴锝嗙��"
+                                            "mind_map" -> "閹�婵堟樊鐎电厧娴�"
+                                            "suggested_questions" -> "瀵ゆ湹鍑犻梻顕�顣�"
+                                            "mistakes" -> "閺勬捇鏁婇悙纭咁嚊鐟�"
+                                            "extension" -> "閻�銉ㄧ槕閹锋挸鐫�"
+                                            else -> key
+                                        },
+                                checked = value,
+                                onCheckedChange = {
+                                    viewModel.showModules.value =
+                                            showModules.toMutableMap().apply { put(key, it) }
+                                }
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // 7. AI 瀵�鏇熸惛闁�澶嬪��
+                    Text(
+                            "棣冾樆 AI 瀵�鏇熸惛",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                                selected = aiEngine == "deepseek",
+                                onClick = { viewModel.aiEngine.value = "deepseek" },
+                                label = { Text("DeepSeek", fontSize = 12.sp) },
+                                colors =
+                                        FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFF2196F3)
+                                        )
+                        )
+                        FilterChip(
+                                selected = aiEngine == "hunyuan",
+                                onClick = { viewModel.aiEngine.value = "hunyuan" },
+                                label = { Text("濞ｅ嘲鍘�", fontSize = 12.sp) },
+                                colors =
+                                        FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Color(0xFFFF9800)
+                                        )
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // 8. 閸樺棗褰堕弮銉︽埂閼煎啫娲�
+                    Text(
+                            "棣冩惍 閸樺棗褰剁拋鏉跨秿閼煎啫娲�",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                                value = historyStartDate,
+                                onValueChange = { viewModel.historyStartDate.value = it },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("瀵�鈧�婵�瀣�妫╅張?(2026-01-01)", color = Color.Gray) },
+                                singleLine = true,
+                                colors = darkTextFieldColors()
+                        )
+                        OutlinedTextField(
+                                value = historyEndDate,
+                                onValueChange = { viewModel.historyEndDate.value = it },
+                                modifier = Modifier.weight(1f),
+                                placeholder = { Text("閹搭亝顒涢弮銉︽埂 (2026-12-31)", color = Color.Gray) },
+                                singleLine = true,
+                                colors = darkTextFieldColors()
+                        )
+                    }
+
+                    Divider(color = Color.White.copy(alpha = 0.2f))
+
+                    // 9. 濞撳懘娅庨崢鍡楀蕉鐠佹澘缍�
+                    Button(
+                            onClick = { viewModel.clearHistory() },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+                    ) { Text("棣冩�忛敂?濞撳懘娅庨崢鍡楀蕉鐠佹澘缍�") }
+                }
+            },
+            confirmButton = {},
+            containerColor = Color(0xFF16213E)
+    )
+}
+
+@Composable
+fun SettingSwitch(
+        title: String,
+        subtitle: String = "",
+        checked: Boolean,
+        onCheckedChange: (Boolean) -> Unit,
+        enabled: Boolean = true
+) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                    title,
+                    color = if (enabled) Color.White else Color.Gray,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+            )
+            if (subtitle.isNotEmpty()) {
+                Text(subtitle, color = Color.Gray, fontSize = 11.sp)
+            }
+        }
+        Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                enabled = enabled,
+                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF00D2FF))
+        )
+    }
+}
+
+
+fun darkTextFieldColors() =
+        OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedBorderColor = Color(0xFF00D2FF),
+                unfocusedBorderColor = Color.Gray,
+        )

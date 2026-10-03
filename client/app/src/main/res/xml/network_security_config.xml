@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  网络策略说明：
+  - Android 的 <domain> 元素不支持 CIDR 网段（如 10.100.0.0/16 不会生效），
+    且服务端 IP 通过 UDP 广播动态发现，无法预知。
+  - 因此使用 base-config 全局允许明文流量（本项目为局域网教育场景，HTTP 明文可接受）。
+  - 如需更严格的安全策略，可改为仅允许指定域名/IP，并同步维护 server_ip.txt。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <!-- 兼容旧配置：保留域名级白名单（精确IP，非CIDR） -->
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- 模拟器访问宿主机的特殊地址 -->
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <!-- 内网服务器地址（显式声明） -->
+        <domain>10.100.55.231</domain>
+        <!-- 允许 localhost -->
+        <domain includeSubdomains="true">localhost</domain>
+    </domain-config>
+</network-security-config>

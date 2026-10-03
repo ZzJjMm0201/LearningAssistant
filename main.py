@@ -1,0 +1,2258 @@
+import json
+import uuid
+import os
+import sys as _sys
+# Windows GBK 控制台无法打印 ⁻₂ 等Unicode字符会崩线程 → 强制UTF-8+替换
+for _s in (_sys.stdout, _sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import asyncio
+
+from server.config import HISTORY_DIR, REPORT_DIR, FEATURE_FLAGS, APIConfig
+from server.database.models import init_database, SubmissionRecord, TrackingRecord, ConversationHistory, User
+from server.services.ai_service import ai_service
+from server.services.search_service import search_service
+from server.services.report_generator import ReportGenerator
+from server.utils.latex_processor import process_latex_blocks, clean_markdown_for_display
+from server.utils.export_service import export_pdf, export_word
+
+# ==================== 日志系统（文件轮转 + 控制台） ====================
+import logging as _logging
+from logging.handlers import RotatingFileHandler
+
+def _setup_logging():
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    _fmt = _logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    _file_h = RotatingFileHandler(log_dir / "server.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    _file_h.setFormatter(_fmt)
+    _console_h = _logging.StreamHandler()
+    _console_h.setFormatter(_fmt)
+    _root = _logging.getLogger()
+    _root.setLevel(_logging.INFO)
+    _root.handlers = [_file_h, _console_h]
+    # uvicorn 自身日志也写入同一文件（access日志由中间件替代，避免重复）
+    _logging.getLogger("uvicorn").propagate = True
+    _logging.getLogger("uvicorn.error").propagate = True
+    _logging.getLogger("uvicorn.access").disabled = True
+    _logging.getLogger("app").setLevel(_logging.INFO)
+    print("[日志] 已初始化: logs/server.log (轮转5MB×5)")
+
+_setup_logging()
+from server.utils.tikz_md_renderer import get_available_latex_engines
+from server.utils.image_utils import save_uploaded_image
+from server.services.discovery_service import DiscoveryService
+from server.services.solve_pipeline import solve_pipeline
+from server.services.animation_service import generate_animation
+from server.services.ocr_service import ocr_service
+from server.services.auth_service import register, login, get_user_by_token, verify_token
+from server.services.permission_service import can_use_ai, RESTRICTED_MSG
+
+# ==================== MiKTeX 环境设置 ====================
+
+import shutil
+# 优先使用系统级MiKTeX，后退到用户级MiKTeX
+_MIKTEX_BIN = next(
+    (p for p in [
+        r'C:\Program Files\MiKTeX\miktex\bin\x64',
+        r'C:\Program Files (x86)\MiKTeX\miktex\bin',
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'MiKTeX', 'miktex', 'bin', 'x64'),
+    ] if os.path.isdir(p)),
+    None
+)
+if os.path.isdir(_MIKTEX_BIN):
+    os.environ['PATH'] = _MIKTEX_BIN + os.pathsep + os.environ.get('PATH', '')
+    print(f"[启动] MiKTeX 已加入PATH: {_MIKTEX_BIN}")
+    # 确认LaTeX引擎可用
+    engines = get_available_latex_engines()
+    if engines:
+        print(f"[启动] 可用LaTeX引擎: {engines}")
+    else:
+        print("[启动] 警告: 未找到LaTeX引擎")
+else:
+    print("[启动] MiKTeX 未安装（LaTeX图形渲染不可用）")
+
+HISTORY_DIR.mkdir(exist_ok=True)
+REPORT_DIR.mkdir(exist_ok=True)
+(HISTORY_DIR / "animations").mkdir(parents=True, exist_ok=True)
+
+# ==================== 服务生命周期 ====================
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    """服务生命周期：启动时预加载OCR模型"""
+    # startup
+    import threading
+    # 本地 PaddleOCR 内存占用大，仅在本机OCR启用时才预加载（避免空载 OOM/卡顿）
+    if FEATURE_FLAGS.get("enable_local_ocr", False):
+        thread = threading.Thread(target=ocr_service.preload_local_model, daemon=True)
+        thread.start()
+        print("[启动] OCR模型预加载已触发（后台异步加载中...）")
+    else:
+        print("[启动] 本地OCR未启用，跳过 PaddleOCR 模型预加载")
+    yield
+    # shutdown
+    print("[关闭] 服务关闭")
+
+# 创建FastAPI应用
+app = FastAPI(title="学习助手API", version="3.0.0", lifespan=lifespan)
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 请求日志中间件（⑧）
+@app.middleware("http")
+async def _log_requests(request: Request, call_next):
+    import time as _t
+    _start = _t.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _logging.getLogger("app").exception("%s %s 异常", request.method, request.url.path)
+        raise
+    _dur = (_t.time() - _start) * 1000
+    _logging.getLogger("app").info(
+        "%s %s -> %d (%.0fms)", request.method, request.url.path, response.status_code, _dur)
+    return response
+
+# 初始化数据库
+SessionLocal = init_database()
+
+# ==================== 数据模型 ====================
+
+class AskRequest(BaseModel):
+    session_id: str
+    question: str
+    context: Optional[list] = None
+
+class ReportRequest(BaseModel):
+    days: int = 30
+    theme: str = "dark"  # dark / light（② 数据报告深浅色）
+    grade: str = ""      # ③ 报告筛选：年级（空=不限）
+    subject: str = ""    # ③ 报告筛选：学科（空=不限）
+
+class ExportRequest(BaseModel):
+    title: str = "导出"
+    content: str = ""
+    format: str = "pdf"  # pdf / word
+
+class PomodoroRecommendRequest(BaseModel):
+    ocr_text: str = ""
+    summary: str = ""  # 学情摘要（可选）
+    image_base64: str = ""  # 题目图片（可选，视觉模型直接看图推荐）
+
+
+class TrackingData(BaseModel):
+    session_id: str
+    focus_state: str
+    duration_seconds: float
+    page_number: int = 0
+    pomodoro_count: int = 0
+
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenRequest(BaseModel):
+    token: str
+
+# ==================== API端点 ====================
+
+@app.get("/")
+async def root():
+    """网页端入口：重定向到学生端"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/web/")
+
+# Feature 7: 处理favicon.ico请求避免404日志
+@app.get("/favicon.ico")
+async def favicon():
+    # 返回204 No Content以避免404日志，且不影响功能
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+def get_engine(request: Request) -> str:
+    """AI提供方（X-Engine头：deepseek/qwen/doubao/hunyuan），默认deepseek"""
+    engine = (request.headers.get("X-Engine") or "deepseek").lower()
+    return engine if engine in ("deepseek", "qwen", "doubao", "hunyuan") else "deepseek"
+
+
+def get_llm_model(request: Request) -> Optional[str]:
+    """大语言模型名（X-LLM-Model头），未指定用提供方默认"""
+    m = (request.headers.get("X-LLM-Model") or "").strip()
+    return m or None
+
+
+def get_ocr_mode(request: Request) -> str:
+    """OCR模式（X-OCR-Mode头：paddle/qwen），默认取 OCR_DEFAULT_MODE（qwen 视觉模型）"""
+    default = getattr(APIConfig, "OCR_DEFAULT_MODE", "qwen")
+    default = default if default in ("paddle", "qwen") else "qwen"
+    mode = (request.headers.get("X-OCR-Mode") or default).lower()
+    return mode if mode in ("paddle", "qwen") else default
+
+
+def get_vision_model(request: Request) -> Optional[str]:
+    """视觉/OCR模型名（X-Vision-Model头）"""
+    m = (request.headers.get("X-Vision-Model") or "").strip()
+    return m or None
+
+
+def get_answer_style(request: Request) -> Optional[str]:
+    """② 回答风格（X-Style头；兼容网页端旧头 X-Answer-Style）
+    取值：formal(正式)/encouraging(鼓励)/humorous(幽默)，另保留历史值 plain/concise/lively/dialect"""
+    s = (request.headers.get("X-Style") or request.headers.get("X-Answer-Style") or "").strip().lower()
+    return s if s in ("formal", "encouraging", "humorous", "plain", "concise", "lively", "dialect") else None
+
+
+def get_theme(request: Request) -> str:
+    """界面主题（X-Theme头：light/dark）。用于动画等“生成时就固化了配色”的内容做深浅色适配"""
+    t = (request.headers.get("X-Theme") or "").strip().lower()
+    return "light" if t == "light" else "dark"
+
+
+def get_personality(request: Request) -> Optional[str]:
+    """⑨ 人格（X-Personality头：MBTI类型如INTJ，或auto）"""
+    import urllib.parse
+    v = (request.headers.get("X-Personality") or "").strip()
+    return urllib.parse.unquote(v) or None
+
+
+def get_detail(request: Request) -> Optional[str]:
+    """⑨ 详细度（X-Detail头：very_detailed/detailed/brief/auto）"""
+    v = (request.headers.get("X-Detail") or "").strip().lower()
+    return v if v in ("very_detailed", "detailed", "brief", "auto") else None
+
+
+def get_subject(request: Request) -> str:
+    """⑨ 学科（X-Subject头，用于personality=auto时推荐老师人格）"""
+    import urllib.parse
+    v = (request.headers.get("X-Subject") or "").strip()
+    return urllib.parse.unquote(v)
+
+
+def get_dialect(request: Request) -> str:
+    """③ 方言名称（X-Dialect头，style=dialect 时生效；客户端URL编码，这里解码）"""
+    import urllib.parse
+    v = (request.headers.get("X-Dialect") or "").strip()
+    v = urllib.parse.unquote(v)
+    return v or "普通话"
+
+
+def get_grade(request: Request) -> str:
+    """④ 年级（X-Grade头，如 高中；客户端URL编码，这里解码）"""
+    import urllib.parse
+    v = (request.headers.get("X-Grade") or "").strip()
+    return urllib.parse.unquote(v)
+
+
+def get_thinking_enabled(request: Request):
+    """十一 思考模式（X-Thinking头：1/true/on 开启；auto 自动按难度；仅DeepSeek链路生效）
+    返回 True / False / "auto"""
+    v = (request.headers.get("X-Thinking") or "").strip().lower()
+    if v == "auto":
+        return "auto"
+    return v in ("1", "true", "yes", "on")
+
+
+def get_latex_helper(request: Request):
+    """图解辅助（X-Latex-Helper头：1/on 开启；0/off 关闭；auto 自动（数学/物理 且 较难/难））"""
+    v = (request.headers.get("X-Latex-Helper") or "").strip().lower()
+    if v == "auto":
+        return "auto"
+    if v in ("0", "false", "off", "no"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return "auto"
+
+
+def get_search_enabled(request: Request) -> bool:
+    """④ 搜题开关（X-Search-Enabled头：0/false/off 关闭；默认开启）
+
+    ⑲ 但全局开关 FEATURE_FLAGS['enable_question_search'] 为 False 时一律不搜，
+    避免好未来额度被消耗（客户端开关也已禁用，这里再做一层服务端兜底）。
+    """
+    if not FEATURE_FLAGS.get("enable_question_search", False):
+        return False
+    v = (request.headers.get("X-Search-Enabled") or "").strip().lower()
+    return v not in ("0", "false", "off", "no")
+
+
+def get_interactive_quiz(request: Request) -> bool:
+    """⑯ 边解答边设问（X-Interactive-Quiz头：1/true/on 开启；默认关闭）"""
+    v = (request.headers.get("X-Interactive-Quiz") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def get_ai_annotate(request: Request) -> bool:
+    """⑰ AI批注（X-AI-Annotate头）；实际由 /annotate 接口单独走，这里仅备用"""
+    v = (request.headers.get("X-AI-Annotate") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def get_weak_count(user_id: Optional[int]) -> int:
+    """⑨ 薄弱知识点数（mastery_records 中未完全掌握的数量，用于 detail=auto 时决定详细度）"""
+    try:
+        mastery_dir = HISTORY_DIR / "mastery_records"
+        if not mastery_dir.exists():
+            return 0
+        weak = 0
+        for f in mastery_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("user_id") == user_id and data.get("mastery_level") in ("not_mastered", "partially_mastered"):
+                    weak += 1
+            except Exception:
+                continue
+        return weak
+    except Exception:
+        return 0
+
+@app.post("/solve")
+async def solve_problem(request: Request, file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    request_id = str(uuid.uuid4())
+    
+    image_path = HISTORY_DIR / f"{request_id}.jpg"
+    content = await file.read()
+    # 最长边压缩至1000像素以下，便于后续OCR识别
+    save_uploaded_image(content, image_path)
+    
+    # 用同一个 request_id 启动流程；传入请求Host用于构造LaTeX图片URL，user_id用于数据隔离
+    _user_id = get_current_user(request)
+    solve_pipeline.start_solve(
+        image_path=image_path,
+        session_id=request_id,  # ← 传入相同ID
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+    )
+    
+    return {
+        "request_id": request_id,  # ← 返回相同ID
+        "status": "processing",
+        "message": "解题已启动"
+    }
+
+
+class SolveTextRequest(BaseModel):
+    text: str
+
+
+@app.post("/solve/multipage")
+async def solve_multipage(request: Request, file: UploadFile = File(...)):
+    """长按多页拍摄：上传一段连续拍摄的视频，服务端抽关键帧
+
+    每帧视作一页 → 逐页 OCR → 合并成一篇长文本 → 交给现有分题流水线
+    （多题时会照常下发 question_split，由客户端选题）。
+    这样多页拍摄与单张多题走的是同一条下游路径，行为一致。
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    request_id = str(uuid.uuid4())
+    video_path = HISTORY_DIR / f"mp_{request_id}.mp4"
+    content = await file.read()
+    if not content:
+        return {"status": "error", "message": "视频内容为空"}
+    try:
+        with open(video_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        return {"status": "error", "message": f"视频保存失败: {e}"}
+
+    # ① 抽关键帧（OpenCV，本环境无 ffmpeg）
+    from server.services.keyframe_service import extract_keyframes
+    try:
+        frames, kf_err = extract_keyframes(HISTORY_DIR, str(video_path))
+    except Exception as e:
+        return {"status": "error", "message": f"关键帧提取失败: {e}"}
+    if kf_err or not frames:
+        return {"status": "error", "message": kf_err or "没有从视频中提取到有效画面"}
+
+    # ② 逐页 OCR（沿用请求里的 OCR 模式）
+    mode = get_ocr_mode(request)
+    vision_model = get_vision_model(request)
+    page_texts = []
+    for fr in frames:
+        try:
+            txt, _conf, _src = ocr_service.recognize(fr["path"], mode=mode, vision_model=vision_model)
+        except Exception as e:
+            print(f"[{request_id}] 第{fr['index']}页 OCR 异常: {e}")
+            txt = ""
+        if txt and not str(txt).startswith("OCR"):
+            page_texts.append(str(txt).strip())
+
+    if not page_texts:
+        return {"status": "error", "message": "多页识别失败，请重新拍摄（注意逐页拍清楚）"}
+
+    # ③ 合并成一篇长文，交给现有分题流水线（多题自动广播 question_split）
+    merged = "\n\n".join(page_texts)
+    _user_id = get_current_user(request)
+    solve_pipeline.start_solve(
+        image_path=frames[0]["path"],
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=mode,
+        vision_model=vision_model,
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+        text_input=merged,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "pages": len(page_texts),
+        "total_frames": len(frames),
+        "message": "多页解题已启动",
+    }
+
+
+@app.post("/solve/multipage-images")
+async def solve_multipage_images(request: Request, files: List[UploadFile] = File(...)):
+    """多页拍摄（多图版）：一次上传多张已拍好的页面图片
+
+    与视频版（/solve/multipage）同一下游：逐页 OCR → 合并长文 → 分题流水线。
+    安卓端用「连续拍多张」而不是录视频，这条路更贴合现有 ImageCapture 链路。
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    if not files:
+        return {"status": "error", "message": "没有收到页面图片"}
+
+    request_id = str(uuid.uuid4())
+    mode = get_ocr_mode(request)
+    vision_model = get_vision_model(request)
+    page_texts = []
+    saved_first = None
+
+    for idx, uf in enumerate(files):
+        try:
+            content = await uf.read()
+            if not content:
+                continue
+            img_path = HISTORY_DIR / f"mp_{request_id}_{idx:02d}.jpg"
+            save_uploaded_image(content, img_path)
+            if saved_first is None:
+                saved_first = img_path
+            txt, _conf, _src = ocr_service.recognize(str(img_path), mode=mode, vision_model=vision_model)
+            if txt and not str(txt).startswith("OCR"):
+                page_texts.append(str(txt).strip())
+        except Exception as e:
+            print(f"[{request_id}] 第{idx + 1}页处理异常: {e}")
+
+    if not page_texts:
+        return {"status": "error", "message": "多页识别失败，请重新拍摄（注意逐页拍清楚）"}
+
+    merged = "\n\n".join(page_texts)
+    _user_id = get_current_user(request)
+    solve_pipeline.start_solve(
+        image_path=saved_first or (HISTORY_DIR / f"{request_id}.jpg"),
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=mode,
+        vision_model=vision_model,
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+        text_input=merged,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "pages": len(page_texts),
+        "total_images": len(files),
+        "message": "多页解题已启动",
+    }
+
+
+@app.post("/solve/text")
+async def solve_text(request: Request, body: SolveTextRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """⑧ 文字输入解题：跳过OCR与分题，直接解题"""
+    request_id = str(uuid.uuid4())
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    _user_id = get_current_user(request)
+    # 用占位图片路径（无需真实图片）
+    image_path = HISTORY_DIR / f"{request_id}.txt.jpg"
+    solve_pipeline.start_solve(
+        image_path=image_path,
+        session_id=request_id,
+        base_host=request.headers.get("host") or None,
+        user_id=_user_id,
+        engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        thinking=get_thinking_enabled(request),
+        latex_helper=get_latex_helper(request),
+        search_enabled=get_search_enabled(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        personality=get_personality(request),
+        subject=get_subject(request),
+        detail=get_detail(request),
+        weak_count=get_weak_count(_user_id),
+        interactive_quiz=get_interactive_quiz(request),
+        text_input=text,
+    )
+    return {
+        "request_id": request_id,
+        "status": "processing",
+        "message": "文字解题已启动"
+    }
+
+@app.get("/solve/stream/{request_id}")
+async def solve_stream(request_id: str):
+    """SSE流式推送解题结果（异步轮询，不阻塞事件循环）"""
+    
+    async def event_stream():
+        queue = solve_pipeline.get_queue(request_id)
+        if queue is None:
+            yield f"data: {json.dumps({'stage': 'error', 'content': '无效的request_id'}, ensure_ascii=False)}\n\n"
+            return
+        while True:
+            if queue:
+                event = queue.popleft()
+                # 将事件转换为SSE格式
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                
+                # 如果事件中包含大量文本，让出控制权
+                if event.get("stage") in ("solution", "mindmap", "solution_chunk"):
+                    await asyncio.sleep(0.01)
+                
+                if event.get("stage") == "complete":
+                    break
+            else:
+                await asyncio.sleep(0.05)
+        
+        # 发送完成事件
+        yield "data: {\"stage\": \"complete\", \"content\": \"解题完成\"}\n\n"
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁用nginx缓冲
+        }
+    )
+
+@app.post("/solve/confirm/{request_id}")
+async def confirm_solve(request_id: str):
+    """用户确认OCR结果后继续解题流程"""
+    if solve_pipeline.confirm_continue(request_id):
+        return {"status": "ok", "message": "已确认，继续处理"}
+    return {"status": "error", "message": "request_id无效或已过期"}
+
+@app.post("/solve/select_questions/{request_id}")
+async def select_questions(request_id: str, body: dict):
+    """① 多题：用户选定要解的题目索引后继续"""
+    indices = body.get("indices", []) if isinstance(body, dict) else []
+    if solve_pipeline.select_questions(request_id, indices):
+        return {"status": "ok", "message": "已确认选题"}
+    return {"status": "error", "message": "request_id无效或已超时"}
+
+@app.post("/solve/cancel/{request_id}")
+async def cancel_solve(request_id: str):
+    """用户取消解题流程"""
+    solve_pipeline.cancel_solve(request_id)
+    return {"status": "ok", "message": "已取消"}
+
+@app.get("/static/svgs/{rest_of_path:path}")
+async def get_svg(rest_of_path: str):
+    """获取SVG文件"""
+    file_path = HISTORY_DIR / rest_of_path
+    if file_path.exists():
+        return FileResponse(file_path)
+    return {"detail": "Not Found"}
+
+@app.post("/ask")
+async def ask_question(request: Request, body: AskRequest):
+    # 【修复】原签名只有 request: AskRequest（请求体模型），却把 request 直接传给
+    # check_ai_permission() / get_engine() / get_answer_style() 等“读请求头”的辅助函数。
+    # AskRequest 根本没有 .headers 属性 -> AttributeError -> /ask 恒返回 HTTP 500。
+    # 这就是“AI解题/知识延伸追问不了”的真因。现同时注入真正的 Request 与请求体。
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """多轮对话 - 继续提问（从数据库加载该会话的历史上下文）"""
+    db = SessionLocal()
+    try:
+        from server.database.models import ConversationHistory as CH
+        # 从数据库读取该会话的历史消息作为上下文
+        history = (
+            db.query(CH)
+            .filter(CH.session_id == body.session_id)
+            .order_by(CH.id.asc())
+            .all()
+        )
+        messages: list = clean_conversation_history(
+            [{"role": h.role, "content": h.content} for h in history]
+        )
+        # 历史记录页追问：该会话没有对话上下文时，用客户端传入的 context 兜底
+        # （solve 会保存 ConversationHistory，知识延伸/动画记录不会，需要前端带上正文）
+        if not messages and isinstance(body.context, list):
+            messages = clean_conversation_history(
+                [m for m in body.context if isinstance(m, dict) and m.get("role") and m.get("content")]
+            )
+
+        response = ai_service.continue_conversation(messages, body.question, engine=get_engine(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
+
+        # 保存本次问答到数据库，保证后续追问上下文连续
+        for role, content in (("user", body.question), ("assistant", response)):
+            conv = CH(session_id=body.session_id, role=role, content=content)
+            db.add(conv)
+        db.commit()
+
+        return {"answer": response, "session_id": body.session_id}
+    finally:
+        db.close()
+
+@app.post("/ask/stream")
+async def ask_question_stream(request: Request, body: AskRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        raise HTTPException(status_code=403, detail=_perm_err.get("message", "AI使用受限"))
+
+    """多轮对话 - 继续提问（SSE流式，回答与AI解题同样式）"""
+    db = SessionLocal()
+    try:
+        from server.database.models import ConversationHistory as CH
+        history = (
+            db.query(CH)
+            .filter(CH.session_id == body.session_id)
+            .order_by(CH.id.asc())
+            .all()
+        )
+        messages: list = clean_conversation_history(
+            [{"role": h.role, "content": h.content} for h in history]
+        )
+        # 历史记录页追问：无对话上下文时用客户端传入的 context 兜底（同 /ask）
+        if not messages and isinstance(body.context, list):
+            messages = clean_conversation_history(
+                [m for m in body.context if isinstance(m, dict) and m.get("role") and m.get("content")]
+            )
+        engine = get_engine(request)
+        llm_model = get_llm_model(request)
+        style = get_answer_style(request)
+        dialect = get_dialect(request)
+        grade = get_grade(request)
+
+        async def event_stream():
+            accumulated = ""
+            prev_sent = ""
+            for chunk in ai_service.continue_conversation_stream(messages, body.question, engine=engine, model=llm_model, style=style, dialect=dialect, grade=grade):
+                accumulated = chunk
+                # AI流式回调返回“累积到当前”的全文：只下发新增部分，客户端累加后不会重复
+                delta = chunk[len(prev_sent):] if chunk.startswith(prev_sent) else chunk
+                prev_sent = chunk
+                if delta:
+                    yield f"data: {json.dumps({'stage': 'answer_chunk', 'content': delta}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
+            
+            # ① 追问若包含LaTeX图形代码块 → 本地渲染为图片并下发渲染结果（含“（*图形渲染失败*）”提示）
+            final_answer = accumulated
+            if "```" in final_answer:
+                try:
+                    from server.utils.latex_processor import process_latex_blocks_with_retry
+                    svg_dir = HISTORY_DIR / f"svgs_ask_{body.session_id[:16]}"
+                    svg_dir.mkdir(parents=True, exist_ok=True)
+                    rendered = process_latex_blocks_with_retry(
+                        final_answer, svg_dir, ai_service=ai_service,
+                        engine=engine, model=llm_model
+                    )
+                    rendered = rewrite_rendered_images(rendered, get_request_host(request), f"svgs_ask_{body.session_id[:16]}")
+                    if rendered != final_answer:
+                        final_answer = rendered
+                        yield f"data: {json.dumps({'stage': 'answer_rendered', 'content': final_answer}, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"[ask/stream] 追问LaTeX渲染失败: {e}")
+            
+            # 保存本次问答到数据库（流结束、response返回后执行，需新开会话）
+            try:
+                db2 = SessionLocal()
+                try:
+                    for role, content in (("user", body.question), ("assistant", final_answer)):
+                        conv = CH(session_id=body.session_id, role=role, content=content)
+                        db2.add(conv)
+                    db2.commit()
+                finally:
+                    db2.close()
+            except Exception as e:
+                print(f"[ask/stream] 保存对话失败: {e}")
+            yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+    finally:
+        db.close()
+
+@app.post("/animation")
+async def create_animation(request: Request, file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """生成AI动画"""
+    request_id = str(uuid.uuid4())
+    # 保存图片（最长边压缩至1000像素以下，便于后续OCR）
+    image_path = HISTORY_DIR / f"{request_id}.jpg"
+    content = await file.read()
+    save_uploaded_image(content, image_path)
+    # OCR 识别
+    ocr_text, _, _ = ocr_service.recognize(str(image_path))
+    if not ocr_text or ocr_text.startswith("OCR"):
+        return {"status": "error", "message": "OCR识别失败"}
+    
+    # 生成动画（theme：浅色界面下用浅色背景，避免深色动画与页面格格不入）
+    html_path = generate_animation(ocr_text, engine=get_engine(request), theme=get_theme(request))
+    if html_path:
+        # 返回动画文件的 URL
+        filename = Path(html_path).name
+        url = f"/static/animations/{filename}"
+        # ③ 保存 AI 动画记录到历史
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="animation",
+                    title="AI动画",
+                    content=url,
+                    extra_json={"ocr_text": ocr_text[:200]},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[动画] 保存历史记录失败: {e}")
+        return {
+            "status": "ok",
+            "url": url,
+            "request_id": request_id,
+            "usage": ai_service.get_usage()   # ⑫ tokens：动画也要能显示用量
+        }
+    else:
+        return {"status": "error", "message": "动画生成失败"}
+
+
+
+@app.post("/animation/text")
+async def create_animation_text(request: Request, body: SolveTextRequest):
+    """⑧ 文字输入直接生成AI动画（跳过OCR，复用动画生成）"""
+    # ⑮ 账号权限
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    request_id = str(uuid.uuid4())
+    html_path = generate_animation(text, engine=get_engine(request), theme=get_theme(request))
+    if html_path:
+        filename = Path(html_path).name
+        url = f"/static/animations/{filename}"
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="animation",
+                    title="AI动画",
+                    content=url,
+                    extra_json={"ocr_text": text[:200]},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[动画-文本] 保存历史记录失败: {e}")
+        return {"status": "ok", "url": url, "request_id": request_id, "usage": ai_service.get_usage()}
+    else:
+        return {"status": "error", "message": "动画生成失败"}
+
+@app.get("/static/animations/{filename}")
+async def get_animation(filename: str):
+    """获取动画文件"""
+    file_path = HISTORY_DIR / "animations" / filename
+    if file_path.exists():
+        return FileResponse(file_path, media_type="text/html")
+    return {"detail": "Not Found"}
+
+@app.post("/report/mistakes")
+async def report_mistakes(request: Request, body: dict = Body(default={})):
+    """⑨ 最近易错点梳理：汇总该用户最近若干条记录的 easy_mistakes。
+
+    请求体：{"limit": 10}   可选，默认 10 条记录
+    返回：{"items": [{"text": "...", "count": 2}], "records": N}
+    """
+    try:
+        limit = int((body or {}).get("limit") or 10)
+    except Exception:
+        limit = 10
+    limit = max(1, min(limit, 50))
+
+    user_id = get_current_user(request)
+    from server.database.models import SubmissionRecord
+    from collections import Counter
+
+    db = SessionLocal()
+    try:
+        q = db.query(SubmissionRecord)
+        if user_id is not None:
+            q = q.filter(SubmissionRecord.user_id == user_id)
+        rows = q.order_by(SubmissionRecord.id.desc()).limit(limit).all()
+        counter = Counter()
+        records = 0
+        for r in rows:
+            qi = getattr(r, "question_info", None)
+            if not qi:
+                continue
+            try:
+                d = json.loads(qi) if isinstance(qi, str) else qi
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            em = d.get("easy_mistakes")
+            if isinstance(em, str):
+                em = [x for x in re.split(r"[；;、\n]", em) if x.strip()]
+            if not isinstance(em, list):
+                continue
+            got = False
+            for x in em:
+                t = str(x).strip()
+                if t:
+                    counter[t] += 1
+                    got = True
+            if got:
+                records += 1
+        items = [{"text": t, "count": c} for t, c in counter.most_common(20)]
+        return {"status": "ok", "items": items, "records": records}
+    finally:
+        db.close()
+
+
+@app.post("/report/data")
+async def data_report(request: Request, body: ReportRequest):
+    """生成数据版学情报告（按用户隔离 + ③ 年级/学科筛选）"""
+    db = SessionLocal()
+    try:
+        generator = ReportGenerator(db)
+        theme = "light" if (body.theme or "").lower() == "light" else "dark"
+        html_path = generator.generate_data_report_html(
+            body.days, user_id=get_current_user(request), theme=theme,
+            grade=(body.grade or "").strip(), subject=(body.subject or "").strip())
+        
+        if html_path:
+            filename = Path(html_path).name
+            return {
+                "status": "ok",
+                "url": f"/static/reports/{filename}"
+            }
+        else:
+            return {"status": "error", "message": "没有足够的数据生成报告"}
+    finally:
+        db.close()
+
+@app.post("/report/ai")
+async def ai_report(request: Request, body: ReportRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """生成AI版学情报告（非流式，兼容旧客户端）；⑦ 规定时段题目 <5 题则不生成"""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+        from datetime import timedelta
+        user_id = get_current_user(request)
+        q = db.query(SubmissionRecord)
+        if body.days and body.days > 0:
+            q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
+        if user_id is not None:
+            q = q.filter(SubmissionRecord.user_id == user_id)
+        else:
+            # 未登录/游客：无个人记录可统计
+            q = q.filter(SubmissionRecord.id == -1)
+        record_count = q.count()
+        if record_count < 5:
+            return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
+
+        generator = ReportGenerator(db)
+        summary = generator.get_report_summary(body.days, user_id=user_id)
+        
+        if summary == "暂无学习记录":
+            return {"status": "error", "message": "暂无学习记录"}
+        
+        ai_report_text = ai_service.generate_ai_report(
+            summary, engine=get_engine(request), model=get_llm_model(request),
+            style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request),
+            personality=get_personality(request), detail=get_detail(request),
+            subject=get_subject(request), weak_count=get_weak_count(user_id))
+        
+        return {
+            "status": "ok",
+            "report": ai_report_text,
+            "summary": summary
+        }
+    finally:
+        db.close()
+
+@app.post("/report/ai/stream")
+async def ai_report_stream(request: Request, body: ReportRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        raise HTTPException(status_code=403, detail=_perm_err.get("message", "AI使用受限"))
+
+    """生成AI版学情报告（SSE流式）；⑦ 规定时段题目 <5 题则不生成"""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+        from datetime import timedelta
+        user_id = get_current_user(request)
+        q = db.query(SubmissionRecord)
+        if body.days and body.days > 0:
+            q = q.filter(SubmissionRecord.timestamp >= datetime.utcnow() - timedelta(days=body.days))
+        if user_id is not None:
+            q = q.filter(SubmissionRecord.user_id == user_id)
+        else:
+            # 未登录/游客：无个人记录可统计
+            q = q.filter(SubmissionRecord.id == -1)
+        record_count = q.count()
+        if record_count < 5:
+            return {"status": "error", "message": f"当前时段仅 {record_count} 道题，积累题目数量太少，暂不生成报告（至少需 5 题）"}
+
+        generator = ReportGenerator(db)
+        summary = await asyncio.to_thread(generator.get_report_summary, body.days, user_id=user_id)
+        
+        if summary == "暂无学习记录":
+            return {"status": "error", "message": "暂无学习记录"}
+        
+        async def event_stream():
+            # 先发摘要供客户端展示
+            yield f"data: {json.dumps({'stage': 'summary', 'content': summary}, ensure_ascii=False)}\n\n"
+            # 流式生成报告正文
+            for chunk in ai_service.generate_ai_report_stream(
+                    summary, engine=get_engine(request), model=get_llm_model(request),
+                    style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request),
+                    personality=get_personality(request), detail=get_detail(request),
+                    subject=get_subject(request), weak_count=get_weak_count(user_id)):
+                yield f"data: {json.dumps({'stage': 'report_chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.01)
+            yield f"data: {json.dumps({'stage': 'complete', 'content': ''}, ensure_ascii=False)}\n\n"
+        
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+    finally:
+        db.close()
+
+@app.get("/static/reports/{filename}")
+async def get_report(filename: str):
+    """获取报告文件"""
+    file_path = REPORT_DIR / filename
+    if file_path.exists():
+        return FileResponse(file_path, media_type="text/html")
+    return {"detail": "Not Found"}
+
+@app.post("/export")
+async def export_content(request: Request, body: ExportRequest):
+    """④ 导出 PDF / Word（服务端生成，公式转纯文本；返回文件URL供客户端下载）"""
+    import uuid as _uuid
+    export_dir = REPORT_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (body.format or "pdf").lower()
+    if fmt not in ("pdf", "word"):
+        fmt = "pdf"
+    ext = "pdf" if fmt == "pdf" else "docx"
+    fname = f"export_{_uuid.uuid4().hex[:10]}.{ext}"
+    out_path = export_dir / fname
+    import asyncio
+    _host = get_request_host(request)
+    # 导出含 pandoc 子进程/图片下载等阻塞操作，放到线程避免卡死事件循环
+    ok = await asyncio.to_thread(
+        export_pdf if fmt == "pdf" else export_word,
+        body.title, body.content, out_path, _host
+    )
+    if not ok:
+        return {"status": "error", "message": "导出失败"}
+    return {"status": "ok", "url": f"/static/exports/{fname}", "filename": fname}
+
+@app.get("/static/exports/{filename}")
+async def get_export_file(filename: str):
+    """获取导出的 PDF/Word 文件"""
+    file_path = REPORT_DIR / "exports" / filename
+    if not file_path.exists():
+        return {"detail": "Not Found"}
+    mt = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if filename.endswith(".docx") else "application/pdf"
+    return FileResponse(file_path, media_type=mt, filename=filename)
+
+
+# ==================== ⑰ AI 批注 ====================
+
+@app.post("/annotate")
+async def ai_annotate(request: Request, file: UploadFile = File(...)):
+    """⑰ AI批注：在学生作业/试卷图片上生成老师的批改标记
+
+    两条通道（由 X-OCR-Mode 决定，与设置里的 OCR 模式一致）：
+      ㈠ 视觉模型（qwen）：在外围画像素刻度尺，批注由视觉模型**直接生成**，不投给大语言模型
+      ㈡ PaddleOCR：取出文本块坐标，连同题目内容一起投给大语言模型来定位
+    产出：带批注的 PNG（可下载）+ 批注列表
+    """
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    import uuid as _uuid
+    from server.services import annotation_service as anno
+
+    request_id = str(_uuid.uuid4())
+    src_path = HISTORY_DIR / f"annotate_{request_id}.jpg"
+    content = await file.read()
+    try:
+        save_uploaded_image(content, src_path)
+    except Exception as e:
+        return {"status": "error", "message": f"图片保存失败: {e}"}
+
+    mode = get_ocr_mode(request)          # paddle / qwen
+    engine = get_engine(request)
+    model = get_llm_model(request)
+    vision_model = get_vision_model(request)
+
+    out_dir = HISTORY_DIR / "annotations"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f"anno_{request_id}.png"
+    out_path = out_dir / out_name
+
+    try:
+        if mode == "qwen":
+            # ---- ㈠ 视觉模型：画刻度尺 → 视觉模型直接产出批注 ----
+            ruler_path = out_dir / f"ruler_{request_id}.png"
+            try:
+                w, h = await asyncio.to_thread(anno.add_rulers, str(src_path), str(ruler_path))
+            except Exception as e:
+                return {"status": "error", "message": f"绘制刻度尺失败: {e}"}
+
+            # 【修复】批注要输出较长 JSON，而默认视觉模型是推理型（思考过程也计入
+            # completion_tokens）：实测 max_tokens=5000 会被 reasoning_tokens 吃满，
+            # 返回 finish_reason=length 且 content 为空，上层就报“AI 未生成有效批注”。
+            # 这里把额度提到 16000（思考+JSON 都放得下）。
+            raw = await asyncio.to_thread(
+                ai_service.recognize_image_with_vision,
+                str(ruler_path), vision_model, anno.VISION_ANNOTATE_PROMPT, 16000
+            )
+            raw_text = raw[0] if isinstance(raw, tuple) else (raw or "")
+            annotations = anno.parse_annotations(raw_text)
+            channel = "vision"
+        else:
+            # ---- ㈡ PaddleOCR：取文字块坐标 → 投给大语言模型 ----
+            text, blocks, width, height, _el = await asyncio.to_thread(
+                ocr_service.recognize_with_boxes, str(src_path)
+            )
+            if not text:
+                return {"status": "error", "message": "OCR识别失败，无法生成批注"}
+            if not width or not height:
+                try:
+                    from PIL import Image as _Image
+                    with _Image.open(src_path) as _im:
+                        width, height = _im.size
+                except Exception:
+                    width = height = 0
+            prompt = anno.build_paddle_annotate_prompt(text, blocks, width, height)
+            raw_text = await asyncio.to_thread(
+                ai_service.generate_response, prompt, engine, model,
+                "你是一位批改作业的老师。请严格按要求只输出 JSON，"
+                "形如 {\"annotations\": [...]}，不要任何解释文字。",
+                4000,
+            )
+            annotations = anno.parse_annotations(raw_text or "")
+            channel = "paddle"
+
+        if not annotations:
+            return {"status": "error", "message": "AI 未生成有效批注，请重试或换一张更清晰的图片"}
+
+        # 在原图（不带刻度尺）上绘制批注，便于下载使用
+        ok = await asyncio.to_thread(
+            anno.draw_annotations, str(src_path), annotations, str(out_path)
+        )
+        if not ok:
+            return {"status": "error", "message": "批注图片保存失败"}
+
+        # 存一条历史记录（与 AI动画/知识延伸 并列）
+        try:
+            from server.database.models import AuxRecord
+            db2 = SessionLocal()
+            try:
+                rec = AuxRecord(
+                    session_id=request_id,
+                    user_id=get_current_user(request),
+                    record_type="annotation",
+                    title="AI批注",
+                    content=f"/static/annotations/{out_name}",
+                    extra_json={"channel": channel, "annotations": annotations},
+                )
+                db2.add(rec)
+                db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            print(f"[批注] 保存历史记录失败: {e}")
+
+        return {
+            "status": "ok",
+            "url": f"/static/annotations/{out_name}",
+            "channel": channel,
+            "annotations": annotations,
+            "usage": ai_service.get_usage(),   # ⑫ tokens：批注也要能显示用量
+            "request_id": request_id,
+        }
+    except Exception as e:
+        print(f"[批注] 生成失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"批注生成失败: {e}"}
+
+
+@app.get("/static/annotations/{filename}")
+async def get_annotation_file(filename: str):
+    """获取批注后的图片"""
+    file_path = HISTORY_DIR / "annotations" / filename
+    if not file_path.exists():
+        return {"detail": "Not Found"}
+    return FileResponse(file_path, media_type="image/png")
+
+@app.post("/pomodoro/recommend")
+async def pomodoro_recommend(request: Request, body: PomodoroRecommendRequest):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """番茄钟 AI 推荐做题时长：基于题目图片/文字+学情，返回 {duration_minutes, reason}"""
+    import re as _re
+    try:
+        ocr_text = body.ocr_text
+        # 优先级：有图片 base64 → 用视觉模型直接看题描述
+        if body.image_base64:
+            # E: 与“AI解答”一致，用设置面板所选 OCR 模型(X-OCR-Mode / X-Vision-Model)
+            # 而非写死千问视觉，避免误用慢模型导致 30s+ 等待
+            import base64 as _b64
+            import tempfile
+            try:
+                img_bytes = _b64.b64decode(body.image_base64)
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                    tf.write(img_bytes)
+                    tmp_path = tf.name
+                desc, _, _ = ocr_service.recognize(
+                    tmp_path, mode=get_ocr_mode(request), vision_model=get_vision_model(request))
+                if desc and not desc.startswith("OCR"):
+                    ocr_text = desc
+                else:
+                    print("[Pomodoro] 图片OCR为空/失败，改用传入文本")
+            except Exception as e:
+                print(f"[Pomodoro] 图片识别失败，回退文字: {e}")
+        prompt = (
+            "你是学习规划助手。请根据学生当前要做的题目和学情，推荐一个合适的番茄钟专注时长（分钟，取 25/30/35/40/45/50 之一），"
+            "并给出简短理由。\n\n"
+            f"题目内容：{ocr_text[:800]}\n"
+            f"学情摘要：{body.summary[:500] or '暂无学情数据'}\n\n"
+            "只输出 JSON：{\"duration_minutes\": 建议时长(整数), \"reason\": \"推荐理由(一句话)\"}"
+        )
+        resp = ai_service.generate_response(
+            prompt, engine=get_engine(request), model=get_llm_model(request),
+            system="你是学习规划助手。只输出 JSON，不要任何解释文字。",
+        ) or ""
+        m = _re.search(r'\{[^{}]*\}', resp, _re.DOTALL)
+        data = {}
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = {}
+        dur = data.get("duration_minutes", 30)
+        if not isinstance(dur, int):
+            try:
+                dur = int(dur)
+            except Exception:
+                dur = 30
+        dur = min(50, max(25, dur))
+        reason = str(data.get("reason", "建议保持常规专注时长"))
+        return {"status": "ok", "duration_minutes": dur, "reason": reason}
+    except Exception as e:
+        print(f"[Pomodoro] 推荐失败: {e}")
+        return {"status": "error", "message": f"推荐失败: {e}"}
+
+
+
+# ④ 网页端（学生端）静态目录：与 API 同源，避免跨域
+from pathlib import Path as _WebPath
+_WEB_DIR = _WebPath(__file__).resolve().parent / "web"
+# 开发/迭代期：静态资源禁缓存，避免浏览器继续使用旧版 JS/CSS
+class _NoCacheStatic(StaticFiles):
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
+if _WEB_DIR.is_dir():
+    app.mount("/web", _NoCacheStatic(directory=str(_WEB_DIR), html=True), name="web")
+
+@app.get("/static/{filename:path}")
+async def get_history_image(filename: str):
+    """获取历史图片等静态文件（已加固：禁止路径穿越）"""
+    # 🔒 只允许访问 HISTORY_DIR 内的文件，拒绝 .. / 绝对路径
+    base = HISTORY_DIR.resolve()
+    try:
+        file_path = (base / filename).resolve()
+    except Exception:
+        return {"detail": "Not Found"}
+    if file_path != base and base not in file_path.parents:
+        return {"detail": "Not Found"}
+    if file_path.exists() and file_path.is_file():
+        return FileResponse(file_path)
+    return {"detail": "Not Found"}
+
+@app.post("/extend")
+async def knowledge_extension(request: Request, file: UploadFile = File(...)):
+    # ⑮ 账号权限：受限用户拒绝(因AI资源有限; 管理员/白名单放行)
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+
+    """知识延伸"""
+    request_id = str(uuid.uuid4())
+    image_path = HISTORY_DIR / f"{request_id}.jpg"
+    # 最长边压缩至1000像素以下，便于后续OCR识别
+    save_uploaded_image(await file.read(), image_path)
+    
+    solve_pipeline.start_knowledge_extension(image_path, request_id, user_id=get_current_user(request), engine=get_engine(request), ocr_mode=get_ocr_mode(request), vision_model=get_vision_model(request), model=get_llm_model(request), style=get_answer_style(request), dialect=get_dialect(request), grade=get_grade(request))
+    
+    return {"request_id": request_id, "status": "processing"}
+
+
+
+@app.post("/report-issue")
+async def report_issue(request: Request, body: dict = Body(...)):
+    """📣 上报问题：记录描述 + 环境信息供排查（不消耗 AI 额度，不受权限限制）"""
+    desc = str((body or {}).get("description") or "").strip()
+    if not desc:
+        return {"status": "error", "message": "问题描述不能为空"}
+    try:
+        from server.database.models import AuxRecord
+        rec = AuxRecord(
+            session_id=str(uuid.uuid4()),
+            user_id=get_current_user(request),
+            record_type="issue",
+            title=str((body or {}).get("version") or "上报问题")[:80],
+            content=desc[:4000],
+            extra_json={
+                "page": str((body or {}).get("page") or "")[:300],
+                "user_agent": str((body or {}).get("user_agent") or "")[:300],
+            },
+        )
+        db3 = SessionLocal()
+        try:
+            db3.add(rec)
+            db3.commit()
+        finally:
+            db3.close()
+    except Exception as e:
+        print(f"[上报问题] 保存失败: {e}")
+        return {"status": "error", "message": "提交失败，请稍后重试"}
+    return {"status": "ok"}
+
+
+@app.post("/extend/text")
+async def knowledge_extension_text(request: Request, body: SolveTextRequest):
+    """⑧ 文字输入直接知识延伸（跳过OCR）"""
+    _perm_err = check_ai_permission(request)
+    if _perm_err is not None:
+        return _perm_err
+    text = (body.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "题目文本不能为空"}
+    request_id = str(uuid.uuid4())
+    image_path = HISTORY_DIR / f"{request_id}.txt.jpg"
+    solve_pipeline.start_knowledge_extension(
+        image_path, request_id,
+        user_id=get_current_user(request),
+        engine=get_engine(request),
+        ocr_mode=get_ocr_mode(request),
+        vision_model=get_vision_model(request),
+        model=get_llm_model(request),
+        style=get_answer_style(request),
+        dialect=get_dialect(request),
+        grade=get_grade(request),
+        text_input=text,
+    )
+    return {"request_id": request_id, "status": "processing"}
+
+@app.get("/extend/stream/{request_id}")
+async def extend_stream(request_id: str):
+    """SSE流式推送知识延伸结果（异步轮询，不阻塞事件循环）"""
+    async def event_stream():
+        queue = solve_pipeline.get_queue(request_id)
+        if queue is None:
+            yield f"data: {json.dumps({'stage': 'error', 'content': '无效的request_id'}, ensure_ascii=False)}\n\n"
+            return
+        while True:
+            if queue:
+                event = queue.popleft()
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event.get("stage") == "complete":
+                    break
+            else:
+                await asyncio.sleep(0.05)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.post("/history")
+async def get_history(request: Request, body: dict):
+    """获取历史记录（按用户隔离；返回完整内容，清除图片链接）"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        from sqlalchemy import or_
+        from datetime import datetime, time as dtime, timedelta
+        import re
+        
+        start_date = body.get("start_date", "")
+        end_date = body.get("end_date", "")
+        user_id = get_current_user(request)
+        
+        # 数据库存UTC时间，客户端传本地时间：过滤时本地→UTC换算，展示时UTC→本地换算
+        local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+        
+        query = db.query(SubmissionRecord)
+        
+        # 【修复】日期边界只算一次，供"解题记录"与"辅助记录(知识延伸/AI动画)"共用。
+        # 原实现只把日期筛选加在 SubmissionRecord 上，辅助记录整表返回，
+        # 于是出现"筛选 09-20~09-23 却显示 09-16 记录"的越界现象（录屏中实际出现）。
+        start_bound = None
+        end_bound = None
+        if start_date:
+            start_bound = datetime.fromisoformat(start_date) - local_offset
+            query = query.filter(SubmissionRecord.timestamp >= start_bound)
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date)
+            # 只传日期（如"2026-08-26"）时表示包含当天全天，而非当天0点
+            if end_dt.time() == dtime(0, 0):
+                end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
+            end_bound = end_dt - local_offset
+            query = query.filter(SubmissionRecord.timestamp <= end_bound)
+        
+        # 多用户隔离：登录用户看自己的+公共(NULL)；未登录只能看公共(NULL)
+        if user_id is not None:
+            query = query.filter(
+                SubmissionRecord.user_id == user_id
+            )
+        else:
+            # 未登录/游客：不给任何人的记录（历史属私人数据）
+            query = query.filter(SubmissionRecord.id == -1)
+        
+        # 全量返回（个人学习记录量级小，不分页截断；避免“部分题目莫名消失”），并在Python侧应用筛选
+        all_records = query.order_by(SubmissionRecord.timestamp.desc()).all()
+        
+        # ③ 筛选参数（客户端“筛选”面板：学科/年级/难度，支持多选：数组或逗号分隔字符串）
+        def _parse_filters(val):
+            if isinstance(val, list):
+                return {str(v).strip() for v in val if str(v).strip()}
+            if isinstance(val, str) and val.strip():
+                return {v.strip() for v in val.split(",") if v.strip()}
+            return set()
+        filter_subjects = _parse_filters(body.get("subject"))
+        filter_grades = _parse_filters(body.get("grade"))
+        filter_difficulties = _parse_filters(body.get("difficulty"))
+        # ⑤ 掌握程度筛选（值：完全掌握/部分掌握/完全没掌握/未记录）
+        filter_masteries = _parse_filters(body.get("mastery"))
+        
+        result = []
+        all_subjects = set()
+        # 学科统计基于筛选后的全量记录
+        for r in all_records:
+            subj = ""
+            qi = r.question_info
+            if isinstance(qi, dict):
+                subj = qi.get("subject", "")
+            if not subj and r.ocr_text:
+                extracted = extract_subjects(cleanup_markdown_images(r.ocr_text))
+                if extracted and extracted[0] != "其他":
+                    subj = extracted[0]
+            if subj:
+                all_subjects.add(subj)
+        
+        # 图片URL统一重写到当前请求Host（LaTeX图/原图均指向当前服务地址）
+        host = get_request_host(request)
+        
+        for r in all_records:
+            # 清理OCR文本中的图片链接（仅OCR文本清理）
+            clean_ocr = cleanup_markdown_images(r.ocr_text) if r.ocr_text else ""
+            clean_steps = cleanup_markdown_images(r.solution_steps) if r.solution_steps else ""
+            # 完整解析保留LaTeX图片标记，仅把图片URL重写到当前服务地址
+            clean_solution = rewrite_static_urls(r.full_solution, host) if r.full_solution else ""
+            
+            # 提取年级学科信息
+            grade = ""
+            subject = ""
+            difficulty = ""
+            knowledge_points = []
+            question_info = r.question_info
+            if isinstance(question_info, dict):
+                grade = question_info.get("grade", "")
+                subject = question_info.get("subject", "")
+                difficulty = question_info.get("difficulty", "")
+                knowledge_points = question_info.get("knowledge_points", [])
+            
+            # Feature 18: 如果question_info中没有学科，尝试从OCR文本提取
+            if not subject and clean_ocr:
+                extracted = extract_subjects(clean_ocr)
+                if extracted and extracted[0] != "其他":
+                    subject = extracted[0]
+            
+            # ③ 应用学科/年级/难度多选筛选
+            if filter_subjects and subject not in filter_subjects:
+                continue
+            if filter_grades and grade not in filter_grades:
+                continue
+            if filter_difficulties and difficulty not in filter_difficulties:
+                continue
+            
+            if subject:
+                all_subjects.add(subject)
+            
+            # 原图URL
+            image_url = ""
+            if r.original_image_path:
+                image_path = Path(r.original_image_path)
+                if image_path.exists():
+                    image_url = f"/static/{image_path.name}"
+            # 【修复】显示时间必须与"日期筛选"同源：筛选用的是数据库 timestamp（UTC），
+            # 原代码却**优先用原图文件的 mtime** 显示（文件被复制/移动后 mtime 会变），
+            # 于是会出现"筛选 09-20~09-23 却显示一条 09-16 记录"的越界现象（录屏中实际出现）。
+            # 改为优先用数据库时间（UTC→本地），仅当其缺失时才回退到文件 mtime。
+            display_ts = ""
+            if r.timestamp is not None:
+                display_ts = (r.timestamp + local_offset).isoformat()
+            if not display_ts and r.original_image_path:
+                image_path = Path(r.original_image_path)
+                if image_path.exists():
+                    display_ts = datetime.fromtimestamp(image_path.stat().st_mtime).isoformat()
+            
+            # 掌握程度（读取 mastery_records 下按 session_id 保存的选项）
+            mastery_label = ""
+            mf = HISTORY_DIR / "mastery_records" / f"{r.session_id}.json"
+            if mf.exists():
+                try:
+                    mj = json.loads(mf.read_text(encoding="utf-8"))
+                    mastery_label = _MASTERY_LABELS.get(mj.get("mastery_level", ""), "")
+                except Exception:
+                    pass
+            
+            # ⑤ 应用掌握程度多选筛选（“未记录”匹配没有掌握程度文件的记录）
+            if filter_masteries:
+                if mastery_label:
+                    if mastery_label not in filter_masteries:
+                        continue
+                else:
+                    if "未记录" not in filter_masteries:
+                        continue
+            
+            # 图解辅助（解题时单独落盘的旁文件）：历史详情需要独立成模块展示
+            extras_md = ""
+            if r.session_id:
+                try:
+                    _ex = HISTORY_DIR / f"{r.session_id}_latex_extras.md"
+                    if _ex.exists():
+                        extras_md = rewrite_static_urls(_ex.read_text(encoding="utf-8"), host)
+                except Exception:
+                    extras_md = ""
+
+            result.append({
+                "id": r.id,
+                "session_id": r.session_id or "",
+                "timestamp": display_ts,
+                "record_type": "solve",
+                "ocr_text": clean_ocr,
+                "question_info_raw": json.dumps(question_info, ensure_ascii=False) if isinstance(question_info, dict) else str(question_info),
+                "grade": grade,
+                "subject": subject,
+                "difficulty": difficulty,
+                "knowledge_points": knowledge_points,
+                "solution_steps": clean_steps,
+                "full_solution": clean_solution,
+                "mind_map": r.mind_map or "",
+                "latex_extras": extras_md,
+                "image_url": image_url,
+                "mastery_level": mastery_label,
+            })
+        
+        # ③ 合并知识延伸 / AI动画记录到历史列表
+        from server.database.models import AuxRecord
+        aux_query = db.query(AuxRecord)
+        if user_id is not None:
+            aux_query = aux_query.filter(AuxRecord.user_id == user_id)
+        else:
+            aux_query = aux_query.filter(AuxRecord.id == -1)
+        # 【修复】辅助记录必须沿用同一套日期边界，否则会绕过筛选返回越界记录
+        if start_bound is not None:
+            aux_query = aux_query.filter(AuxRecord.timestamp >= start_bound)
+        if end_bound is not None:
+            aux_query = aux_query.filter(AuxRecord.timestamp <= end_bound)
+        for a in aux_query.order_by(AuxRecord.timestamp.desc()).all():
+            try:
+                a_ts = (a.timestamp + local_offset).isoformat() if a.timestamp else ""
+            except Exception:
+                a_ts = ""
+            extra = a.extra_json or {}
+            result.append({
+                "id": a.id,
+                "session_id": a.session_id or "",
+                "timestamp": a_ts,
+                "record_type": a.record_type,  # extension / animation
+                "ocr_text": "",
+                "question_info_raw": "",
+                "grade": "",
+                "subject": (extra.get("subject") or "") if isinstance(extra, dict) else "",
+                "difficulty": "",
+                "knowledge_points": [],
+                "solution_steps": "",
+                "full_solution": a.content or "",
+                "image_url": "",
+                "mastery_level": "",
+                "title": a.title or "",
+                "extra_json": extra if isinstance(extra, dict) else {},
+                "mind_map": "",
+                "latex_extras": "",
+            })
+        
+        # 按时间降序排序（solve + aux 合并后）
+        def _ts_key(r):
+            try:
+                return r["timestamp"]
+            except Exception:
+                return ""
+        result.sort(key=_ts_key, reverse=True)
+        
+        return {
+            "status": "ok",
+            "records": result,
+            "total_count": len(result),
+            "subject_count": len(all_subjects)  # Feature 18: 学科数
+        }
+    finally:
+        db.close()
+
+@app.delete("/history")
+async def clear_history(request: Request):
+    """清除历史记录（仅本人记录；未登录时仅清空无主数据）；文件移入回收站而非硬删"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        from sqlalchemy import or_
+        user_id = get_current_user(request)
+        if user_id is not None:
+            records = db.query(SubmissionRecord).filter(
+                SubmissionRecord.user_id == user_id
+            ).all()
+        else:
+            records = []
+        for rec in records:
+            _move_record_files_to_recycle_bin(rec)
+            db.delete(rec)
+        # ③ 同时清除知识延伸/AI动画记录
+        from server.database.models import AuxRecord
+        aux_list = db.query(AuxRecord).filter(
+            AuxRecord.user_id == user_id if user_id is not None else AuxRecord.id == -1
+        ).all()
+        for a in aux_list:
+            db.delete(a)
+        db.commit()
+        return {"status": "ok", "message": f"历史记录已清除（{len(records)} 条，文件已移入回收站）"}
+    finally:
+        db.close()
+
+@app.delete("/history/{record_id}")
+async def delete_history_record(record_id: int, request: Request):
+    """删除单条历史记录（校验归属）；文件移入回收站"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        user_id = get_current_user(request)
+        record = db.query(SubmissionRecord).filter(SubmissionRecord.id == record_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        # 未登录只能删公共(NULL)记录；登录用户只能删自己的记录
+        if record.user_id is not None and (user_id is None or record.user_id != user_id):
+            raise HTTPException(status_code=403, detail="无权删除他人的记录")
+        _move_record_files_to_recycle_bin(record)
+        db.delete(record)
+        db.commit()
+        return {"status": "ok", "message": f"记录 {record_id} 已删除（文件已移入回收站）"}
+    finally:
+        db.close()
+
+@app.post("/history/batch-delete")
+async def batch_delete_history(request: Request, body: dict):
+    """批量删除历史记录（校验归属）；文件移入回收站"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        from sqlalchemy import or_
+        ids = body.get("ids", [])
+        if not ids:
+            return {"status": "error", "message": "未指定要删除的记录ID"}
+        user_id = get_current_user(request)
+        query = db.query(SubmissionRecord).filter(SubmissionRecord.id.in_(ids))
+        if user_id is not None:
+            query = query.filter(
+                SubmissionRecord.user_id == user_id
+            )
+        else:
+            # 未登录/游客：不给任何人的记录（历史属私人数据）
+            query = query.filter(SubmissionRecord.id == -1)
+        records = query.all()
+        for rec in records:
+            _move_record_files_to_recycle_bin(rec)
+            db.delete(rec)
+        db.commit()
+        return {"status": "ok", "message": f"已删除 {len(records)} 条记录（文件已移入回收站）", "deleted_count": len(records)}
+    finally:
+        db.close()
+
+@app.post("/history/render/{record_id}")
+async def render_history_record(record_id: int, request: Request):
+    """把历史记录的完整解析中的LaTeX代码块渲染为图片（本地编译，不调AI），并缓存回数据库"""
+    db = SessionLocal()
+    try:
+        from server.database.models import SubmissionRecord
+        from server.utils.latex_processor import process_latex_blocks
+        record = db.query(SubmissionRecord).filter(SubmissionRecord.id == record_id).first()
+        if not record or not record.full_solution:
+            return {"status": "error", "message": "记录不存在或无解析内容"}
+        if "```" not in record.full_solution:
+            return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
+        svg_dir = _svg_dir_from_stored(record.rendered_svg_dir)
+        if not svg_dir or not svg_dir.exists():
+            svg_dir = HISTORY_DIR / f"svgs_{record.session_id}"
+            svg_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rendered = process_latex_blocks(record.full_solution, svg_dir)
+        except Exception as e:
+            print(f"[history/render] 渲染失败 id={record_id}: {e}")
+            return {"status": "ok", "full_solution": record.full_solution, "rendered": False}
+        host = get_request_host(request)
+        rendered = rewrite_rendered_images(rendered, host, f"svgs_{record.session_id}")
+        if rendered != record.full_solution:
+            record.full_solution = rendered
+            record.rendered_svg_dir = _svg_dir_to_stored(svg_dir)
+            db.commit()
+        return {"status": "ok", "full_solution": rendered, "rendered": True}
+    finally:
+        db.close()
+
+@app.post("/tracking/sync")
+async def sync_tracking_data(request: Request, data: list[TrackingData]):
+    """同步跟踪学习数据（记录所属用户）"""
+    db = SessionLocal()
+    try:
+        user_id = get_current_user(request)
+        for item in data:
+            record = TrackingRecord(
+                session_id=item.session_id,
+                user_id=user_id,
+                focus_state=item.focus_state,
+                duration_seconds=item.duration_seconds,
+                page_number=item.page_number,
+                pomodoro_count=item.pomodoro_count,
+            )
+            db.add(record)
+        db.commit()
+        return {"status": "ok", "synced": len(data)}
+    finally:
+        db.close()
+
+@app.post("/auth/register")
+async def auth_register(request: AuthRequest):
+    """注册用户"""
+    if not request.username or len(request.username.strip()) == 0:
+        raise HTTPException(status_code=400, detail="用户名不能为空")
+    if len(request.username) < 3:
+        raise HTTPException(status_code=400, detail="用户名至少3个字符")
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少6个字符")
+
+    db = SessionLocal()
+    try:
+        result = register(db, request.username.strip(), request.password)
+        result["user"]["ai_permission"] = can_use_ai(result["user"]["username"], result["user"]["is_admin"])
+        return {"status": "ok", "data": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+
+
+# ==================== 登录失败限流（内存版） ====================
+# 目的：阻止公网爆破。同一 用户名+IP 连续失败达阈值后锁定一段时间。
+_LOGIN_FAILS = {}          # key -> [失败次数, 首次失败时间戳]
+_LOGIN_LOCK_SECONDS = 900      # 锁定时长：15 分钟
+_LOGIN_MAX_FAILS = 5           # 允许的连续失败次数
+
+
+def _login_key(request, username: str) -> str:
+    try:
+        ip = request.client.host if request.client else "unknown"
+    except Exception:
+        ip = "unknown"
+    return "%s|%s" % (ip, (username or "").strip().lower())
+
+
+def _login_locked(key: str) -> int:
+    """返回剩余锁定秒数；0 表示未锁定"""
+    import time as _t
+    rec = _LOGIN_FAILS.get(key)
+    if not rec:
+        return 0
+    cnt, ts = rec
+    if cnt < _LOGIN_MAX_FAILS:
+        return 0
+    left = int(_LOGIN_LOCK_SECONDS - (_t.time() - ts))
+    return left if left > 0 else 0
+
+
+def _login_record_fail(key: str) -> None:
+    import time as _t
+    rec = _LOGIN_FAILS.get(key)
+    now = _t.time()
+    if not rec or (now - rec[1]) > _LOGIN_LOCK_SECONDS:
+        _LOGIN_FAILS[key] = [1, now]
+    else:
+        rec[0] += 1
+        rec[1] = now
+
+
+def _login_clear(key: str) -> None:
+    _LOGIN_FAILS.pop(key, None)
+
+
+@app.post("/auth/login")
+async def auth_login(request: AuthRequest, req: Request):
+    """用户登录（已加固：失败限流）"""
+    key = _login_key(req, request.username)
+    left = _login_locked(key)
+    if left > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="登录失败次数过多，请 %d 分钟后再试" % max(1, left // 60),
+        )
+
+    db = SessionLocal()
+    try:
+        result = login(db, request.username.strip(), request.password)
+        _login_clear(key)
+        result["user"]["ai_permission"] = can_use_ai(result["user"]["username"], result["user"]["is_admin"])
+        return {"status": "ok", "data": result}
+    except ValueError as e:
+        _login_record_fail(key)
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/auth/verify")
+async def auth_verify(request: TokenRequest):
+    """验证token并返回用户信息"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_token(db, request.token)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Token无效或已过期")
+        user["ai_permission"] = can_use_ai(user["username"], user["is_admin"])
+        return {"status": "ok", "user": user}
+    finally:
+        db.close()
+
+
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "version": "3.0.0",
+        "features": FEATURE_FLAGS,
+    }
+
+
+# ==================== 用户认证辅助 ====================
+
+def _resolve_user(request: Request):
+    """解析 token -> (user_id, username, is_admin)，未登录返回 (None,None,False)"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            uid = verify_token(token)
+            if uid is not None:
+                try:
+                    db = SessionLocal()
+                    try:
+                        user = db.query(User).filter(User.id == uid).first()
+                        if user:
+                            return uid, user.username, bool(user.is_admin)
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+                return uid, None, False
+        except Exception:
+            return None, None, False
+    return None, None, False
+
+
+def _ai_denied_response(username: str, is_admin: bool):
+    """返回 (error 字典, None) / (None, allowed_bool) 结构"""
+    if can_use_ai(username, is_admin):
+        return None, False
+    return ({"status": "error", "code": 403,
+             "message": RESTRICTED_MSG}, True)
+
+
+# ⑮ AI类端点：受限则拒（新账号默认False；管理员/白名单放行）
+def check_ai_permission(request: Request):
+    """受限时返回 {"status":"error","code":403,"message":...}，否则返回 None
+
+    安全修复：未登录不再无条件放行。
+    此前游客（无 token）可绕过全部 AI 端点，无限制消耗 API 额度，
+    而受限账号反被拦截——逻辑是反的。
+    这些端点均需绑定用户历史记录，未登录使用本身无意义，故要求先登录。
+    """
+    _, username, is_admin = _resolve_user(request)
+    if username is None:
+        return {"status": "error", "code": 401,
+                "message": "请先登录后再使用 AI 功能"}
+    err, denied = _ai_denied_response(username, is_admin)
+    return err if denied else None
+
+
+def get_current_user(request: Request) -> Optional[int]:
+    """从 Authorization: Bearer <token> 解析当前用户ID；未登录返回 None"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        try:
+            uid = verify_token(token)
+            if uid is not None:
+                return uid
+        except Exception:
+            return None
+    return None
+
+# ==================== Feature 4: 掌握程度 ====================
+
+class MasteryRequest(BaseModel):
+    request_id: str
+    mastery_level: str
+
+@app.post("/mastery")
+async def save_mastery(request: Request, body: MasteryRequest):
+    """保存掌握程度记录（记录所属用户）"""
+    mastery_dir = HISTORY_DIR / "mastery_records"
+    mastery_dir.mkdir(exist_ok=True)
+    
+    record = {
+        "request_id": body.request_id,
+        "mastery_level": body.mastery_level,
+        "timestamp": datetime.now().isoformat(),
+        "user_id": get_current_user(request),
+    }
+    
+    file_path = mastery_dir / f"{body.request_id}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+    
+    return {"status": "ok", "message": "掌握程度已保存"}
+
+# ==================== 工具函数 ====================
+
+# 掌握程度英文键 → 中文显示
+_MASTERY_LABELS = {
+    "completely_mastered": "完全掌握",
+    "partially_mastered": "部分掌握",
+    "not_mastered": "完全没掌握",
+}
+
+
+def get_request_host(request: Request) -> str:
+    """获取客户端访问本服务的地址（优先请求Host头，回退server_ip.txt）"""
+    host = (request.headers.get("host") or "").strip()
+    if not host:
+        try:
+            ip_file = Path(__file__).resolve().parent / "server_ip.txt"
+            host = ip_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            host = "127.0.0.1:8000"
+    return host.removeprefix("http://").removeprefix("https://").rstrip("/")
+
+
+def rewrite_static_urls(text: str, host: str) -> str:
+    """把Markdown中的 /static/ 图片地址重写到当前服务地址（防旧IP失效导致图片不显示）"""
+    if not text:
+        return text
+    import re as _re
+    base = f"http://{host}/static/"
+    # 已有绝对地址（http(s)://旧host/static/...）→ 换成当前host
+    text = _re.sub(r'https?://[^/]+/static/', base, text)
+    return text
+
+
+def _svg_dir_to_stored(p) -> str:
+    """把 svg 目录写成"相对 history 根"的形式入库。
+
+    以前存绝对路径，项目目录一改名历史图解就全失效；存相对路径后
+    只依赖 HISTORY_DIR，搬迁/改名都不受影响。
+    """
+    try:
+        rel = Path(p).resolve().relative_to(HISTORY_DIR.resolve())
+        return str(rel).replace("\\", "/")
+    except Exception:
+        # 无法相对化（例如已是旧绝对路径且不在当前树内）-> 原样保留
+        return str(p)
+
+
+def _svg_dir_from_stored(v) -> Path:
+    """把库里存的值还原成绝对 Path，兼容旧的绝对路径与新的相对路径。"""
+    if not v:
+        return None
+    s = str(v)
+    p = Path(s)
+    # 旧数据：本身就是绝对路径
+    if p.is_absolute():
+        return p
+    # 新数据：相对 history 根
+    return HISTORY_DIR / s
+
+
+def rewrite_rendered_images(text: str, host: str, svg_rel_dir: str) -> str:
+    """② 把LaTeX渲染产物中的相对图片引用(diagram_xxx.png)补全为绝对URL，并把旧host统一到当前host
+    svg_rel_dir: 图片所在目录（相对history根），如 svgs_xxx 或 svgs_ask_xxx"""
+    if not text:
+        return text
+    import re as _re
+    base = f"http://{host}/static/"
+    text = _re.sub(r'!\[([^\]]*)\]\((diagram_[^)\s]+\.(?:png|svg))\)',
+                   rf'![\1]({base}{svg_rel_dir}/\2)', text)
+    text = _re.sub(r'https?://[^/]+/static/', base, text)
+    return text
+
+
+def _move_record_files_to_recycle_bin(record) -> str:
+    """删除记录时把相关文件（原图/svg目录/solution.md/掌握程度）移入回收站目录"""
+    import shutil
+    from datetime import datetime as _dt
+    bin_root = HISTORY_DIR / "recycle_bin"
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    dest = bin_root / f"{ts}_{record.session_id or record.id}"
+    dest.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    if record.original_image_path and Path(record.original_image_path).exists():
+        candidates.append(Path(record.original_image_path))
+    _sd = _svg_dir_from_stored(record.rendered_svg_dir)
+    if _sd and _sd.exists():
+        candidates.append(_sd)
+    md_path = HISTORY_DIR / f"{record.session_id}_solution.md"
+    if md_path.exists():
+        candidates.append(md_path)
+    mastery_path = HISTORY_DIR / "mastery_records" / f"{record.session_id}.json"
+    if mastery_path.exists():
+        candidates.append(mastery_path)
+    for p in candidates:
+        try:
+            shutil.move(str(p), str(dest / p.name))
+        except Exception as e:
+            print(f"[recycle] 移动失败 {p}: {e}")
+    return str(dest)
+
+
+# 解题流水线内部使用的提示词前缀（追问时应从上下文剔除，防止AI模仿之前的JSON输出格式）
+_INTERNAL_PROMPT_PREFIXES = (
+    "请分析这道题目，以JSON格式",     # 题目信息JSON提取
+    "基于以上题目分析，请给出清晰的解题思路",  # 解题思路
+    "请给出完整的解题过程和答案",     # 完整解析（其回复会保留作为题解上下文）
+    "请为这道题生成有助于学生理解",   # LaTeX图解
+    "请用纯文本缩进格式，为这道题生成",  # 思维导图
+    "请生成3个学生可能会问",          # 预判问题JSON
+)
+
+
+def clean_conversation_history(history: list) -> list:
+    """从解题会话历史中提取干净的追问上下文。
+
+    保留：system题面、完整解析、真实的追问问答对；
+    剔除：内部流水线提示词及其直接回复（如JSON题目信息、JSON预判问题等）。
+    否则AI会把上一个“输出JSON数组”的指令延续到追问中，导致回答是JSON格式。
+    """
+    cleaned: list = []
+    solution_text = ""
+    skip_next_assistant = False
+    capture_next = False
+    for h in history:
+        content = (h.get("content") or "").strip()
+        role = h.get("role")
+        if role == "system":
+            cleaned.append({"role": "system", "content": content})
+            continue
+        if role == "user":
+            if content.startswith("请给出完整的解题过程和答案"):
+                capture_next = True
+                continue
+            if content.startswith(_INTERNAL_PROMPT_PREFIXES):
+                # 内部提示词：连同紧随其后的assistant回复一起剔除
+                skip_next_assistant = True
+                continue
+            capture_next = False
+            skip_next_assistant = False
+            cleaned.append({"role": "user", "content": content})
+        else:  # assistant
+            if capture_next:
+                capture_next = False
+                solution_text = content
+                continue
+            if skip_next_assistant:
+                skip_next_assistant = False
+                continue
+            cleaned.append({"role": "assistant", "content": content})
+    # 题面之后插入完整解析作为上下文
+    if solution_text:
+        if cleaned and cleaned[0].get("role") == "system":
+            cleaned.insert(1, {"role": "assistant", "content": solution_text})
+        else:
+            cleaned.insert(0, {"role": "system", "content": "以下是这道题的完整解析，供你参考。"})
+            cleaned.insert(1, {"role": "assistant", "content": solution_text})
+    return cleaned
+
+
+def cleanup_markdown_images(text: str) -> str:
+    """清理Markdown中的图片标记，保留alt文本"""
+    import re
+    if not text:
+        return text
+    # 移除 ![alt](url) 格式的图片
+    text = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'[图片: \1]', text)
+    # 移除 <img ...> 格式
+    text = re.sub(r'<img[^>]+>', '[图片]', text)
+    return text
+
+def extract_subjects(text: str) -> list:
+    """Feature 18: 从题目文本中提取学科"""
+    import re
+    subjects = set()
+    subject_map = {
+        "数学": ["数学", "方程", "函数", "几何", "代数", "三角", "导数", "积分", "概率", "统计"],
+        "物理": ["物理", "力学", "电学", "光学", "热学", "磁场", "电场", "速度", "加速度", "牛顿"],
+        "化学": ["化学", "反应", "分子", "原子", "元素", "化合", "氧化", "还原", "酸碱"],
+        "英语": ["英语", "English", "grammar", "vocabulary", "reading", "writing"],
+        "语文": ["语文", "阅读", "作文", "古诗", "文言文", "修辞", "成语"],
+        "生物": ["生物", "细胞", "基因", "DNA", "遗传", "生态"],
+        "地理": ["地理", "气候", "地形", "经纬", "地图"],
+        "历史": ["历史", "朝代", "战争", "革命", "改革"],
+    }
+    for subject, keywords in subject_map.items():
+        for kw in keywords:
+            if kw.lower() in text.lower():
+                subjects.add(subject)
+                break
+    return list(subjects) if subjects else ["其他"]
+
+# ==================== 启动 ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    import socket
+    def get_local_ip():
+        # 优先读取 server_ip.txt（用户可手动指定固定IP）
+        try:
+            ip_file = Path(__file__).resolve().parent / "server_ip.txt"
+            if ip_file.exists():
+                content = ip_file.read_text(encoding="utf-8").strip()
+                ip = content.split(":")[0].strip()
+                if ip:
+                    print(f"[启动] 从 server_ip.txt 读取IP: {ip}")
+                    return ip
+        except Exception:
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+    
+    local_ip = get_local_ip()
+    print(f"本机IP地址: {local_ip}")
+    
+    # Feature 19: 保存服务器IP到文件（仅当文件不存在时写入，保留手动指定）
+    ip_file = Path(__file__).parent / "server_ip.txt"
+    if not ip_file.exists():
+        with open(ip_file, "w") as f:
+            f.write(f"{local_ip}:8000")
+    else:
+        print(f"[启动] server_ip.txt 已存在，保留内容: {ip_file.read_text(encoding='utf-8').strip()}")
+    
+    discovery = DiscoveryService(server_host=local_ip, api_port=8000)
+    discovery.start()
+
+    # ===== 诊断: 记录收到的终止信号，帮助定位服务被意外关闭的原因 =====
+    import signal as _signal_mod
+    import sys as _sys_mod
+    import time as _time_mod
+    from uvicorn.server import Server as _UvicornServer
+
+    _server_start_ts = _time_mod.time()
+    _SIGINT_GRACE_SECONDS = 30.0  # 启动保护窗口：此时间内首次SIGINT仅记录不退出
+    _sigint_state = {"count": 0}
+    _orig_handle_exit = _UvicornServer.handle_exit
+
+    def _dump_console_processes():
+        """枚举与本进程共享同一控制台的进程PID（Windows上Ctrl+C会发给其中所有进程）"""
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            buf = (ctypes.c_uint * 64)()
+            n = k32.GetConsoleProcessList(buf, 64)
+            pids = list(buf[:n])
+            print(f"[诊断] 共享控制台的进程PID: {pids}（本进程={os.getpid()}）")
+            print("[诊断] 若列表中存在本进程之外的进程（如助手/代理工具），它可能正是Ctrl+C的来源")
+        except Exception as e:
+            print(f"[诊断] 无法枚举控制台进程: {e}")
+
+    def _diagnose_handle_exit(self, sig, frame):
+        try:
+            sig_name = _signal_mod.Signals(sig).name
+        except ValueError:
+            sig_name = str(sig)
+        elapsed = _time_mod.time() - _server_start_ts
+        now_str = datetime.now().strftime('%H:%M:%S')
+        # 启动保护：30秒内的首次SIGINT仅记录并忽略，防止工具/终端误发Ctrl+C杀掉服务
+        if sig == _signal_mod.SIGINT and elapsed < _SIGINT_GRACE_SECONDS:
+            _sigint_state["count"] += 1
+            if _sigint_state["count"] == 1:
+                print(f"\n[诊断] {now_str} 启动仅{elapsed:.0f}秒即收到 SIGINT (Ctrl+C)，已忽略以保持服务运行。"
+                      f"若确实要停止服务，请再次按 Ctrl+C。")
+                _dump_console_processes()
+                return
+        print(f"\n[诊断] {now_str} 收到终止信号: {sig_name} ({sig})，"
+              f"距启动约{elapsed:.0f}秒，stdin_isatty={_sys_mod.stdin.isatty()}，服务即将关闭。"
+              f"若未手动按 Ctrl+C，请检查是否有其他程序/终端操作发送了该信号。")
+        _dump_console_processes()
+        return _orig_handle_exit(self, sig, frame)
+
+    _UvicornServer.handle_exit = _diagnose_handle_exit
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    finally:
+        discovery.stop()
