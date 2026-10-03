@@ -1,0 +1,31 @@
+# 运行期产物（不入版本控制）
+data/
+history/
+reports/
+exports/
+annotations/
+logs/
+venv/
+.venv/
+*.db
+*.db-shm
+*.db-wal
+.env.local
+.env.*.local
+
+# 密钥
+.env
+
+# 构建产物
+bin/
+*.exe
+*.log
+__pycache__/
+*.py[cod]
+*.pyd
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

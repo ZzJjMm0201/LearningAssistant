@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>学习助手 · 学生端</title>
+<link rel="stylesheet" href="./css/app.css">
+<script src="./js/vendor/marked.min.js"></script>
+<script>
+window.MathJax = {
+  tex: {
+    packages: {'[+]': ['mhchem']},
+    inlineMath: [['$', '$'], ['\\(', '\\)']],
+    displayMath: [['$$', '$$'], ['\\[', '\\]']]
+  },
+  svg: { fontCache: 'global' },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+};
+</script>
+<!-- tex-svg.js 仅登记了 [tex]/mhchem 依赖项，不含实现；须显式引入扩展脚本 -->
+<script id="MathJax-script" async src="./js/vendor/tex-svg.js"></script>
+</head>
+<body data-theme="dark">
+
+<!-- ================= 登录 ================= -->
+<div id="authView" class="auth-wrap">
+  <div class="auth-card">
+    <div class="auth-logo">📎</div>
+    <h1>学习助手</h1>
+    <p class="auth-sub">AI 拍照解题 · 知识延伸 · 学情报告</p>
+    <div class="auth-tabs">
+      <button class="auth-tab active" data-mode="login">登录</button>
+      <button class="auth-tab" data-mode="register">注册</button>
+    </div>
+    <input id="authUser" class="ipt" placeholder="用户名" autocomplete="username">
+    <input id="authPass" class="ipt" type="password" placeholder="密码" autocomplete="current-password">
+    <button id="authBtn" class="btn btn-primary btn-block">登录</button>
+    <div id="authMsg" class="auth-msg"></div>
+    <div class="auth-skip"><a href="#" id="skipLogin">先随便看看（不登录）</a></div>
+  </div>
+</div>
+
+<!-- ================= 主应用 ================= -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="topbar-title">📎 学习助手</div>
+    <div class="topbar-actions">
+      <button id="pomoBtn" class="icon-btn" title="番茄钟">🍅</button>
+      <button id="themeBtn" class="icon-btn" title="深浅色">🌗</button>
+      <button id="meBtn" class="icon-btn" title="账号">👤</button>
+    </div>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <nav class="tabbar">
+    <button class="tab active" data-view="home"><span>🏠</span><em>首页</em></button>
+    <button class="tab" data-view="history"><span>📚</span><em>历史</em></button>
+    <button class="tab" data-view="report"><span>📊</span><em>报告</em></button>
+    <button class="tab" data-view="settings"><span>⚙️</span><em>设置</em></button>
+  </nav>
+</div>
+
+<!-- ================= 通用组件 ================= -->
+<div id="toast" class="toast hidden"></div>
+<div id="overlay" class="overlay hidden"><div class="spinner"></div><div id="overlayText">处理中…</div></div>
+
+<script src="./js/api.js"></script>
+<script src="./js/app.js"></script>
+</body>
+</html>

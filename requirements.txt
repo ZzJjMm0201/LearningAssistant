@@ -1,0 +1,38 @@
+# 学习助手 AI 服务依赖
+#
+# 分层说明：核心链路只依赖 httpx + pydantic + fastapi；
+# OCR / LaTeX / 图像 / 导出 / 视频 是可选增强，缺失时对应功能自动降级，
+# 不会让整个服务起不来。原项目把 paddleocr、paddlepaddle 这类重型依赖
+# 写进 requirements，结果是"只想跑追问也要先装 2GB 的 Paddle"。
+
+# ---- 核心（必需）----
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+
+# ---- 图像处理（批注必需）----
+Pillow>=10.2.0
+
+# ---- 导出 ----
+# Word 导出
+python-docx>=1.1.0
+# PDF 导出
+reportlab>=4.2.0
+
+# ---- 可选增强 ----
+# 本地 PaddleOCR（体积大，启用 ENABLE_LOCAL_OCR 时才需要）
+# paddleocr>=2.8.0
+# paddlepaddle>=2.6.0
+
+# LaTeX 图形渲染需要外部程序（不是 pip 包）：
+#   MiKTeX 或 TeX Live 提供 xelatex
+#   poppler 提供 pdftocairo（或安装 Inkscape 作为替代）
+
+# 视频关键帧抽取（长按多页拍摄功能）
+# opencv-python-headless>=4.9.0
+
+# 若要启用本地 OCR / 视频抽帧，取消下面两行注释并按需安装：
+# ENABLE_LOCAL_OCR=true
+# pip install paddleocr paddlepaddle opencv-python-headless
