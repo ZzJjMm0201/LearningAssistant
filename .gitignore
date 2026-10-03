@@ -1,69 +1,31 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-venv/
-*.egg
-
-# Android
-client/.gradle/
-client/build/
-client/app/build/
-client/.kotlin/
-client/local.properties
-*.iml
-.idea/
-
-# IDE
-.vscode/
-*.swp
-*.swo
-*.log
-
-# Data
-history/*.jpg
-history/animations/
-history/svgs_*/
-history/*.md
-history/mastery_records/
-history/recycle_bin/
-history/geogebra/
-history/geogebra_apps/
-history/geogebra_assets/
-reports/*.html
-data/*.db
-server_ip.txt
-.env
-
-# OS
-.DS_Store
-Thumbs.db
-Desktop.ini
-
-# Large binary files
-*.pkl
-*.model
-*.h5
-*.onnx
-
-# 网页端
-*.bak_sub
-
-# ===== 运行期产物与测试数据（只保留源码）=====
+# 运行期产物（不入版本控制）
+data/
 history/
 reports/
-data/
+exports/
+annotations/
 logs/
-*.log
-server_run_*.log
-server_restart*.log
-server_autostart.log
-server_test.log
-server_ip.txt
-~$*
+venv/
+.venv/
+*.db
+*.db-shm
+*.db-wal
+.env.local
+.env.*.local
 
-# 临时/调试脚本
-_tmp_*
-fix_encoding*.py
-*_test.py
-ARCHITECTURE.md.bak
+# 密钥
+.env
+
+# 构建产物
+bin/
+*.exe
+*.log
+__pycache__/
+*.py[cod]
+*.pyd
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
